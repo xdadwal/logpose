@@ -41,7 +41,7 @@ If you plan to use a Claude Code subscription token, read the
 - [Install](#install)
 - [Quickstart](#quickstart)
 - [Auth](#auth)
-- [Streaming](#streaming)
+- [Streaming](#streaming) — [gating tool calls](#gating-tool-calls)
 - [Defining tools](#defining-tools)
 - [Discovering tools](#discovering-tools)
 - [Multi-turn conversations](#multi-turn-conversations)
@@ -208,8 +208,38 @@ It is merged into every wire request, so it reaches `CompletionRequest.extra`.
 
 **A failing tool is never an exception.** A handler that raises, or a call to a
 tool that does not exist, becomes a `ToolResultBlock(is_error=True)` so the model
-reads the error and adapts. Only the iteration cap, a provider failure, or a
-credential failure ends a run abnormally.
+reads the error and adapts. Only the iteration cap, a provider failure, a
+credential failure, or a gate that raises ends a run abnormally.
+
+### Gating tool calls
+
+`on_tool_call` sees every call the model asks for **before** any handler starts.
+Return `None` to let it through, or a string to block it and hand that text back
+to the model instead:
+
+```python
+def gate(call):
+    if call.name in DANGEROUS and not user_approves(call.name, call.input):
+        return "Denied by the user. Try another approach."
+    return None
+
+agent = Agent("anthropic", tools=[...], on_tool_call=gate)
+```
+
+Within a turn the gate runs **one call at a time, in wire order** — a gate that
+asks a human cannot be asked several things at once — and entirely before the
+concurrent execution phase, so a blocked call has no chance to have already run.
+(An `Agent` holds no per-run state, so a gate shared across *concurrent* runs
+still needs its own lock.) It may be `async def` or ordinary; a synchronous gate
+runs inline on the event loop, so put anything blocking in `asyncio.to_thread`.
+
+Blocking is reported to the model as an error by default. Return
+`ToolGateResult(content=..., is_error=False)` when the block is a redirection
+rather than a failure — declining a call *and* saying what to do instead reads
+better to the model as a steer than as something that broke.
+
+A gate that raises ends the run: a permission layer that breaks must not fail
+open.
 
 ## Defining tools
 
@@ -367,7 +397,10 @@ another loop cannot work, so it fails loudly instead of deadlocking.
 
 ## Errors
 
-Everything derives from `LogposeError`, so one `except` covers the surface.
+Everything *logpose* raises derives from `LogposeError`, so one `except` covers
+the surface. The exception is code you supplied: whatever your `on_tool_call`
+gate raises propagates unchanged, because a permission layer that breaks must
+not fail open.
 
 | Error | Raised when |
 |---|---|
@@ -485,7 +518,7 @@ re-emitted verbatim, so an assistant turn always survives a `pause_turn` resend.
   OpenAI, Kimi, vLLM, Ollama, and LM Studio. No extra dependency: the
   OpenAI-compatible path is plain `httpx`, which logpose already ships.
 - **Later** — Codex subscription auth (needs harness delegation; the hybrid
-  decision gets revisited then), context compaction, pre/post tool-call hooks,
+  decision gets revisited then), context compaction, a post-tool-call hook,
   MCP tool ingestion.
 
 <a id="subscription-auth-disclaimer"></a>

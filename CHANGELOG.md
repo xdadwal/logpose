@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Agent(on_tool_call=...)`** — a gate consulted before each tool runs, so an
+  embedder can put a permission prompt, a policy check, or a dry run in front of
+  execution. It sees every requested call one at a time in wire order and
+  entirely before the concurrent execution phase, so a gate that asks a human is
+  never asked several things at once, and a call it blocks cannot have already
+  run. Returning `None` allows the call; a `str` or `ToolGateResult` blocks it
+  and is handed to the model in its place — use
+  `ToolGateResult(..., is_error=False)` when the block is a redirection rather
+  than a failure. Sync and async gates are both supported; a gate that raises
+  ends the run rather than failing open.
 - **OpenAI-compatible provider** (`openai-compat`). Drives any server exposing
   `POST /chat/completions` — llama.cpp, vLLM, Ollama, LM Studio, OpenAI, Kimi.
   Built on `httpx`, which logpose already depends on, so it adds no dependency

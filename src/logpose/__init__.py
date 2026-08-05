@@ -40,7 +40,13 @@ resolved by name (:func:`resolve`) and import their SDK lazily, so
 
 from __future__ import annotations
 
-from logpose.agent import Agent, Conversation
+from logpose.agent import (
+    Agent,
+    Conversation,
+    ToolGate,
+    ToolGateOutcome,
+    ToolGateResult,
+)
 from logpose.errors import (
     AuthError,
     LogposeError,
@@ -93,6 +99,9 @@ __all__ = [
     # the loop
     "Agent",
     "Conversation",
+    "ToolGate",
+    "ToolGateOutcome",
+    "ToolGateResult",
     # tools
     "tool",
     "ToolDef",

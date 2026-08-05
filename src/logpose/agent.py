@@ -38,10 +38,11 @@ One iteration is one provider round trip:
    a pre-output ``refusal``): providers reject an empty content array, so
    appending it would poison every later turn on the same
    :class:`Conversation`. Such a turn is reported but never stored.
-#. On ``stop_reason == "tool_use"``, run *every* requested tool concurrently and
-   append **one** user message holding all the results in request order.
-   Splitting results across several user messages measurably degrades parallel
-   tool calling, so it is treated as a bug.
+#. On ``stop_reason == "tool_use"``, offer each call to the optional
+   ``on_tool_call`` gate, run *every* surviving tool concurrently, and append
+   **one** user message holding all the results in request order. Splitting
+   results across several user messages measurably degrades parallel tool
+   calling, so it is treated as a bug.
 #. On ``stop_reason == "pause_turn"``, re-issue transparently.
 #. Otherwise finish: :class:`~logpose.events.RunEnd` carries the
    :class:`~logpose.events.RunResult`.
@@ -50,7 +51,19 @@ A failing tool is never an exception: it becomes a
 :class:`~logpose.messages.ToolResultBlock` with ``is_error=True`` so the model
 can read the error and adapt. The same is true of a call to a tool that does not
 exist. Only the iteration cap (:class:`~logpose.errors.MaxIterationsError`), a
-provider failure, or a credential failure can end a run abnormally.
+provider failure, a credential failure, or a gate that raises can end a run
+abnormally.
+
+Gating tool calls
+-----------------
+``Agent(on_tool_call=...)`` installs a gate that sees every requested call
+*before* any handler starts, in wire order, one at a time. Returning ``None``
+lets the call through; returning a string or a :class:`ToolGateResult`
+substitutes that text as the call's result and the handler never runs. That is
+the seam for a permission prompt, a policy check, or a dry run — and within a
+turn it is deliberately sequential, because a gate that asks a human cannot be
+asked several things at once. An :class:`Agent` holds no per-run state, so a
+gate shared across *concurrent* runs still needs its own lock.
 
 :meth:`Agent.run` is implemented by draining :meth:`Agent.stream`, so there is
 exactly one loop implementation to reason about.
@@ -60,8 +73,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from typing import Any, Union
 
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
@@ -89,6 +103,9 @@ from logpose.tools import ToolDef
 __all__ = [
     "Agent",
     "Conversation",
+    "ToolGate",
+    "ToolGateOutcome",
+    "ToolGateResult",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
     "EMPTY_TOOL_RESULT",
@@ -110,6 +127,58 @@ EMPTY_TOOL_RESULT = "(no output)"
 
 Providers reject empty content blocks, so a tool that returns ``""`` would
 otherwise fail the *next* request rather than its own.
+"""
+
+
+@dataclass(frozen=True)
+class ToolGateResult:
+    """The result a gate substitutes for a call it blocked.
+
+    Returning a bare ``str`` from a gate is shorthand for
+    ``ToolGateResult(content)``, which reports the block as an error. Build the
+    dataclass explicitly when the block is *not* a failure — a permission layer
+    that declines a call while telling the model what to do instead wants
+    ``is_error=False``, so the model reads it as a redirection rather than
+    something that went wrong.
+
+    The gate never names the call it answers: the loop pairs the result with the
+    :class:`~logpose.messages.ToolUseBlock` it was handed.
+
+    Attributes:
+        content: The text handed back to the model in place of the tool's output.
+        is_error: Whether the model should read this as a failure.
+    """
+
+    content: str
+    is_error: bool = True
+
+    def __post_init__(self) -> None:
+        """Reject a non-string result at the point of construction.
+
+        Raises:
+            LogposeError: If ``content`` is not a string. Caught here rather than
+                deep in the loop, where it would surface as an ``AttributeError``
+                naming nothing the caller wrote.
+        """
+        if not isinstance(self.content, str):
+            raise LogposeError(
+                f"ToolGateResult.content must be a str, got {type(self.content).__name__}."
+            )
+
+
+ToolGateOutcome = Union[str, ToolGateResult, None]  # noqa: UP007 - runtime-importable alias
+"""What a gate may return: ``None`` to allow, otherwise the substituted result."""
+
+ToolGate = Callable[[ToolUseBlock], Union[ToolGateOutcome, Awaitable[ToolGateOutcome]]]  # noqa: UP007
+"""A pre-execution gate over tool calls.
+
+Called once per requested call, in wire order, before any handler starts. It may
+be a coroutine function or an ordinary one; a synchronous gate runs inline on the
+event loop, so anything blocking (a prompt, a file read, a network check) belongs
+in :func:`asyncio.to_thread`.
+
+An exception raised by a gate propagates out of the run rather than being turned
+into a tool result: a permission layer that breaks must not fail open.
 """
 
 
@@ -201,6 +270,7 @@ class Agent:
         max_tokens: Output-token ceiling override, or ``None`` to use the
             provider's own default.
         extra: Provider-specific request parameters merged into every turn.
+        on_tool_call: Optional gate consulted before each tool runs.
     """
 
     def __init__(
@@ -213,6 +283,7 @@ class Agent:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
         extra: dict[str, Any] | None = None,
+        on_tool_call: ToolGate | None = None,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -236,6 +307,10 @@ class Agent:
                 hatch for options logpose does not model — ``tool_choice``,
                 ``stop_sequences``, ``metadata``, ``service_tier``. Copied, so
                 later mutation of the caller's dict is not observed.
+            on_tool_call: Gate consulted once per requested tool call, in wire
+                order, before any handler starts. Return ``None`` to let the call
+                run, or a ``str`` / :class:`ToolGateResult` to block it and hand
+                that text back to the model instead. See :data:`ToolGate`.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("anthropic", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -244,13 +319,18 @@ class Agent:
             LogposeError: If the provider name is unknown, if ``provider_kwargs``
                 are passed alongside an already-built provider, if the provider
                 does not implement the protocol, if two tools share a name, if a
-                tool is not a :class:`~logpose.tools.ToolDef`, or if
-                ``max_iterations`` / ``max_tokens`` are not positive.
+                tool is not a :class:`~logpose.tools.ToolDef`, if
+                ``on_tool_call`` is not callable, or if ``max_iterations`` /
+                ``max_tokens`` are not positive.
         """
         if max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
         if max_tokens is not None and max_tokens < 1:
             raise LogposeError(f"max_tokens must be at least 1, got {max_tokens}.")
+        if on_tool_call is not None and not callable(on_tool_call):
+            raise LogposeError(
+                f"on_tool_call must be callable, got {type(on_tool_call).__name__}."
+            )
 
         if isinstance(provider, str):
             self.provider: Provider = resolve(provider, **provider_kwargs)
@@ -276,6 +356,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
         self.extra: dict[str, Any] = dict(extra) if extra else {}
+        self.on_tool_call = on_tool_call
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -316,11 +397,14 @@ class Agent:
             The completed :class:`~logpose.events.RunResult`.
 
         Raises:
-            LogposeError: If there is nothing to send, or if no model could be
-                resolved (no ``model=`` and no provider ``model_default``).
+            LogposeError: If there is nothing to send, if no model could be
+                resolved (no ``model=`` and no provider ``model_default``), or if
+                ``on_tool_call`` returns an unsupported type.
             MaxIterationsError: If the run exceeds ``max_iterations``. The
                 partial conversation is attached to the error.
             ProviderError: If the provider fails or violates its contract.
+            Exception: Whatever ``on_tool_call`` raises, propagated unchanged
+                rather than converted into a tool result.
         """
         result: RunResult | None = None
         async for event in self.stream(prompt, conversation=conversation):
@@ -360,7 +444,9 @@ class Agent:
 
         Raises:
             LogposeError: If ``prompt`` is not a supported type, or if there is
-                nothing to send.
+                nothing to send. Iterating can raise the same errors
+                :meth:`run` documents, including whatever ``on_tool_call``
+                raises.
         """
         first = _as_message(prompt) if prompt is not None else None
         if first is None and not (conversation is not None and conversation.messages):
@@ -580,7 +666,11 @@ class Agent:
     # -- tools --------------------------------------------------------------
 
     async def _execute(self, calls: Sequence[ToolUseBlock]) -> list[ToolResultBlock]:
-        """Run every requested tool concurrently.
+        """Gate every requested call, then run the survivors concurrently.
+
+        Gating is a sequential pre-pass and running is concurrent: a gate that
+        asks a human cannot be asked several things at once, while the tools it
+        cleared are independent by construction.
 
         Args:
             calls: The tool-use blocks from the assistant turn, in wire order.
@@ -589,9 +679,11 @@ class Agent:
             One :class:`~logpose.messages.ToolResultBlock` per call, in the same
             order. Failures are reported as error results, never raised.
         """
-        tasks = [asyncio.create_task(self._invoke(call)) for call in calls]
+        blocked = await self._gate(calls)
+        runnable = [(index, call) for index, call in enumerate(calls) if index not in blocked]
+        tasks = [asyncio.create_task(self._invoke(call)) for _, call in runnable]
         try:
-            results: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
+            ran: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
         finally:
             # If the consumer abandoned the stream (or a sibling blew up), no
             # tool task may outlive this call.
@@ -599,7 +691,59 @@ class Agent:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-        return results
+        results = dict(blocked)
+        for (index, _call), result in zip(runnable, ran, strict=True):
+            results[index] = result
+        return [results[index] for index in range(len(calls))]
+
+    async def _gate(self, calls: Sequence[ToolUseBlock]) -> dict[int, ToolResultBlock]:
+        """Offer each call to ``on_tool_call`` and collect the ones it blocked.
+
+        Runs one call at a time, in wire order, and entirely before any handler
+        starts — so a gate can prompt on stdin, and a call it blocks has no
+        chance to have already run.
+
+        Args:
+            calls: The tool-use blocks from the assistant turn, in wire order.
+
+        Returns:
+            The substituted result for each blocked call, keyed by its position
+            in ``calls``. Empty when no gate is installed.
+
+        Raises:
+            LogposeError: If the gate returns something that is neither ``None``,
+                a ``str``, nor a :class:`ToolGateResult`.
+            Exception: Whatever the gate itself raises, unchanged — a permission
+                layer that breaks must not fail open.
+        """
+        if self.on_tool_call is None:
+            return {}
+        blocked: dict[int, ToolResultBlock] = {}
+        for index, call in enumerate(calls):
+            returned = self.on_tool_call(call)
+            outcome = await returned if isinstance(returned, Awaitable) else returned
+            if outcome is None:
+                continue
+            if isinstance(outcome, str):
+                outcome = ToolGateResult(content=outcome)
+            elif not isinstance(outcome, ToolGateResult):
+                # LogposeError, not ToolExecutionError: this is the embedder's
+                # contract being violated, like a bad prompt type or a
+                # non-callable gate. ToolExecutionError means "fold me into a
+                # tool result", which is the opposite of what must happen here.
+                raise LogposeError(
+                    f"on_tool_call returned {type(outcome).__name__} for tool {call.name!r}; "
+                    "it must return None, a str, or a ToolGateResult."
+                )
+            blocked[index] = ToolResultBlock(
+                tool_use_id=call.id,
+                # Same reason as a tool that returns "": providers reject an
+                # empty content block, so a silent gate would fail the *next*
+                # request rather than this one.
+                content=outcome.content if outcome.content.strip() else EMPTY_TOOL_RESULT,
+                is_error=outcome.is_error,
+            )
+        return blocked
 
     async def _invoke(self, call: ToolUseBlock) -> ToolResultBlock:
         """Execute one tool call and render the outcome for the model.
