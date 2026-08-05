@@ -8,13 +8,20 @@ loop semantics the agent must guarantee are grouped into the sections below.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 
-from logpose.agent import DEFAULT_MAX_TOKENS, EMPTY_TOOL_RESULT, Agent, Conversation
+from logpose.agent import (
+    DEFAULT_MAX_TOKENS,
+    EMPTY_TOOL_RESULT,
+    Agent,
+    Conversation,
+    ToolGateResult,
+)
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
@@ -1033,6 +1040,253 @@ def test_a_bad_prompt_type_raises_before_any_request() -> None:
 def test_a_blank_prompt_raises_rather_than_sending_an_empty_block(blank_prompt: str) -> None:
     with pytest.raises(LogposeError, match="must not be blank"):
         Agent(FakeProvider()).stream(blank_prompt)
+
+
+# ---------------------------------------------------------------------------
+# 11. the on_tool_call gate
+# ---------------------------------------------------------------------------
+
+
+def logging_tool(name: str, log: list[str]) -> ToolDef:
+    """Build a tool that records the fact that it ran.
+
+    Args:
+        name: Tool name.
+        log: Shared ordering log, shared with the gate under test.
+
+    Returns:
+        The tool definition.
+    """
+
+    async def handler() -> str:
+        """Record that it ran."""
+        log.append(f"ran:{name}")
+        return f"{name} ok"
+
+    handler.__name__ = name
+    return tool(handler)
+
+
+def tool_use_provider(*names: str) -> FakeProvider:
+    """Script one tool-use turn asking for ``names``, then a closing text turn.
+
+    Args:
+        *names: Tool names to request, in wire order. Ids are ``t1``, ``t2``, ...
+
+    Returns:
+        The scripted provider.
+    """
+    calls = [tool_call(name, id=f"t{index}") for index, name in enumerate(names, start=1)]
+    return FakeProvider([ScriptedTurn.tool_use(*calls), ScriptedTurn.text("done")])
+
+
+async def test_the_gate_sees_every_call_in_wire_order_before_any_handler_runs() -> None:
+    log: list[str] = []
+    tools = [logging_tool("alpha", log), logging_tool("beta", log)]
+
+    async def gate(call: ToolUseBlock) -> None:
+        log.append(f"gate:{call.name}")
+        await asyncio.sleep(0)  # a real gate awaits; ordering must survive it
+        return None
+
+    await Agent(tool_use_provider("alpha", "beta"), tools=tools, on_tool_call=gate).run("go")
+
+    assert log[:2] == ["gate:alpha", "gate:beta"]  # in wire order, and both first
+    assert sorted(log[2:]) == ["ran:alpha", "ran:beta"]
+
+
+async def test_a_blocked_call_never_reaches_its_handler() -> None:
+    log: list[str] = []
+
+    def gate(call: ToolUseBlock) -> str:
+        return "Denied by the user."
+
+    result = await Agent(
+        tool_use_provider("alpha"), tools=[logging_tool("alpha", log)], on_tool_call=gate
+    ).run("go")
+
+    assert log == []  # the handler never ran
+    results_message = result.messages[2]
+    assert [block.content for block in results_message.content] == ["Denied by the user."]
+    assert [block.is_error for block in results_message.content] == [True]
+
+
+async def test_a_gate_can_block_without_calling_it_an_error() -> None:
+    """A permission layer that declines *and steers* is not reporting a failure."""
+
+    def gate(call: ToolUseBlock) -> ToolGateResult:
+        return ToolGateResult(content="Do it the other way instead.", is_error=False)
+
+    events = await collect(
+        Agent(tool_use_provider("alpha"), tools=[logging_tool("alpha", [])], on_tool_call=gate),
+        "go",
+    )
+
+    results = [event for event in events if isinstance(event, ToolResult)]
+    assert [(result.content, result.is_error) for result in results] == [
+        ("Do it the other way instead.", False)
+    ]
+
+
+async def test_blocked_and_allowed_calls_keep_request_order() -> None:
+    log: list[str] = []
+    tools = [logging_tool(name, log) for name in ("alpha", "beta", "gamma")]
+
+    def gate(call: ToolUseBlock) -> str | None:
+        return "blocked" if call.name == "beta" else None
+
+    result = await Agent(
+        tool_use_provider("alpha", "beta", "gamma"), tools=tools, on_tool_call=gate
+    ).run("go")
+
+    assert sorted(log) == ["ran:alpha", "ran:gamma"]
+    results_message = result.messages[2]
+    assert [block.tool_use_id for block in results_message.content] == ["t1", "t2", "t3"]
+    assert [block.content for block in results_message.content] == [
+        "alpha ok",
+        "blocked",
+        "gamma ok",
+    ]
+
+
+async def test_a_blocked_call_still_emits_its_call_and_result_events() -> None:
+    def gate(call: ToolUseBlock) -> str:
+        return "blocked"
+
+    events = await collect(
+        Agent(tool_use_provider("alpha"), tools=[logging_tool("alpha", [])], on_tool_call=gate),
+        "go",
+    )
+
+    assert [type(event) for event in events] == [
+        TurnEnd,
+        ToolCall,
+        ToolResult,
+        TextDelta,
+        TurnEnd,
+        RunEnd,
+    ]
+
+
+async def test_the_gate_sees_unknown_tool_names_too() -> None:
+    seen: list[str] = []
+
+    def gate(call: ToolUseBlock) -> None:
+        seen.append(call.name)
+        return None
+
+    result = await Agent(tool_use_provider("nope"), tools=[add], on_tool_call=gate).run("go")
+
+    assert seen == ["nope"]
+    # Letting it through leaves the loop's own unknown-tool report intact.
+    assert "Unknown tool 'nope'" in result.messages[2].content[0].content
+
+
+async def test_an_empty_gate_result_is_replaced_with_the_placeholder() -> None:
+    def gate(call: ToolUseBlock) -> str:
+        return "   "
+
+    result = await Agent(
+        tool_use_provider("alpha"), tools=[logging_tool("alpha", [])], on_tool_call=gate
+    ).run("go")
+
+    assert result.messages[2].content[0].content == EMPTY_TOOL_RESULT
+
+
+async def test_a_raising_gate_ends_the_run_rather_than_failing_open() -> None:
+    log: list[str] = []
+
+    def gate(call: ToolUseBlock) -> None:
+        raise PermissionError("the permission service is down")
+
+    with pytest.raises(PermissionError, match="permission service is down"):
+        await Agent(
+            tool_use_provider("alpha"), tools=[logging_tool("alpha", log)], on_tool_call=gate
+        ).run("go")
+
+    assert log == []
+
+
+async def test_a_gate_that_raises_late_still_stops_its_already_allowed_siblings() -> None:
+    """The whole point of gating *entirely* before execution.
+
+    An implementation that created each task as its call cleared the gate would
+    pass every other test here while letting alpha run before the gate refused
+    beta.
+    """
+    log: list[str] = []
+    tools = [logging_tool("alpha", log), logging_tool("beta", log)]
+
+    def gate(call: ToolUseBlock) -> None:
+        if call.name == "beta":
+            raise PermissionError("no")
+        return None
+
+    with pytest.raises(PermissionError):
+        await Agent(tool_use_provider("alpha", "beta"), tools=tools, on_tool_call=gate).run("go")
+
+    assert log == []
+
+
+async def test_abandoning_a_stream_mid_gate_leaves_no_stray_tasks() -> None:
+    """Section 9's invariant, extended to the loop's new suspension point."""
+    log: list[str] = []
+    entered = asyncio.Event()
+
+    async def gate(call: ToolUseBlock) -> None:
+        entered.set()
+        await asyncio.Event().wait()  # never fires; the consumer walks away
+        return None
+
+    stream = Agent(
+        tool_use_provider("alpha"), tools=[logging_tool("alpha", log)], on_tool_call=gate
+    ).stream("go")
+
+    async def drain() -> None:
+        async for _event in stream:
+            pass
+
+    consumer = asyncio.create_task(drain())
+    await entered.wait()
+    before = len(asyncio.all_tasks())
+    consumer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await consumer
+    await stream.aclose()  # type: ignore[attr-defined]
+
+    assert log == []  # nothing started while the gate was still deciding
+    assert len(asyncio.all_tasks()) < before
+
+
+async def test_a_gate_returning_an_unsupported_type_raises() -> None:
+    def gate(call: ToolUseBlock) -> Any:
+        return 42
+
+    with pytest.raises(LogposeError, match="must return None, a str, or a ToolGateResult"):
+        await Agent(
+            tool_use_provider("alpha"), tools=[logging_tool("alpha", [])], on_tool_call=gate
+        ).run("go")
+
+
+def test_a_gate_result_rejects_non_string_content_where_it_is_built() -> None:
+    # Otherwise it surfaces as an AttributeError from inside the loop, naming
+    # nothing the caller wrote.
+    with pytest.raises(LogposeError, match="ToolGateResult.content must be a str"):
+        ToolGateResult(content=None)  # type: ignore[arg-type]
+
+
+async def test_without_a_gate_every_call_runs() -> None:
+    log: list[str] = []
+    tools = [logging_tool("alpha", log), logging_tool("beta", log)]
+
+    await Agent(tool_use_provider("alpha", "beta"), tools=tools).run("go")
+
+    assert sorted(log) == ["ran:alpha", "ran:beta"]
+
+
+def test_on_tool_call_must_be_callable() -> None:
+    with pytest.raises(LogposeError, match="on_tool_call must be callable"):
+        Agent(FakeProvider(), on_tool_call="nope")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
