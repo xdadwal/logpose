@@ -24,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into `ThinkingDelta` events and a `ThinkingBlock`. The tag splitter handles
   tags straddling chunk boundaries; `parse_think_tags=False` turns it off.
 - `examples/local_docker.py` — a runnable local-model example.
+- **`discover_tools()`** — collects every `@tool` in a module or package, so a
+  growing tool set no longer has to be hand-listed at the call site:
+  `Agent("docker", tools=discover_tools("myapp.tools"))`. `Agent` is unchanged and
+  the result is a plain list, so discovery composes with hand-written tools.
+  A tool re-exported into a package `__init__` is returned once (deduplicated by
+  object identity); two *different* tools sharing a name raise `LogposeError`
+  naming both defining modules. Results are in traversal order rather than sorted,
+  so appending a tool leaves the preceding request bytes untouched and does not
+  disturb automatic prefix caching. Submodules named with a leading underscore are
+  skipped without being imported, and a submodule that fails to import raises
+  rather than being silently dropped.
 - Project documentation: `CONTRIBUTING.md` (setup, the provider seam, test and
   PR conventions) and `SECURITY.md` (private reporting, and what does and does
   not count as a vulnerability in a library that handles provider credentials

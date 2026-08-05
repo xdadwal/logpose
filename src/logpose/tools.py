@@ -51,24 +51,39 @@ annotation, a parameter whose name pydantic reserves) raise
 :class:`~logpose.errors.ToolSchemaError` at decoration time, as does a tool name
 outside ``[A-Za-z0-9_-]{1,128}`` — the charset every targeted provider accepts.
 Nothing that would fail as an opaque provider 400 is allowed to reach a request.
+
+Discovery
+---------
+:func:`tool` is a pure factory — it returns a :class:`ToolDef` and registers it
+nowhere, so this module holds no mutable state. :func:`discover_tools` is the
+consequence: collecting the tools in a package means importing its modules and
+scanning their namespaces, rather than reading a registry.
+
+That import step is why the underscore-prefix skip is applied *before* a submodule
+is imported, and why a failing import is reported rather than swallowed: a scan
+executes the top-level code of everything it touches, and silently missing a tool
+is worse than a loud error.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import json
+import pkgutil
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from types import ModuleType
 from typing import Any, overload
 
 from pydantic import BaseModel, ConfigDict, ValidationError, create_model
 
-from logpose.errors import ToolExecutionError, ToolSchemaError
+from logpose.errors import LogposeError, ToolExecutionError, ToolSchemaError
 from logpose.providers.base import ToolSpec
 
-__all__ = ["ToolDef", "tool"]
+__all__ = ["ToolDef", "discover_tools", "tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -836,3 +851,223 @@ def tool(
     if func is None:
         return decorate
     return decorate(func)
+
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+
+def _origin_of(tool_def: ToolDef, fallback: str) -> str:
+    """Name the module a tool was defined in.
+
+    Reads the handler's ``__module__`` rather than where the tool was *found*, so
+    a re-exported tool is reported against the file that defines it.
+
+    Args:
+        tool_def: The tool to locate.
+        fallback: Module name to use when the handler has no ``__module__``.
+
+    Returns:
+        A module name suitable for an error message.
+    """
+    origin = getattr(tool_def.handler, "__module__", None)
+    return origin if isinstance(origin, str) and origin else fallback
+
+
+def _import(name: str) -> ModuleType:
+    """Import a module by name, reporting failure with the module named.
+
+    Args:
+        name: Fully qualified module name.
+
+    Returns:
+        The imported module.
+
+    Raises:
+        LogposeError: If the module cannot be imported. The original exception is
+            chained as ``__cause__``.
+    """
+    try:
+        return importlib.import_module(name)
+    except Exception as exc:
+        raise LogposeError(
+            f"Failed to import {name!r} while discovering tools: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def _walk(module: ModuleType, recursive: bool, visited: set[str]) -> Iterator[ModuleType]:
+    """Yield ``module`` and, when recursive, every submodule beneath it.
+
+    Uses :func:`pkgutil.iter_modules` rather than :func:`pkgutil.walk_packages`
+    for three reasons that matter here: the underscore filter is applied *before*
+    the submodule is imported (``walk_packages`` imports subpackages itself, so a
+    ``_private`` package would have its top-level code executed anyway), an import
+    failure keeps its ``__cause__`` (``walk_packages``'s ``onerror`` receives only
+    a name, and silently swallows the error when no handler is given), and the
+    traversal order is ours to fix.
+
+    Submodules are visited in sorted name order. That is explicit rather than
+    inherited: the default path finder happens to sort, but zip importers and
+    third-party path hooks do not.
+
+    Namespace subpackages — a directory with no ``__init__.py`` — are not
+    descended into, because ``iter_modules`` does not report them as packages.
+
+    Args:
+        module: The module or package to start from.
+        recursive: Whether to descend into subpackages.
+        visited: Module names already yielded, mutated in place so overlapping
+            targets do not scan the same module twice.
+
+    Yields:
+        Modules to scan, the parent before its children.
+
+    Raises:
+        LogposeError: If a submodule cannot be imported.
+    """
+    yield module
+    path = getattr(module, "__path__", None)
+    if not recursive or path is None:
+        return
+
+    for info in sorted(pkgutil.iter_modules(list(path)), key=lambda item: item.name):
+        # Filter before importing: this is the whole reason for iter_modules.
+        # Covers dunders too, so `__main__.py` is never executed by a scan.
+        if info.name.startswith("_"):
+            continue
+        qualified = f"{module.__name__}.{info.name}"
+        if qualified in visited:
+            continue
+        visited.add(qualified)
+        yield from _walk(_import(qualified), recursive, visited)
+
+
+def _caller_namespace() -> tuple[Mapping[str, Any], str]:
+    """Return the calling module's globals, for a bare ``discover_tools()``.
+
+    Reads the frame's globals directly rather than looking the module up in
+    ``sys.modules``, so this also works in a REPL, under ``python -c``, and
+    inside ``exec`` with a custom namespace.
+
+    Returns:
+        The caller's global namespace and a label for error messages.
+
+    Raises:
+        LogposeError: If frame introspection is unavailable, which is possible on
+            non-CPython implementations.
+    """
+    frame = inspect.currentframe()
+    # _caller_namespace -> discover_tools -> the actual caller.
+    for _ in range(2):
+        frame = frame.f_back if frame is not None else None
+    if frame is None:
+        raise LogposeError(
+            "discover_tools() cannot inspect the calling frame on this Python "
+            "implementation; pass an explicit module or module name instead."
+        )
+    namespace = frame.f_globals
+    name = namespace.get("__name__")
+    return namespace, name if isinstance(name, str) else "<caller>"
+
+
+def discover_tools(
+    *targets: str | ModuleType,
+    recursive: bool = True,
+    predicate: Callable[[ToolDef], bool] | None = None,
+) -> list[ToolDef]:
+    """Collect every :func:`tool`-decorated function in one or more modules.
+
+    ``@tool`` keeps no registry — it simply returns a :class:`ToolDef` — so
+    discovery works by importing modules and scanning their namespaces::
+
+        agent = Agent("docker", tools=discover_tools("myapp.tools"))
+
+    The result is an ordinary list, so it composes with hand-written tools::
+
+        tools = [*discover_tools("myapp.tools"), extra_tool]
+
+    A tool re-exported into a package's ``__init__`` is returned **once**: results
+    are deduplicated by object identity, so the usual
+    ``from .weather import get_weather`` is not mistaken for a duplicate. Two
+    *different* tools sharing a name is a genuine conflict and raises.
+
+    **Order is traversal order, not alphabetical**: targets in the order given,
+    each module's own namespace in definition order, then its submodules sorted by
+    name, depth-first. Appending a tool therefore leaves the preceding request
+    bytes untouched, which preserves automatic prefix caching on providers that do
+    it; sorting by name would shift every entry after an insertion. Sort the
+    result yourself if you want alphabetical.
+
+    **Discovery imports every module under a target**, which executes its
+    top-level code. Never pass a target derived from untrusted input, and call
+    this at startup rather than inside a running event loop, since importing a
+    package tree blocks.
+
+    Only module-level names are found. A tool defined inside a class body or a
+    function, or held only in a list or dict, is not discovered, and ``__all__``
+    is not consulted. A :class:`ToolDef` imported into a scanned module from a
+    third-party library *is* discovered — use ``predicate`` to exclude it.
+
+    Args:
+        *targets: Modules to scan, each a dotted module path or an
+            already-imported module object. With no targets, the **calling
+            module** is scanned; note it sees only names bound above the call, so
+            put the call at the bottom of the file.
+        recursive: Descend into subpackages when a target is a package.
+            Submodules whose name starts with an underscore are skipped without
+            being imported. Ignored for a plain module.
+        predicate: Optional filter applied as tools are collected. A rejected tool
+            is ignored entirely, so this also resolves a name conflict. Exceptions
+            it raises propagate unchanged.
+
+    Returns:
+        The discovered tools in traversal order. Empty when the targets imported
+        cleanly but defined no tools.
+
+    Raises:
+        LogposeError: If a target or submodule cannot be imported, or if two
+            different tools share a name.
+    """
+    found: dict[int, ToolDef] = {}
+    claimed: dict[str, tuple[ToolDef, str]] = {}
+    visited: set[str] = set()
+
+    def collect(namespace: Mapping[str, Any], where: str) -> None:
+        for value in namespace.values():
+            # Keyed by id() because ToolDef is an unhashable frozen dataclass
+            # (input_schema is a dict). Safe because `found` holds a strong
+            # reference to every object it has keyed, so no id can be reused.
+            if not isinstance(value, ToolDef) or id(value) in found:
+                continue
+            if predicate is not None and not predicate(value):
+                continue
+            origin = _origin_of(value, where)
+            previous = claimed.get(value.name)
+            if previous is not None:
+                if previous[0].handler is value.handler:
+                    # The same function decorated twice: two ToolDef objects, but
+                    # unambiguously the same tool. Keep the first.
+                    continue
+                raise LogposeError(
+                    f"Duplicate tool name {value.name!r} found while discovering tools:\n"
+                    f"  {previous[1]}\n"
+                    f"  {origin}\n"
+                    "Rename one of them, or exclude it with predicate=."
+                )
+            found[id(value)] = value
+            claimed[value.name] = (value, origin)
+
+    if not targets:
+        namespace, label = _caller_namespace()
+        collect(namespace, label)
+
+    for target in targets:
+        module = _import(target) if isinstance(target, str) else target
+        if module.__name__ in visited:
+            continue
+        visited.add(module.__name__)
+        for scanned in _walk(module, recursive, visited):
+            collect(vars(scanned), scanned.__name__)
+
+    return list(found.values())

@@ -34,7 +34,7 @@ src/logpose/
 ├── agent.py          the loop — the only place tools are executed
 ├── messages.py       provider-neutral message model
 ├── events.py         public streaming events + RunResult
-├── tools.py          @tool decorator and JSON Schema generation
+├── tools.py          @tool decorator, JSON Schema generation, discover_tools()
 ├── sync.py           blocking facade over the async core
 ├── errors.py         exception hierarchy
 ├── auth/             credential resolution (read-only)
@@ -102,6 +102,14 @@ For a bug fix, add the test first and confirm it fails against the old code. For
 a new provider, cover at minimum: request translation, streaming assembly,
 `stop_reason` mapping, usage mapping, and error classification (which failures
 are retryable).
+
+The suite must stay hermetic, so prefer a fake over a real dependency: providers
+are driven through `httpx.MockTransport` or the scripted `tests/fake_provider.py`.
+The exception is `discover_tools`, whose whole job is real import machinery — it
+is tested against committed fixture packages under `tests/fixtures_*`. Those are
+deliberately *not* named `test_*.py` so pytest never collects them, and
+`tests/fixtures_broken/` exists only to be imported and fail, so keep it out of
+any happy-path scan.
 
 ## Pull requests
 

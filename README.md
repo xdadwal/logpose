@@ -43,6 +43,7 @@ If you plan to use a Claude Code subscription token, read the
 - [Auth](#auth)
 - [Streaming](#streaming)
 - [Defining tools](#defining-tools)
+- [Discovering tools](#discovering-tools)
 - [Multi-turn conversations](#multi-turn-conversations)
 - [Sync usage](#sync-usage)
 - [Errors](#errors)
@@ -246,6 +247,65 @@ Un-schematizable signatures raise `ToolSchemaError` at decoration time, not at
 runtime: `*args`, `**kwargs`, an unannotated parameter, a parameter whose name
 pydantic reserves (`model_config`, anything leading-underscore), and a tool name
 outside `[A-Za-z0-9_-]{1,128}` — the charset every targeted provider accepts.
+
+## Discovering tools
+
+Once tools live across several modules, hand-maintaining `tools=[a, b, c]` stops
+being fun — and a tool you forget to add is silently unavailable to the model.
+`discover_tools` imports a module or package and collects every `@tool` it finds:
+
+```python
+from logpose import Agent, discover_tools
+
+agent = Agent("docker", tools=discover_tools("myapp.tools"))
+```
+
+It returns an ordinary list, so it composes:
+
+```python
+tools = [*discover_tools("myapp.tools"), extra_tool]
+tools = discover_tools("myapp.tools", "myapp.integrations")   # several targets
+tools = discover_tools(predicate=lambda t: not t.name.startswith("debug_"))
+```
+
+With no arguments it scans the **calling** module. It reads that module's globals
+directly, so it works in a script, a REPL, or `python -c` — but it only sees names
+bound *above* the call, so put it at the bottom of the file.
+
+A tool re-exported into a package's `__init__.py` — the usual
+`from .weather import get_weather` — is returned **once**: results are deduplicated
+by object identity, so a re-export is not mistaken for a duplicate. Two *different*
+tools sharing a name is a genuine conflict and raises `LogposeError` naming both
+defining modules; `predicate` is the escape hatch.
+
+Order is **traversal order, not alphabetical**: targets as given, each module's own
+namespace in definition order, then its submodules sorted by name, depth-first.
+That means appending a tool leaves the preceding request bytes untouched, which
+keeps automatic prefix caching intact on providers that do it — sorting by name
+would shift every entry after an insertion. Sort it yourself if you want
+alphabetical.
+
+### What is and is not found
+
+Only **module-level** names. Not found: a tool defined in a class body or inside a
+function, or one held only in a list or dict. `__all__` is not consulted. A
+`ToolDef` imported into a scanned module from a third-party library **is** found —
+exclude it with `predicate` if you don't want it advertised.
+
+Submodules whose name starts with `_` are skipped *without being imported*, and so
+is everything beneath them (including `__main__.py`). A directory with no
+`__init__.py` is a namespace package and is not descended into. Naming an
+underscore module explicitly still scans it.
+
+> **Discovery imports every module under the target, which executes its top-level
+> code.** Never build a target from untrusted input, and call it at startup rather
+> than inside a running event loop, since importing a package tree blocks. A
+> submodule that fails to import raises rather than being skipped — a silently
+> missing tool is worse than a loud error.
+
+One sharp edge: `Agent` rejects two tools with the same *name* regardless of
+identity, so an `extra_tool` passed alongside discovery must not also live inside
+the scanned tree. Either keep it outside, or exclude it with `predicate`.
 
 ## Multi-turn conversations
 

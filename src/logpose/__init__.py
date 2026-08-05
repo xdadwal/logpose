@@ -84,7 +84,7 @@ from logpose.providers import (
     resolve,
 )
 from logpose.sync import SyncAgent, close_sync, run_sync, stream_sync
-from logpose.tools import ToolDef, tool
+from logpose.tools import ToolDef, discover_tools, tool
 
 __version__ = "0.1.0"
 
@@ -96,6 +96,7 @@ __all__ = [
     # tools
     "tool",
     "ToolDef",
+    "discover_tools",
     # sync facade
     "SyncAgent",
     "run_sync",

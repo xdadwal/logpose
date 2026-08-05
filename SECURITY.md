@@ -41,7 +41,11 @@ Concrete examples that would qualify:
   read-only by design; a write is a bug, and a potentially destructive one.
 
 **Tool execution boundary.** logpose ships no built-in shell, file, or network
-tools — it runs exactly the functions you hand it. A defect that causes it to
+tools — it runs exactly the functions you hand it. `discover_tools` is one of the
+ways you hand them over: it **imports** every module under the target, executing
+that module's top-level code, and registers every `ToolDef` it finds. A discovery
+target must therefore never be built from untrusted input — passing one is
+equivalent to importing the module yourself. A defect that causes it to
 execute something you did not register, or to execute a registered tool with
 arguments that bypassed schema validation, is in scope.
 
