@@ -369,10 +369,61 @@ async def test_compat_claude_code_prepends_identity() -> None:
     ]
 
 
-async def test_compat_claude_code_off_by_default() -> None:
-    client = FakeClient(final=sdk_message([]))
+async def test_api_key_auth_sends_no_identity() -> None:
+    client = FakeClient(final=sdk_message([]), api_key="sk-ant-api-test")
     await drain(make_provider(client), simple_request(system="You are terse."))
     assert client.messages.calls[0]["system"] == "You are terse."
+
+
+async def test_oauth_auth_prepends_identity_by_default() -> None:
+    # A bare OAuth request (no identity line) is answered with HTTP 429
+    # rate_limit_error even when the account has quota left, so subscription
+    # tokens must carry the identity unless the caller opts out.
+    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
+
+    await drain(make_provider(client), simple_request(system="You are terse."))
+
+    assert client.messages.calls[0]["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": "You are terse."},
+    ]
+
+
+async def test_oauth_identity_is_sent_without_a_caller_system_prompt() -> None:
+    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
+
+    await drain(make_provider(client), simple_request())
+
+    assert client.messages.calls[0]["system"] == [{"type": "text", "text": CLAUDE_CODE_IDENTITY}]
+
+
+async def test_compat_claude_code_false_suppresses_identity_for_oauth() -> None:
+    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
+
+    await drain(
+        make_provider(client, compat_claude_code=False),
+        simple_request(system="You are terse."),
+    )
+
+    assert client.messages.calls[0]["system"] == "You are terse."
+
+
+async def test_resolved_oauth_credential_enables_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The provider owns its client here, so the identity decision has to come
+    # from the credential it resolved rather than from a caller-supplied client.
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-token")
+    provider = AnthropicProvider()
+    real = await provider.get_client()
+    await real.close()
+    client = FakeClient(final=sdk_message([]))
+    provider._client = client
+
+    await drain(provider, simple_request(system="You are terse."))
+
+    assert client.messages.calls[0]["system"] == [
+        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
+        {"type": "text", "text": "You are terse."},
+    ]
 
 
 async def test_extra_is_merged_into_the_wire_request() -> None:

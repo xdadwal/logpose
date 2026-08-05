@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every subscription (OAuth) request failed with `429 rate_limit_error`.** Not
+  a quota problem: Anthropic began rejecting subscription requests whose system
+  prompt does not open with the Claude Code identity line, and the rejection is
+  dressed as a rate limit — an empty `"message":"Error"` body and none of the
+  `anthropic-ratelimit-*` headers a real limit carries. The same token, in the
+  same second, is answered `200` with the line and `429` without it.
+  `AnthropicProvider(compat_claude_code=...)` therefore now defaults to `None`,
+  meaning "decide per credential": the identity line is prepended for OAuth and
+  omitted for an API key. Pass `True` or `False` to force either way; `True`
+  keeps its old meaning, so existing callers are unaffected. Behavior on the
+  API-key path is unchanged.
 - `redact` moved to `logpose.providers._redact` so a backend can reuse it
   without importing a sibling provider's SDK. It is still exported from
   `logpose.providers.anthropic` for compatibility.

@@ -83,7 +83,15 @@ OAUTH_BETA_HEADER = "oauth-2025-04-20"
 """``anthropic-beta`` value required for subscription OAuth tokens."""
 
 CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
-"""System line prepended when ``compat_claude_code=True``."""
+"""System line prepended on subscription (OAuth) requests.
+
+Anthropic now answers a subscription request whose system prompt does not open
+with this line with ``HTTP 429 rate_limit_error`` — even when the account has
+quota to spare, and with none of the ``anthropic-ratelimit-*`` headers a real
+limit carries. Sending it is what makes the OAuth path work at all, so
+:class:`AnthropicProvider` sends it by default whenever the credential is an
+OAuth token. See ``compat_claude_code`` to override.
+"""
 
 _ADAPTIVE_THINKING: dict[str, Any] = {"type": "adaptive", "display": "summarized"}
 # ``display="summarized"`` is required: the API default is "omitted", which
@@ -361,7 +369,8 @@ class AnthropicProvider:
         model_default: Model used when a request omits one.
         max_tokens: Output-token ceiling used when a request omits one.
         compat_claude_code: Whether the Claude Code identity line is prepended
-            to the system prompt.
+            to the system prompt. ``None`` (the default) decides per credential:
+            on for OAuth, off for an API key.
     """
 
     name = "anthropic"
@@ -375,7 +384,7 @@ class AnthropicProvider:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: str | dict[str, Any] | None = "adaptive",
         client: AsyncAnthropic | None = None,
-        compat_claude_code: bool = False,
+        compat_claude_code: bool | None = None,
     ) -> None:
         """Configure the provider.
 
@@ -401,9 +410,12 @@ class AnthropicProvider:
                 ``None`` omits the parameter; a dict is sent verbatim.
             client: A pre-built ``AsyncAnthropic``. When given, no credential
                 resolution happens and the caller owns the client's lifetime.
-            compat_claude_code: Prepend the Claude Code identity line to the
-                system prompt. Off by default; turn it on only if bare OAuth
-                requests start being rejected.
+            compat_claude_code: Prepend :data:`CLAUDE_CODE_IDENTITY` to the
+                system prompt. ``None`` (the default) decides per credential:
+                on for a subscription OAuth token, off for an API key. Pass
+                ``False`` to send a bare OAuth request anyway — expect the API
+                to answer it with a 429 — or ``True`` to force the line on a
+                caller-supplied client logpose cannot inspect.
 
         Raises:
             LogposeError: If ``thinking`` or ``max_tokens`` is invalid.
@@ -508,9 +520,27 @@ class AnthropicProvider:
 
     # -- request ------------------------------------------------------------
 
+    def _use_claude_code_identity(self) -> bool:
+        """Whether this turn's system prompt must open with the identity line.
+
+        An explicit ``compat_claude_code`` always wins. Otherwise the answer
+        follows the credential: OAuth needs the line (bare subscription requests
+        come back 429), an API key does not. When the caller supplied their own
+        client no credential was resolved, so the client's own ``auth_token``
+        stands in for the kind.
+
+        Returns:
+            ``True`` when :data:`CLAUDE_CODE_IDENTITY` should be prepended.
+        """
+        if self.compat_claude_code is not None:
+            return self.compat_claude_code
+        if self._credential_kind is not None:
+            return self._credential_kind == "oauth"
+        return bool(getattr(self._client, "auth_token", None))
+
     def _build_system(self, system: str | None) -> str | list[dict[str, Any]] | None:
         """Build the ``system`` request parameter."""
-        if not self.compat_claude_code:
+        if not self._use_claude_code_identity():
             return system
         blocks: list[dict[str, Any]] = [{"type": "text", "text": CLAUDE_CODE_IDENTITY}]
         if system:

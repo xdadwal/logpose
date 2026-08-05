@@ -152,6 +152,21 @@ win would bill per token someone who deliberately set up a subscription. Pass
 `api_key=` explicitly (and no `auth_token=`) to force BYOK regardless of the
 environment.
 
+### Claude Code identity on the subscription path
+
+A subscription (OAuth) request whose system prompt does not open with `You are
+Claude Code, Anthropic's official CLI for Claude.` is answered with `429
+rate_limit_error` — a body carrying no detail and, tellingly, none of the
+`anthropic-ratelimit-*` headers a genuine limit sends. It is a rejection, not an
+exhausted quota. logpose therefore prepends that line as the first system block
+whenever the resolved credential is OAuth, ahead of your own `system=`, which
+follows it as a second block. API-key requests are untouched.
+
+Override with `compat_claude_code`: `False` sends a bare OAuth request anyway
+(expect the 429), `True` forces the line on — useful with
+`Agent("anthropic", client=...)`, where logpose has no credential to inspect and
+falls back to reading the client's `auth_token`.
+
 Credential values never appear in a log line, a `repr`, an exception message, or
 a **traceback** — anything that must reference one redacts it to a prefix plus a
 length. That includes a credential a gateway echoes back in an error body, and
@@ -535,9 +550,13 @@ officially supported integration.** Be clear-eyed about what that means:
   service name, the OAuth client id, the token endpoint, and the
   `anthropic-beta: oauth-2025-04-20` header. Any of these can change without
   notice and break this path, possibly silently.
-- Anthropic may start requiring requests on these tokens to look like Claude
-  Code's. `AnthropicProvider(compat_claude_code=True)` prepends the Claude Code
-  identity line to the system prompt as an escape hatch if that happens.
+- Anthropic **now requires** requests on these tokens to look like Claude
+  Code's: a subscription request whose system prompt does not open with the
+  Claude Code identity line comes back `429 rate_limit_error` regardless of how
+  much quota the account has left. logpose prepends that line automatically on
+  the OAuth path (`compat_claude_code`, which defaults to on for OAuth and off
+  for an API key). This is exactly the kind of undocumented requirement that can
+  change again without notice.
 - Rate limits, abuse handling, and account standing are Anthropic's call, not
   ours. Using this path is at your own risk, including the risk to your account.
 
