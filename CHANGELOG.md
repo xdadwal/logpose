@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `logpose.providers.anthropic` for compatibility.
 - Corrected the repository URL in `pyproject.toml` and the changelog link
   refs, which pointed at a repository that does not exist.
+- README install instructions pointed at `pip install logpose`, but that name
+  belongs to an unrelated logging library on PyPI and would have installed the
+  wrong package. Now installs from git; a distribution name is still to be
+  chosen before publishing.
 - README: the intro no longer claims v0.1 is Anthropic-only, the disclaimer
   anchor no longer depends on GitHub's emoji-anchor quirk, and there is a table
   of contents.

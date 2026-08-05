@@ -57,13 +57,20 @@ If you plan to use a Claude Code subscription token, read the
 
 ## Install
 
+Not on PyPI yet — install from the repository:
+
 ```bash
-uv add logpose
+uv add git+https://github.com/xdadwal/logpose
 # or
-pip install logpose
+pip install git+https://github.com/xdadwal/logpose
 ```
 
-Python 3.10+.
+Python 3.10+. The only runtime dependencies are `anthropic`, `pydantic`, and
+`httpx`; the local-model and OpenAI-compatible backends add nothing further.
+
+> **Note:** the name `logpose` is already taken on PyPI by an unrelated logging
+> library, so `pip install logpose` installs *someone else's package*. A
+> distribution name is still to be chosen before this is published.
 
 ## Quickstart
 
