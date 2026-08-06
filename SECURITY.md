@@ -55,8 +55,8 @@ arguments that bypassed schema validation, is in scope.
   logpose deliberately does not sandbox your tools. If a tool is dangerous when
   called with attacker-influenced arguments, that gate belongs in the tool.
   Design guidance is in the README.
-- **Breakage of the Claude Code subscription auth path.** That path depends on
-  undocumented details and is expected to break; see the disclaimer in the
-  README. Report it as an ordinary bug.
+- **Breakage of the experimental `claude-code` or `codex` subscription auth
+  paths.** These integrations depend on unstable CLI details and may break as
+  those clients evolve. Report compatibility problems as ordinary bugs.
 - Vulnerabilities in `anthropic`, `httpx`, `pydantic`, or a model server —
   report those upstream.

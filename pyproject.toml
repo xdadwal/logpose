@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "logpose"
 version = "0.1.0"
-description = "A universal agentic loop that services embed."
+description = "A provider-neutral agent loop for Python applications."
 readme = "README.md"
 requires-python = ">=3.10"
 # PEP 639: an SPDX expression, not the licence body. `license = {file=...}`

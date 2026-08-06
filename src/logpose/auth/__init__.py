@@ -12,11 +12,11 @@ OAuth token and falling back to a plain API key::
 The unprefixed names are Anthropic's, for backwards compatibility; Codex's are
 prefixed. Both sit on the backend-neutral core in :mod:`logpose.auth._common`.
 
-See :mod:`logpose.auth.claude_code` and :mod:`logpose.auth.codex` for the
-precedence rules, the read-only credential-store discovery, and an important note
-on why the subscription paths are a terms-of-service gray area. The vendor
-``ENV_*`` and ``OAUTH_*`` constants are deliberately not re-exported here — their
-unprefixed names collide — so import the submodule when you need them.
+See :mod:`logpose.auth.claude_code` and :mod:`logpose.auth.codex` for precedence
+rules and read-only credential-store discovery. The CLI subscription paths are
+experimental because their authentication details are unstable. The vendor
+``ENV_*`` and ``OAUTH_*`` constants are not re-exported here because their
+unprefixed names collide; import the submodule when you need them.
 """
 
 from __future__ import annotations

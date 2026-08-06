@@ -10,17 +10,9 @@ single-flight refresh loop — lives in :mod:`logpose.auth._common`. This module
 only the Anthropic-specific half: where the store is, what the payload looks
 like, which endpoint refreshes it, and what to tell the user when it fails.
 
-.. warning::
-
-   **Gray area — read this.** Using a Claude Code *subscription* token against
-   the raw Anthropic API is **not an officially supported integration path**.
-   Anthropic publishes no contract for it. Doing so may violate the Claude
-   Code / Anthropic consumer terms of service, and it may stop working at any
-   time without notice (the credential store layout, the OAuth client id, and
-   the token endpoint used here are all undocumented internals). If you need a
-   supported, stable integration, use an API key (``ANTHROPIC_API_KEY``) and
-   accept the metered billing that comes with it. You are responsible for
-   deciding whether the subscription path is acceptable for your use.
+The Claude Code subscription path is experimental. It depends on unstable CLI
+authentication details, including the credential-store layout and token refresh
+flow, and may stop working without notice.
 
 Discovery of the local Claude Code credential store is strictly **read-only**:
 logpose never writes to ``~/.claude/.credentials.json`` and never writes to the

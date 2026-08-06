@@ -1,15 +1,16 @@
 """End-to-end Codex example: one tool, one agent, streamed events.
 
-Together with ``examples/weather.py`` this is the only code in the repo that talks
-to a real model, so it doubles as the manual verification for the Codex auth path
-and — more importantly — for the reasoning round trip, which no mocked test can
-fully prove.
+The Codex subscription provider is experimental. It depends on unstable CLI
+authentication details and may stop working without notice.
+
+This example talks to a real model and doubles as a manual verification for the
+Codex authentication and reasoning round-trip paths.
 
 Run it
 ------
-Subscription auth::
+Experimental subscription auth::
 
-    codex login                              # from the Codex CLI
+    codex login
     uv run python examples/codex.py
 
 Nothing to export: logpose reads ``~/.codex/auth.json`` read-only.

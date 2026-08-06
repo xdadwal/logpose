@@ -1,8 +1,8 @@
-"""logpose — a universal agentic loop that services embed.
+"""logpose — a provider-neutral agent loop for Python applications.
 
-logpose owns the loop: it drives a provider, executes consumer-defined tools, and
-streams normalized events. It does not wrap any vendor agent harness, so nothing
-provider-specific leaks above :mod:`logpose.providers`.
+logpose drives a provider, executes application-defined tools, and streams
+normalized events. Provider-specific behavior stays behind
+:mod:`logpose.providers`.
 
 .. code-block:: python
 
