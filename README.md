@@ -26,12 +26,13 @@ Three things follow from that:
 - **Async-first, sync-friendly.** The core is `async`; a thin, correct sync
   facade wraps it for callers that are not.
 
-Backends today: **Anthropic** (Claude Code subscription token or BYOK API key),
-**Docker Model Runner** for local models, and a generic **OpenAI-compatible**
-backend covering OpenAI, Kimi, vLLM, Ollama, and LM Studio. The local and
-OpenAI-compatible paths add no dependency and need no credential.
+Backends today, one per credential rather than one per vendor: **`anthropic`** and
+**`openai`** for API keys, **`claude-code`** and **`codex`** for those CLIs'
+subscriptions, **`docker`** for local models, and **`openai-compat`** for anything
+speaking Chat Completions — Kimi, vLLM, Ollama, LM Studio. Everything but the
+Anthropic pair adds no dependency; the local path needs no credential.
 
-If you plan to use a Claude Code subscription token, read the
+If you plan to use either subscription provider, read the
 [disclaimer](#subscription-auth-disclaimer) first.
 
 ---
@@ -47,7 +48,9 @@ If you plan to use a Claude Code subscription token, read the
 - [Multi-turn conversations](#multi-turn-conversations)
 - [Sync usage](#sync-usage)
 - [Errors](#errors)
-- [Providers](#providers) — [local models](#local-models-via-docker-model-runner),
+- [Providers](#providers) — [Anthropic & Claude Code](#anthropic-and-claude-code),
+  [OpenAI & Codex](#openai-and-codex-the-responses-api),
+  [local models](#local-models-via-docker-model-runner),
   [OpenAI-compatible](#any-openai-compatible-server),
   [writing your own](#writing-your-own)
 - [⚠️ Subscription auth disclaimer](#subscription-auth-disclaimer)
@@ -106,66 +109,95 @@ A runnable version with streaming and a BYOK variant lives in
 
 ## Auth
 
-### Subscription (default path in v0.1)
+Four providers, two vendors, one rule each: **a provider accepts exactly one kind
+of credential.** `anthropic` and `openai` take an API key; `claude-code` and
+`codex` take that vendor's subscription token. Naming the provider is how you pick.
+
+| Provider | Credential | Endpoint |
+|---|--------|------|
+| `anthropic` | `ANTHROPIC_API_KEY` | `api.anthropic.com` |
+| `claude-code` | Claude Code subscription | same, plus the OAuth beta header |
+| `openai` | `OPENAI_API_KEY` | `api.openai.com/v1/responses` |
+| `codex` | ChatGPT subscription | `chatgpt.com/backend-api/codex` |
+
+A credential of the wrong kind neither satisfies a provider nor hides a usable one
+from it: `Agent("openai")` ignores a subscription token sitting in
+`~/.codex/auth.json` and goes on to find `$OPENAI_API_KEY`, and if there is no API
+key anywhere it fails with a message naming `codex` instead. That is the point of
+splitting them — it replaces a precedence policy you had to read about with a
+choice you already made.
+
+Every path reads its credential store **read-only** and refreshes in memory only.
+Blank and whitespace-only values count as absent everywhere.
+
+### API keys
 
 ```bash
-claude setup-token                        # from the Claude Code CLI
+export ANTHROPIC_API_KEY=sk-ant-api03-...      # Agent("anthropic")
+export OPENAI_API_KEY=sk-proj-...              # Agent("openai")
+```
+
+Or pass `api_key=` directly, which outranks the environment.
+
+### Claude Code subscription
+
+```bash
+claude setup-token
 export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
 
-### BYOK
+If Claude Code is installed and logged in, the export is optional — logpose reads
+its store: on macOS the Keychain entry `Claude Code-credentials`, elsewhere (and as
+a macOS fallback) `~/.claude/.credentials.json`, or
+`$CLAUDE_CONFIG_DIR/.credentials.json`. Precedence: `auth_token=`, then
+`$CLAUDE_CODE_OAUTH_TOKEN`, then the store.
+
+### Codex / ChatGPT subscription
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-api03-...
+codex login
 ```
 
-### Auto-discovery
+Nothing to export. logpose reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`),
+takes the token out of its `tokens` block, and refreshes it when the access token's
+own `exp` claim says it is due — the file records no expiry of its own. Precedence:
+`auth_token=`, then the store.
 
-If Claude Code is installed and logged in, you do not have to export anything.
-logpose reads its credential store **read-only**:
+`auth_mode` inside `auth.json` is ignored on purpose: logpose goes by which field
+actually holds a value, because the CLI writes files where the two disagree.
 
-- macOS: the Keychain entry `Claude Code-credentials`;
-- elsewhere (and as a macOS fallback): `~/.claude/.credentials.json`, or
-  `$CLAUDE_CONFIG_DIR/.credentials.json` when that variable is set.
+If `auth.json` names no ChatGPT account, `codex` raises `AuthError` before sending
+anything rather than letting the backend answer 401 with an empty body; override
+with `account_id=` or `$CHATGPT_ACCOUNT_ID`.
 
-An expired OAuth token is refreshed in memory for the life of the process.
-logpose **never writes back** to Claude Code's store.
+One thing logpose deliberately does not do on either subscription path: **persist a
+rotated refresh token.** A long-lived process refreshes fine, but a restart falls
+back to whatever is still on disk, so if the vendor rotates the token you re-run
+the CLI login. Writing it back would race the CLI for the file and break the
+read-only promise.
 
-### Precedence
+### CLI identity on the subscription paths
 
-First match wins:
+Both vendors expect requests on a subscription token to look like their own CLI's,
+and both subscription providers comply by default:
 
-| # | Source | Mode |
-|---|--------|------|
-| 1 | `Agent("anthropic", auth_token=...)` | subscription |
-| 2 | `Agent("anthropic", api_key=...)` | API key |
-| 3 | `CLAUDE_CODE_OAUTH_TOKEN` | subscription |
-| 4 | `ANTHROPIC_API_KEY` | API key |
-| 5 | Claude Code credential store | subscription |
+- **`claude-code`** prepends `You are Claude Code, Anthropic's official CLI for
+  Claude.` as the first system block, with your `system=` following it as a second
+  block. Without it the API answers `429 rate_limit_error` regardless of remaining
+  quota — a body carrying no detail and, tellingly, none of the
+  `anthropic-ratelimit-*` headers a genuine limit sends. It is a rejection, not an
+  exhausted quota.
+- **`codex`** opens `instructions` with `You are Codex, a coding agent based on
+  GPT-5.` and sends `originator: codex_cli_rs`.
 
-Blank and whitespace-only values count as absent. Nothing found raises
-`AuthError` telling you to run `claude setup-token`.
+Turn either off with `compat_claude_code=False` / `compat_codex_cli=False`, and
+expect the request to be rejected. The API-key providers never send these, and have
+no flag for it.
 
-Note that **`CLAUDE_CODE_OAUTH_TOKEN` outranks `ANTHROPIC_API_KEY`**. A stray
-`ANTHROPIC_API_KEY` set for unrelated tooling is common, and silently letting it
-win would bill per token someone who deliberately set up a subscription. Pass
-`api_key=` explicitly (and no `auth_token=`) to force BYOK regardless of the
-environment.
+The `chatgpt-account-id` and `OpenAI-Beta` headers are *not* part of that shim —
+they are the Codex wire protocol, and go out regardless of `compat_codex_cli`.
 
-### Claude Code identity on the subscription path
-
-A subscription (OAuth) request whose system prompt does not open with `You are
-Claude Code, Anthropic's official CLI for Claude.` is answered with `429
-rate_limit_error` — a body carrying no detail and, tellingly, none of the
-`anthropic-ratelimit-*` headers a genuine limit sends. It is a rejection, not an
-exhausted quota. logpose therefore prepends that line as the first system block
-whenever the resolved credential is OAuth, ahead of your own `system=`, which
-follows it as a second block. API-key requests are untouched.
-
-Override with `compat_claude_code`: `False` sends a bare OAuth request anyway
-(expect the 429), `True` forces the line on — useful with
-`Agent("anthropic", client=...)`, where logpose has no credential to inspect and
-falls back to reading the client's `auth_token`.
+### All providers
 
 Credential values never appear in a log line, a `repr`, an exception message, or
 a **traceback** — anything that must reference one redacts it to a prefix plus a
@@ -433,9 +465,77 @@ SDK, reads a credential, or touches the network.
 ```python
 from logpose import known_providers, resolve
 
-known_providers()   # ["anthropic", "docker", "docker-models", "openai-compat"]
+known_providers()
+# ["anthropic", "claude-code", "codex", "docker", "docker-models",
+#  "openai", "openai-compat"]
 resolve("anthropic", model_default="claude-opus-5")
 ```
+
+The four credentialed providers come in pairs — one API-key provider and one
+subscription provider per vendor, sharing a wire implementation but never a
+credential policy. See [Auth](#auth) for which takes what.
+
+### Anthropic and Claude Code
+
+```python
+agent = Agent("anthropic")                            # $ANTHROPIC_API_KEY
+agent = Agent("claude-code")                          # rides the local login
+agent = Agent("anthropic", model_default="claude-opus-5", thinking="disabled")
+```
+
+Same Messages API, same SDK, same body. They differ only in the auth header, the
+OAuth beta header, and the identity line.
+
+### OpenAI and Codex (the Responses API)
+
+```python
+agent = Agent("openai")                               # $OPENAI_API_KEY
+agent = Agent("codex")                                # rides `codex login`
+agent = Agent("codex", model="gpt-5.4")               # or $CODEX_MODEL
+agent = Agent("openai", reasoning_effort="high")      # low|medium|high|xhigh|max
+```
+
+**`openai` is not `openai-compat`.** They speak different APIs, and the
+difference is functional, not cosmetic:
+
+| | `openai` | `openai-compat` |
+|---|---|---|
+| API | Responses (`/responses`) | Chat Completions (`/chat/completions`) |
+| Served by | OpenAI only | llama.cpp, vLLM, Ollama, LM Studio, Kimi, OpenAI |
+| Reasoning across a tool call | preserved, as an encrypted item | **lost** — no field carries it |
+
+Pick `openai` for OpenAI's own reasoning models; pick `openai-compat` for
+anything that merely speaks OpenAI's older shape. Four things are specific to the
+Responses pair:
+
+- **Reasoning round-trips as an opaque block.** The API returns reasoning as a
+  separate output item holding a summary plus an `encrypted_content` blob you
+  cannot read, and it rejects a request where that item is not immediately
+  followed by the item it reasoned for. logpose keeps the whole item in a
+  `RawBlock` so it goes back byte-exact and in position. You still get
+  `ThinkingDelta` events live from the summary, but code walking
+  `result.messages` for a `ThinkingBlock` will not find one here. Whether
+  reasoning is emitted at all is the *backend's* call, and the two differ: on
+  `api.openai.com` a tool-calling turn carries a reasoning item, while on the
+  Codex subscription backend the same turn frequently carries none, and summaries
+  are often empty at low effort either way. Both observed live. Treat a turn with
+  no reasoning item as normal, not as a broken round trip.
+- **`max_tokens` is a no-op on `codex`.** The subscription backend answers `400
+  Unsupported parameter: max_output_tokens`, so logpose omits the field there and
+  the model's own budget applies. `openai` sends and honours it.
+- **`store` is always `false`.** logpose owns the history, so server-side
+  retention would buy nothing, and the subscription backend requires it.
+- **A `Conversation` belongs to the backend that produced it.** Handing Responses
+  history to Anthropic (or the reverse) is not supported: each backend's opaque
+  reasoning is meaningless to the other. The Responses providers silently drop
+  Anthropic thinking blocks rather than crashing, but the reasoning is gone.
+
+`codex` defaults to `gpt-5.5`, the highest-priority model the Codex CLI lists;
+`openai` defaults to `gpt-5.1`. They differ because ChatGPT-backend slugs and
+public API model ids are separate namespaces, and a provider whose default moved
+with the credential would be a debugging nightmare. Both defaults are verified
+against their live endpoint. Override with `model=`, `$CODEX_MODEL`, or
+`$OPENAI_RESPONSES_MODEL`.
 
 ### Local models via Docker Model Runner
 
@@ -473,7 +573,9 @@ Two things are worth knowing about local models specifically:
 
 ### Any OpenAI-compatible server
 
-The same backend drives llama.cpp, vLLM, Ollama, LM Studio, OpenAI, and Kimi:
+The same backend drives llama.cpp, vLLM, Ollama, LM Studio, and Kimi. For OpenAI's
+own models prefer the `openai` provider above, which speaks the newer Responses
+API and keeps reasoning across tool calls:
 
 ```python
 agent = Agent(
@@ -528,41 +630,50 @@ re-emitted verbatim, so an assistant turn always survives a `pause_turn` resend.
 
 ### Roadmap
 
-- **v0.1 (now)** — Anthropic (subscription OAuth + BYOK), Docker Model Runner
-  for local models, and a generic OpenAI-compatible backend that already covers
-  OpenAI, Kimi, vLLM, Ollama, and LM Studio. No extra dependency: the
-  OpenAI-compatible path is plain `httpx`, which logpose already ships.
-- **Later** — Codex subscription auth (needs harness delegation; the hybrid
-  decision gets revisited then), context compaction, a post-tool-call hook,
-  MCP tool ingestion.
+- **v0.1 (now)** — Anthropic and Claude Code (Messages API, API key or
+  subscription), OpenAI and Codex (Responses API, API key or subscription),
+  Docker Model Runner for local models, and a generic OpenAI-compatible backend
+  covering Kimi, vLLM, Ollama, and LM Studio. Only the Anthropic pair needs a
+  vendor SDK; everything else is plain `httpx`, which logpose already ships.
+- **Later** — context compaction, a post-tool-call hook, MCP tool ingestion, and
+  cross-backend conversation portability (today a `Conversation` belongs to the
+  backend that produced it).
 
 <a id="subscription-auth-disclaimer"></a>
 
 ## ⚠️ Subscription auth disclaimer
 
-**Using a Claude Code subscription token against the raw Anthropic API is not an
-officially supported integration.** Be clear-eyed about what that means:
+**Neither subscription provider — `claude-code` against the Anthropic API, nor
+`codex` against the Codex backend — is an officially supported integration.** Be
+clear-eyed about what that means:
 
-- It may conflict with Anthropic's terms of service for Claude Code and for
+- It may conflict with the vendor's terms of service for their CLI and for
   consumer subscriptions. logpose is not legal advice; read your agreement and
   decide for yourself.
-- It relies on undocumented details — the credential-store layout, the Keychain
-  service name, the OAuth client id, the token endpoint, and the
-  `anthropic-beta: oauth-2025-04-20` header. Any of these can change without
-  notice and break this path, possibly silently.
-- Anthropic **now requires** requests on these tokens to look like Claude
-  Code's: a subscription request whose system prompt does not open with the
-  Claude Code identity line comes back `429 rate_limit_error` regardless of how
-  much quota the account has left. logpose prepends that line automatically on
-  the OAuth path (`compat_claude_code`, which defaults to on for OAuth and off
-  for an API key). This is exactly the kind of undocumented requirement that can
-  change again without notice.
-- Rate limits, abuse handling, and account standing are Anthropic's call, not
-  ours. Using this path is at your own risk, including the risk to your account.
+- It relies on undocumented details that can change without notice and break the
+  path, possibly silently:
+  - **`claude-code`** — the credential-store layout, the Keychain service name,
+    the OAuth client id, the token endpoint, and the
+    `anthropic-beta: oauth-2025-04-20` header.
+  - **`codex`** — the `auth.json` layout, the OAuth client id, the
+    `auth.openai.com/oauth/token` endpoint, the `chatgpt.com/backend-api/codex`
+    path, the `chatgpt-account-id` / `OpenAI-Beta` / `originator` headers, and the
+    identity line.
+- **Both vendors require requests on these tokens to look like their CLI's.** An
+  Anthropic subscription request whose system prompt does not open with the Claude
+  Code identity line comes back `429 rate_limit_error` regardless of remaining
+  quota; the Codex backend likewise expects a CLI-shaped `instructions` field and
+  an `originator` header. Both providers send them automatically
+  (`compat_claude_code` / `compat_codex_cli`). These are exactly the kind of
+  undocumented requirements that can change again without notice.
+- Rate limits, abuse handling, and account standing are the vendor's call, not
+  ours. Using either path is at your own risk, including the risk to your account.
 
-**BYOK (`ANTHROPIC_API_KEY`) is the supported path.** It is one environment
-variable, it goes through the same provider and the same loop, and it is what
-you should use in production or anywhere the consequences of breakage matter.
+**The API-key providers are the supported paths** — `anthropic` with
+`ANTHROPIC_API_KEY`, `openai` with `OPENAI_API_KEY`. One environment variable, the
+same loop, the same events, and what you should use in production or anywhere the
+consequences of breakage matter. Because they are separate providers, choosing one
+is also a guarantee: no stored subscription token can divert them.
 
 ## Contributing
 
@@ -572,7 +683,7 @@ Contributions are welcome. The short version:
 git clone https://github.com/xdadwal/logpose.git
 cd logpose
 uv sync
-uv run pytest -q                          # 492 tests, no network
+uv run pytest -q                          # 784 tests, no network
 uv run ruff check && uv run mypy src/
 ```
 

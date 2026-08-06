@@ -104,6 +104,48 @@ def _anthropic_factory(**kwargs: Any) -> Provider:
     return AnthropicProvider(**kwargs)
 
 
+def _claude_code_factory(**kwargs: Any) -> Provider:
+    """Build the Claude Code provider, importing its module lazily.
+
+    Args:
+        **kwargs: Forwarded to ``ClaudeCodeProvider``.
+
+    Returns:
+        A configured Claude Code provider.
+    """
+    from logpose.providers.claude_code import ClaudeCodeProvider
+
+    return ClaudeCodeProvider(**kwargs)
+
+
+def _codex_factory(**kwargs: Any) -> Provider:
+    """Build the Codex provider, importing its module lazily.
+
+    Args:
+        **kwargs: Forwarded to ``CodexProvider``.
+
+    Returns:
+        A configured Codex provider.
+    """
+    from logpose.providers.codex import CodexProvider
+
+    return CodexProvider(**kwargs)
+
+
+def _openai_factory(**kwargs: Any) -> Provider:
+    """Build the OpenAI Responses provider, importing its module lazily.
+
+    Args:
+        **kwargs: Forwarded to ``OpenAIProvider``.
+
+    Returns:
+        A configured OpenAI provider.
+    """
+    from logpose.providers.openai import OpenAIProvider
+
+    return OpenAIProvider(**kwargs)
+
+
 def _docker_factory(**kwargs: Any) -> Provider:
     """Build the Docker Model Runner provider, importing its module lazily.
 
@@ -133,6 +175,9 @@ def _openai_compat_factory(**kwargs: Any) -> Provider:
 
 
 register("anthropic", _anthropic_factory)
+register("claude-code", _claude_code_factory)
+register("codex", _codex_factory)
 register("docker", _docker_factory)
+register("openai", _openai_factory)
 register("docker-models", _docker_factory)
 register("openai-compat", _openai_compat_factory)

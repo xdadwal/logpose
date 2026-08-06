@@ -74,9 +74,45 @@ inside the factory, not at the top of the file — so `import logpose` continues
 to pull in no vendor SDK. There is a test that enforces this.
 
 The stream must end with exactly one `CompletionDone` whose `message` is the
-assembled assistant turn, blocks in wire order. `logpose/providers/openai_compat.py`
-is the reference for a backend whose wire format differs substantially from
-logpose's model; its module docstring lists the three mismatches it absorbs.
+assembled assistant turn, blocks in wire order. Two existing backends document
+their own divergences from logpose's model in their module docstrings, and between
+them cover most of what a new one will hit:
+
+- `logpose/providers/openai_compat.py` — a message-shaped wire format (Chat
+  Completions): tool-result fan-out, string tool arguments streamed in fragments,
+  reasoning with no signature to preserve.
+- `logpose/providers/codex.py` — an *item*-shaped wire format (Responses), where a
+  turn is a flat list of siblings rather than a message with content blocks, and
+  where opaque reasoning has to survive a round trip in order. If your backend
+  returns anything logpose does not model, `RawBlock` is how it goes back
+  verbatim.
+
+Anything shared between backends goes in a private helper module —
+`providers/_redact.py`, `providers/_toolargs.py` — never imported from a sibling
+provider, or resolving one backend would drag in the other's SDK. The same rule
+applies under `auth/`: `auth/_common.py` holds the backend-neutral credential
+core, and each vendor module owns only its own store, endpoint, and error strings.
+
+## One provider per credential
+
+A provider accepts **exactly one kind of credential**, and where a vendor supports
+both an API key and a subscription token that means two registered providers over a
+shared private base: `anthropic`/`claude-code` over `_anthropic_base.py`,
+`openai`/`codex` over `_responses.py`.
+
+Do not add a provider that branches on the credential it happens to resolve. Both
+pairs above started life as one class doing exactly that, and the cost showed up as
+state that could not be settled at construction: the endpoint, the auth headers,
+the identity shim, and whether `max_output_tokens` was a legal field all depended on
+a fact discovered on the first request. One provider had to rebuild its SDK client
+when the kind changed mid-conversation; the other had to guess its own `base_url`
+in a property. Splitting them deleted both mechanisms, and made the credential
+precedence rules a per-provider fact rather than a policy to document.
+
+The pattern to copy: subclass the shared base, set the class variables that name
+your credential kind and endpoint, and override only the hooks that genuinely
+differ. `DockerModelsProvider` is the same shape applied to a policy difference
+rather than a credential one.
 
 ## Conventions
 

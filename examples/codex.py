@@ -1,27 +1,30 @@
-"""End-to-end smoke example: one tool, one agent, streamed events.
+"""End-to-end Codex example: one tool, one agent, streamed events.
 
-This is the only place in the repo that talks to a real model, so it doubles as
-the manual verification for the auth path.
+Together with ``examples/weather.py`` this is the only code in the repo that talks
+to a real model, so it doubles as the manual verification for the Codex auth path
+and — more importantly — for the reasoning round trip, which no mocked test can
+fully prove.
 
 Run it
 ------
-Subscription auth (the default here)::
+Subscription auth::
 
-    claude setup-token                       # prints a long-lived OAuth token
-    export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-    uv run python examples/weather.py
+    codex login                              # from the Codex CLI
+    uv run python examples/codex.py
 
-If Claude Code is already installed and logged in on this machine, the export is
-optional: logpose discovers the credential store read-only (macOS Keychain, or
-``~/.claude/.credentials.json``).
+Nothing to export: logpose reads ``~/.codex/auth.json`` read-only.
 
 Bring-your-own-key instead::
 
-    export ANTHROPIC_API_KEY=sk-ant-api03-...
-    uv run python examples/weather.py --byok
+    export OPENAI_API_KEY=sk-proj-...
+    uv run python examples/codex.py --byok
 
-Expected output: a couple of thinking/text deltas, a ``get_weather`` tool call
-and its result, then a final answer and a non-zero token count.
+Expected output: some dim reasoning text, a ``get_weather`` call and its result,
+then a final answer, a non-zero token count, and — the thing actually being
+verified — ``reasoning items resent: 1`` or more. That line proves the second turn
+carried the model's opaque reasoning back in position; if it reads ``0`` while
+reasoning events did stream, the round trip is broken even though the run
+succeeded.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from logpose import (
     Agent,
     AuthError,
     LogposeError,
+    RawBlock,
     RunEnd,
     TextDelta,
     ThinkingDelta,
@@ -68,33 +72,31 @@ def build_agent(*, byok: bool) -> Agent:
     """Build the agent for this example.
 
     Args:
-        byok: When ``True``, use the ``anthropic`` provider, which accepts only
-            an API key. When ``False``, use ``claude-code``, which accepts only a
-            subscription token. The two are separate providers, so the choice is
-            made here rather than inferred from whatever credential turns up.
+        byok: When ``True``, use the ``openai`` provider, which accepts only an
+            API key and talks to ``api.openai.com``. When ``False``, use
+            ``codex``, which accepts only a subscription token and talks to the
+            Codex backend. The two are separate providers, so the choice is made
+            here rather than inferred from whatever credential turns up.
 
     Returns:
         A configured :class:`~logpose.Agent`.
     """
-    # --- BYOK variant -------------------------------------------------------
-    # The `anthropic` provider accepts only an API key, so naming it is how a
-    # service pins itself to per-token billing — no stored subscription token can
-    # divert it.
     if byok:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            raise SystemExit("--byok needs ANTHROPIC_API_KEY to be set.")
+            raise SystemExit("--byok needs OPENAI_API_KEY to be set.")
         return Agent(
-            "anthropic",
+            "openai",
             api_key=api_key,
             tools=[get_weather],
             system="You are a terse weather assistant.",
         )
 
-    # --- default: the Claude Code subscription -------------------------------
+    # Default: the Codex subscription store. reasoning_effort is left at "medium";
+    # "low" makes reasoning summaries mostly empty, which makes this example look
+    # broken when it is not.
     return Agent(
-        "claude-code",
-        model="claude-opus-5",
+        "codex",
         tools=[get_weather],
         system="You are a terse weather assistant.",
         max_iterations=8,
@@ -125,17 +127,26 @@ async def main() -> int:
             elif isinstance(event, TurnEnd):
                 print(f"\n  [turn ended: {event.stop_reason}]", flush=True)
             elif isinstance(event, RunEnd):
-                usage = event.result.usage
-                print(f"\n\n--- {event.result.iterations} iteration(s) ---")
-                print(f"answer: {event.result.text}")
+                result = event.result
+                usage = result.usage
+                # Reasoning lives in a RawBlock, not a ThinkingBlock: it carries an
+                # opaque encrypted_content that has to go back byte-exact.
+                reasoning = [
+                    block
+                    for message in result.messages
+                    for block in message.content
+                    if isinstance(block, RawBlock) and block.block_type == "reasoning"
+                ]
+                print(f"\n\n--- {result.iterations} iteration(s) ---")
+                print(f"answer: {result.text}")
                 print(
                     f"tokens: in={usage.input_tokens} out={usage.output_tokens} "
-                    f"cache_read={usage.cache_read_input_tokens} "
-                    f"cache_write={usage.cache_creation_input_tokens}"
+                    f"cache_read={usage.cache_read_input_tokens}"
                 )
+                print(f"reasoning items resent: {len(reasoning)}")
     except AuthError as exc:
         print(f"\nauth failed: {exc}", file=sys.stderr)
-        print("Run `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.", file=sys.stderr)
+        print("Run `codex login`, or export OPENAI_API_KEY.", file=sys.stderr)
         return 2
     except LogposeError as exc:
         print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -144,14 +155,6 @@ async def main() -> int:
         await agent.aclose()
     return 0
 
-
-# The blocking spelling of the same thing, for callers that are not async:
-#
-#     from logpose import SyncAgent
-#
-#     with SyncAgent(build_agent(byok=False)) as agent:
-#         for event in agent.stream(prompt):
-#             ...
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
