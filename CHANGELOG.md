@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Reworked the README around logpose's use cases, embeddable agent loop,
+  supported authentication paths, local-model workflow, and future roadmap.
+- Made API-key authentication the default in the primary weather example and
+  labeled the Claude Code and Codex subscription integrations as experimental.
+
 ### Added
 
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API

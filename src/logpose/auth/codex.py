@@ -6,17 +6,9 @@ the same :class:`~logpose.auth._common.Credential`; the Codex provider decides
 how to present it on the wire and which endpoint to send it to (the ChatGPT
 backend for ``oauth``, ``api.openai.com`` for ``api_key``).
 
-.. warning::
-
-   **Gray area — read this.** Using a ChatGPT *subscription* token against the
-   Codex backend is **not an officially supported integration path**. OpenAI
-   publishes no contract for it. Doing so may violate the Codex / ChatGPT
-   consumer terms of service, and it may stop working at any time without notice
-   (the ``auth.json`` layout, the OAuth client id, the token endpoint, and the
-   ``backend-api/codex`` path used here are all undocumented internals). If you
-   need a supported, stable integration, use an API key (``OPENAI_API_KEY``) and
-   accept the metered billing that comes with it. You are responsible for
-   deciding whether the subscription path is acceptable for your use.
+The Codex subscription path is experimental. It depends on unstable CLI
+authentication details, including the ``auth.json`` layout and token refresh
+flow, and may stop working without notice.
 
 Discovery of the local Codex credential store is strictly **read-only**: logpose
 never writes to ``~/.codex/auth.json``. Refreshed tokens are held in memory for

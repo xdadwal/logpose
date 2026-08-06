@@ -1,24 +1,24 @@
 """End-to-end smoke example: one tool, one agent, streamed events.
 
-This is the only place in the repo that talks to a real model, so it doubles as
-the manual verification for the auth path.
+This example talks to a real model and doubles as a manual verification for the
+selected authentication path.
 
 Run it
 ------
-Subscription auth (the default here)::
-
-    claude setup-token                       # prints a long-lived OAuth token
-    export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-    uv run python examples/weather.py
-
-If Claude Code is already installed and logged in on this machine, the export is
-optional: logpose discovers the credential store read-only (macOS Keychain, or
-``~/.claude/.credentials.json``).
-
-Bring-your-own-key instead::
+Anthropic API key (the default)::
 
     export ANTHROPIC_API_KEY=sk-ant-api03-...
-    uv run python examples/weather.py --byok
+    uv run python examples/weather.py
+
+Experimental Claude Code subscription auth::
+
+    claude setup-token
+    export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
+    uv run python examples/weather.py --claude-code
+
+If Claude Code is already installed and logged in, the export is optional.
+This path depends on unstable CLI authentication details and may stop working
+without notice.
 
 Expected output: a couple of thinking/text deltas, a ``get_weather`` tool call
 and its result, then a final answer and a non-zero token count.
@@ -64,37 +64,32 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
     return f"{degrees}{unit.upper()}, {description}"
 
 
-def build_agent(*, byok: bool) -> Agent:
+def build_agent(*, claude_code: bool) -> Agent:
     """Build the agent for this example.
 
     Args:
-        byok: When ``True``, use the ``anthropic`` provider, which accepts only
-            an API key. When ``False``, use ``claude-code``, which accepts only a
-            subscription token. The two are separate providers, so the choice is
-            made here rather than inferred from whatever credential turns up.
+        claude_code: When ``True``, use the experimental ``claude-code``
+            subscription provider. Otherwise use ``anthropic`` with an API key.
 
     Returns:
         A configured :class:`~logpose.Agent`.
     """
-    # --- BYOK variant -------------------------------------------------------
-    # The `anthropic` provider accepts only an API key, so naming it is how a
-    # service pins itself to per-token billing — no stored subscription token can
-    # divert it.
-    if byok:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise SystemExit("--byok needs ANTHROPIC_API_KEY to be set.")
+    if claude_code:
         return Agent(
-            "anthropic",
-            api_key=api_key,
+            "claude-code",
             tools=[get_weather],
             system="You are a terse weather assistant.",
+            max_iterations=8,
         )
 
-    # --- default: the Claude Code subscription -------------------------------
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise SystemExit(
+            "Set ANTHROPIC_API_KEY, or pass --claude-code for the experimental path."
+        )
     return Agent(
-        "claude-code",
-        model="claude-opus-5",
+        "anthropic",
+        api_key=api_key,
         tools=[get_weather],
         system="You are a terse weather assistant.",
         max_iterations=8,
@@ -107,7 +102,8 @@ async def main() -> int:
     Returns:
         A process exit code.
     """
-    agent = build_agent(byok="--byok" in sys.argv)
+    use_claude_code = "--claude-code" in sys.argv
+    agent = build_agent(claude_code=use_claude_code)
     prompt = "What's the weather in Pune and in Reykjavik? Answer in one sentence."
 
     print(f"> {prompt}\n")
@@ -135,7 +131,10 @@ async def main() -> int:
                 )
     except AuthError as exc:
         print(f"\nauth failed: {exc}", file=sys.stderr)
-        print("Run `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.", file=sys.stderr)
+        if use_claude_code:
+            print("Run `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.", file=sys.stderr)
+        else:
+            print("Export ANTHROPIC_API_KEY.", file=sys.stderr)
         return 2
     except LogposeError as exc:
         print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -149,7 +148,7 @@ async def main() -> int:
 #
 #     from logpose import SyncAgent
 #
-#     with SyncAgent(build_agent(byok=False)) as agent:
+#     with SyncAgent(build_agent(claude_code=False)) as agent:
 #         for event in agent.stream(prompt):
 #             ...
 

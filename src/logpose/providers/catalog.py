@@ -66,10 +66,10 @@ class ProviderInfo:
             backend. Every built-in provider does; a third-party one may not.
         env_vars: Environment variables that configure the backend, credential
             first. Presented in the order a user would set them.
-        officially_supported: ``False`` for the two subscription backends, which
-            ride an undocumented vendor CLI integration and may break without
-            notice or conflict with that vendor's terms of service. A UI offering
-            these should say so — see the README's disclaimer.
+        officially_supported: ``False`` for the two experimental subscription
+            backends, which depend on unstable CLI authentication details and may
+            break without notice. A UI offering these should label them
+            experimental.
         credential_module: Dotted path of the :mod:`logpose.auth` module that
             resolves this backend's credential, or ``None`` when it needs none.
             Imported lazily, and only by :func:`logpose.provider_status`.

@@ -41,11 +41,10 @@ src/logpose/
 └── providers/        backends; nothing above this directory is provider-specific
 ```
 
-The single most important invariant: **nothing above `logpose/providers/` may
-know which backend is in use.** A provider turns a `CompletionRequest` into a
-stream of events and does nothing else — in particular it cannot execute a tool,
-which is why `ToolSpec` carries no handler. If you find yourself needing a
-provider-specific branch in `agent.py`, that is the bug.
+The main architectural invariant is that nothing above `logpose/providers/`
+depends on a specific backend. A provider turns a `CompletionRequest` into a
+stream of events and does not execute tools, which is why `ToolSpec` carries no
+handler. Provider-specific behavior belongs behind the provider boundary.
 
 ## Adding a provider
 
@@ -100,14 +99,10 @@ both an API key and a subscription token that means two registered providers ove
 shared private base: `anthropic`/`claude-code` over `_anthropic_base.py`,
 `openai`/`codex` over `_responses.py`.
 
-Do not add a provider that branches on the credential it happens to resolve. Both
-pairs above started life as one class doing exactly that, and the cost showed up as
-state that could not be settled at construction: the endpoint, the auth headers,
-the identity shim, and whether `max_output_tokens` was a legal field all depended on
-a fact discovered on the first request. One provider had to rebuild its SDK client
-when the kind changed mid-conversation; the other had to guess its own `base_url`
-in a property. Splitting them deleted both mechanisms, and made the credential
-precedence rules a per-provider fact rather than a policy to document.
+Keep credential types explicit rather than building a provider that changes
+behavior according to whichever credential it finds. The endpoint, headers,
+request fields, and compatibility settings are then known at construction time,
+and each provider can document a simple credential policy.
 
 The pattern to copy: subclass the shared base, set the class variables that name
 your credential kind and endpoint, and override only the hooks that genuinely
