@@ -50,6 +50,7 @@ from logpose.messages import (
     Usage,
 )
 from logpose.providers._redact import redact, scrub_exception_in_place
+from logpose.providers._toolargs import UNPARSED_ARGUMENTS_KEY, parse_tool_arguments
 from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
@@ -84,15 +85,6 @@ AUTO_MODEL = "auto"
 
 Resolution happens on the first request, not in ``__init__``, so constructing a
 provider never touches the network.
-"""
-
-UNPARSED_ARGUMENTS_KEY = "__logpose_unparsed_arguments__"
-"""Key holding tool arguments the model emitted as invalid JSON.
-
-Surfacing the raw string as an unexpected argument makes the loop's schema
-validation fail, which comes back to the model as a tool error it can retry —
-strictly better than raising (kills the run) or silently substituting ``{}``
-(the tool runs with wrong arguments).
 """
 
 _RETRYABLE_STATUS = frozenset({408, 409, 429})
@@ -281,25 +273,6 @@ def _map_usage(raw: Any) -> Usage:
         output_tokens=int(raw.get("completion_tokens") or 0),
         cache_read_input_tokens=cached,
     )
-
-
-def _parse_arguments(raw: str) -> dict[str, Any]:
-    """Parse streamed tool-call arguments, tolerating malformed JSON.
-
-    Args:
-        raw: The concatenated ``function.arguments`` fragments.
-
-    Returns:
-        The parsed object, or ``{UNPARSED_ARGUMENTS_KEY: raw}`` when the model
-        produced something that is not a JSON object.
-    """
-    if not raw.strip():
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        return {UNPARSED_ARGUMENTS_KEY: raw}
-    return parsed if isinstance(parsed, dict) else {UNPARSED_ARGUMENTS_KEY: raw}
 
 
 def _status_is_retryable(status_code: int | None) -> bool:
@@ -618,7 +591,7 @@ class OpenAICompatProvider:
                 ToolUseBlock(
                     id=frag["id"] or f"call_{index}",
                     name=frag["name"] or "",
-                    input=_parse_arguments("".join(frag["args"])),
+                    input=parse_tool_arguments("".join(frag["args"])),
                 )
             )
 
