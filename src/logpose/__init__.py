@@ -80,12 +80,19 @@ from logpose.messages import (
 from logpose.providers import (
     CompletionDone,
     CompletionRequest,
+    CredentialKind,
     Provider,
     ProviderEvent,
+    ProviderInfo,
+    ProviderStatus,
     ProviderTextDelta,
     ProviderThinkingDelta,
     ToolSpec,
+    WireApi,
     known_providers,
+    provider_catalog,
+    provider_info,
+    provider_status,
     register,
     resolve,
 )
@@ -149,4 +156,12 @@ __all__ = [
     "register",
     "resolve",
     "known_providers",
+    # discovering what is available
+    "provider_catalog",
+    "provider_info",
+    "provider_status",
+    "ProviderInfo",
+    "ProviderStatus",
+    "CredentialKind",
+    "WireApi",
 ]

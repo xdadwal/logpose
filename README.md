@@ -48,7 +48,8 @@ If you plan to use either subscription provider, read the
 - [Multi-turn conversations](#multi-turn-conversations)
 - [Sync usage](#sync-usage)
 - [Errors](#errors)
-- [Providers](#providers) — [Anthropic & Claude Code](#anthropic-and-claude-code),
+- [Providers](#providers) — [discovering what is available](#discovering-what-is-available),
+  [Anthropic & Claude Code](#anthropic-and-claude-code),
   [OpenAI & Codex](#openai-and-codex-the-responses-api),
   [local models](#local-models-via-docker-model-runner),
   [OpenAI-compatible](#any-openai-compatible-server),
@@ -475,6 +476,82 @@ The four credentialed providers come in pairs — one API-key provider and one
 subscription provider per vendor, sharing a wire implementation but never a
 credential policy. See [Auth](#auth) for which takes what.
 
+### Discovering what is available
+
+Three calls, deliberately separate because they cost very different amounts.
+
+**`provider_catalog()`** — pure data. No credential is read, no provider module is
+imported, nothing touches the network, so it is safe to call in a render loop:
+
+```python
+from logpose import provider_catalog
+
+for info in provider_catalog():
+    print(info.name, info.api, info.credential, info.default_model, info.env_vars)
+
+# anthropic     messages          api_key      claude-opus-5  ('ANTHROPIC_API_KEY',)
+# claude-code   messages          subscription claude-opus-5  ('CLAUDE_CODE_OAUTH_TOKEN', ...)
+# codex         responses         subscription gpt-5.5        ('CODEX_HOME', ...)
+# docker        chat-completions  none         None           ('DOCKER_MODEL_RUNNER_URL', ...)
+# openai        responses         api_key      gpt-5.1        ('OPENAI_API_KEY', ...)
+# openai-compat chat-completions  optional     None           ('OPENAI_BASE_URL', ...)
+```
+
+One entry per *backend*: `docker-models` shows up in `docker`'s `aliases`, not as a
+seventh row. `provider_info("docker-models")` resolves the alias.
+
+Two fields exist so a UI does not have to hardcode provider names.
+`officially_supported` is `False` for the two subscription backends, which ride an
+undocumented vendor CLI integration — show a warning next to those.
+`preserves_reasoning` is `False` for Chat Completions, which cannot carry a
+reasoning model's chain of thought across a tool call.
+
+**`await provider_status()`** — reads credential stores, so it is async and opt-in.
+It never raises for an absent credential; that is data, not an error:
+
+```python
+from logpose import provider_status
+
+for status in await provider_status():
+    print(status.name, "ready" if status else status.detail)
+
+# anthropic     No Anthropic API key found. Export ANTHROPIC_API_KEY, or pass api_key=...
+# claude-code   ready
+# codex         ready
+# docker        ready
+# openai        ready
+# openai-compat No endpoint configured. Pass base_url=... or set $OPENAI_BASE_URL.
+```
+
+`detail` is the same message the provider itself would have raised, so it is already
+phrased as an instruction. Readiness means *a credential of the right kind was
+found* — not that the token is unexpired or the network is up, so a `ready` provider
+can still fail on the first request.
+
+**`await provider.list_models()`** — authoritative, per backend, needs the network.
+Every built-in provider implements it, over three different mechanisms:
+
+```python
+models = await resolve("openai").list_models()   # GET /models      -> 124 models
+models = await resolve("codex").list_models()    # GET /models      -> 4 models
+models = await resolve("claude-code").list_models()  # SDK models.list -> 10 models
+models = await resolve("docker").list_models()   # the runner's inventory
+```
+
+Two things to know. The lists are raw and unfiltered — `openai` returns everything
+the key can see, including embeddings and realtime models, so a chat picker should
+filter. And the Codex backend **gates its answer on a declared client version**: the
+`client_version` query parameter is required, and a different value is served a
+different set. logpose pins `CODEX_CLIENT_VERSION` for reproducibility; override it
+with `Agent("codex", client_version=...)`.
+
+Putting it together, which is the point:
+
+```python
+ready = {s.name for s in await provider_status() if s.ready}
+choices = [i for i in provider_catalog() if i.name in ready and i.officially_supported]
+```
+
 ### Anthropic and Claude Code
 
 ```python
@@ -683,7 +760,7 @@ Contributions are welcome. The short version:
 git clone https://github.com/xdadwal/logpose.git
 cd logpose
 uv sync
-uv run pytest -q                          # 784 tests, no network
+uv run pytest -q                          # 852 tests, no network
 uv run ruff check && uv run mypy src/
 ```
 

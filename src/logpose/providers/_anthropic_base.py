@@ -98,6 +98,10 @@ _ADAPTIVE_THINKING: dict[str, Any] = {"type": "adaptive", "display": "summarized
 
 _DISABLED_THINKING: dict[str, Any] = {"type": "disabled"}
 
+_MODEL_PAGE_SIZE = 1000
+# One page is plenty — Anthropic lists tens of models, not thousands — so
+# list_models avoids pagination entirely.
+
 _RETRYABLE_STATUS = frozenset({408, 409, 429})
 
 _STOP_REASONS: dict[str, StopReason] = {
@@ -509,6 +513,26 @@ class AnthropicBaseProvider:
             self._apply_credential(self._client, credential)
         self._credential_value = credential.value
         return self._client
+
+    async def list_models(self) -> list[str]:
+        """Ask Anthropic which models it serves.
+
+        Uses the SDK's own ``models.list``, so it follows whatever the credential is
+        entitled to see.
+
+        Returns:
+            Model identifiers, newest first as Anthropic orders them.
+
+        Raises:
+            AuthError: If no usable credential could be resolved.
+            ProviderError: If the request fails.
+        """
+        client = await self.get_client()
+        try:
+            page = await client.models.list(limit=_MODEL_PAGE_SIZE)
+        except anthropic.AnthropicError as exc:
+            raise self._provider_error(exc) from exc
+        return [model.id for model in page.data if isinstance(getattr(model, "id", None), str)]
 
     async def aclose(self) -> None:
         """Close the underlying client if this provider created it."""

@@ -411,6 +411,36 @@ def _status_is_retryable(status_code: int | None) -> bool:
     return status_code in _RETRYABLE_STATUS or status_code >= 500
 
 
+def _model_ids(payload: Any) -> list[str]:
+    """Pull model identifiers out of a ``GET /models`` response.
+
+    Accepts both shapes the two endpoints use: ``{"data": [{"id": ...}]}`` on the
+    public API and ``{"models": [{"slug": ...}]}`` on the Codex backend. Entries
+    without a usable identifier are skipped rather than raising, so one unfamiliar
+    row cannot break discovery.
+
+    Args:
+        payload: The decoded response body.
+
+    Returns:
+        Identifiers in the order the backend listed them.
+    """
+    if not isinstance(payload, dict):
+        return []
+    for key, id_field in (("data", "id"), ("models", "slug")):
+        entries = payload.get(key)
+        if not isinstance(entries, list):
+            continue
+        found = [
+            entry[id_field]
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get(id_field), str)
+        ]
+        if found:
+            return found
+    return []
+
+
 # ---------------------------------------------------------------------------
 # provider base
 # ---------------------------------------------------------------------------
@@ -604,6 +634,43 @@ class ResponsesProvider:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
         return self._client
+
+    def _models_params(self) -> dict[str, str]:
+        """Query parameters for the model-list request.
+
+        Returns:
+            Nothing by default; the Codex backend needs a client version.
+        """
+        return {}
+
+    async def list_models(self) -> list[str]:
+        """Ask the backend which models it serves.
+
+        Both endpoints answer ``GET /models`` but in different shapes — the public
+        API returns ``{"data": [{"id": ...}]}`` and the Codex backend returns
+        ``{"models": [{"slug": ...}]}`` — so both are accepted rather than split
+        across two overrides.
+
+        Returns:
+            Model identifiers in the order the backend reported them, which on the
+            Codex backend is its own priority order.
+
+        Raises:
+            AuthError: If no credential could be resolved.
+            ProviderError: If the backend is unreachable or rejects the request.
+        """
+        credential = await self._current_credential()
+        try:
+            response = await self._http().get(
+                f"{self.base_url}/models",
+                params=self._models_params(),
+                headers=self._headers(credential),
+            )
+        except httpx.HTTPError as exc:
+            raise self._transport_error(exc) from exc
+        if response.status_code >= 400:
+            raise self._status_error(response.status_code, response.text)
+        return _model_ids(response.json())
 
     async def aclose(self) -> None:
         """Close the underlying HTTP client if this provider created it."""

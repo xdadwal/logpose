@@ -25,6 +25,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Claude Code provider** (`claude-code`) — the Anthropic Messages API on a
   Claude Code subscription token, with the identity line and the OAuth beta
   header. `anthropic` is now API-key-only.
+- **Provider discovery**, so an embedding application can build a picker without
+  hardcoding a table of its own. Three calls, separate because they cost very
+  different amounts:
+  - `provider_catalog()` / `provider_info(name)` return `ProviderInfo` — name,
+    aliases, wire API, credential kind, default model, configuring env vars, and
+    two flags a UI would otherwise hardcode: `officially_supported` (`False` for the
+    subscription backends) and `preserves_reasoning` (`False` for Chat Completions,
+    which cannot carry a reasoning model's chain of thought across a tool call).
+    Pure data — no credential is read, no provider module is imported, nothing
+    touches the network. The metadata is declared beside `register()` rather than on
+    the provider classes precisely so asking what the options are cannot drag in a
+    vendor SDK; a test pins each declaration against the class it describes.
+  - `await provider_status()` returns `ProviderStatus` — whether each backend is
+    usable right now, with `detail` carrying the same actionable message the provider
+    would have raised. Async and opt-in because it reads credential stores, including
+    a Keychain subprocess. Never raises for an absent credential.
+  - `provider.list_models()` is now implemented by **every** built-in provider, over
+    three mechanisms: `GET /models` for the Responses and Chat Completions backends,
+    and the SDK's `models.list` for the Anthropic pair. Both `GET /models` response
+    shapes are accepted (`data[].id` and the Codex backend's `models[].slug`).
+- `register()` accepts an optional `info=ProviderInfo(...)`. Third-party providers
+  that omit it stay fully resolvable and are simply absent from the catalog.
+- `CODEX_CLIENT_VERSION` — the Codex `GET /models` endpoint requires a
+  `client_version` query parameter and **gates its answer on it**; a lower version is
+  served a different, sometimes larger, set. Pinned to a constant for reproducibility
+  and overridable with `client_version=`.
   - Model reasoning round-trips as a verbatim `RawBlock`, not a `ThinkingBlock`.
     The Responses API returns reasoning as a sibling output item carrying an
     opaque `encrypted_content` blob that must be resent byte-exact and in

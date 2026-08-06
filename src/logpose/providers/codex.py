@@ -51,6 +51,16 @@ would make the request bytes depend on local state, which is both unreproducible
 and fatal to prompt caching.
 """
 
+CODEX_CLIENT_VERSION = "0.142.5"
+"""``client_version`` declared when listing models (undocumented; may change).
+
+``GET /models`` on the Codex backend requires this query parameter and **gates its
+answer on it** — a lower version is served a different, sometimes larger, set. So it
+is not a formality: it decides which models you are told about. Pinned to a constant
+rather than read from the CLI's own cache so the request is reproducible, and
+overridable per provider with ``client_version=``.
+"""
+
 _FALLBACK_INSTRUCTIONS = "You are a helpful assistant."
 
 
@@ -113,6 +123,7 @@ class CodexProvider(ResponsesProvider):
         auth_token: str | None = None,
         account_id: str | None = None,
         compat_codex_cli: bool = True,
+        client_version: str = CODEX_CLIENT_VERSION,
         **kwargs: Any,
     ) -> None:
         """Configure the Codex backend.
@@ -126,6 +137,8 @@ class CodexProvider(ResponsesProvider):
                 line ahead of ``instructions``, plus ``originator``. On by
                 default because the backend expects it; turning it off will
                 probably be rejected.
+            client_version: Declared to :meth:`list_models`, which the backend
+                gates on. See :data:`CODEX_CLIENT_VERSION`.
             **kwargs: Forwarded to
                 :class:`~logpose.providers._responses.ResponsesProvider`.
         """
@@ -133,6 +146,16 @@ class CodexProvider(ResponsesProvider):
         self._explicit_auth_token = auth_token
         self._explicit_account_id = account_id
         self.compat_codex_cli = compat_codex_cli
+        self.client_version = client_version
+
+    def _models_params(self) -> dict[str, str]:
+        """Declare a client version, which ``GET /models`` requires.
+
+        Returns:
+            The ``client_version`` query parameter. Without it the backend answers
+            ``400`` naming the missing field.
+        """
+        return {"client_version": self.client_version}
 
     def __repr__(self) -> str:
         """Return an unambiguous representation. Never includes a credential."""
