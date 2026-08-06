@@ -80,6 +80,14 @@ EXPECTED_API = {
     "register",
     "resolve",
     "known_providers",
+    # discovering what is available
+    "provider_catalog",
+    "provider_info",
+    "provider_status",
+    "ProviderInfo",
+    "ProviderStatus",
+    "CredentialKind",
+    "WireApi",
 }
 
 # name in logpose -> module that defines it
@@ -126,6 +134,13 @@ OWNERS = {
     "register": "logpose.providers",
     "resolve": "logpose.providers",
     "known_providers": "logpose.providers",
+    "provider_catalog": "logpose.providers",
+    "provider_info": "logpose.providers",
+    "provider_status": "logpose.providers",
+    "ProviderInfo": "logpose.providers.catalog",
+    "ProviderStatus": "logpose.providers.catalog",
+    "CredentialKind": "logpose.providers.catalog",
+    "WireApi": "logpose.providers.catalog",
 }
 
 

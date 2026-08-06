@@ -1300,10 +1300,10 @@ def test_unknown_provider_name_raises() -> None:
 
 
 def test_named_provider_is_resolved_with_provider_kwargs() -> None:
-    agent = Agent("anthropic", model="claude-opus-5", compat_claude_code=True)
+    agent = Agent("claude-code", model="claude-opus-5", compat_claude_code=False)
 
-    assert agent.provider_name == "anthropic"
-    assert agent.provider.compat_claude_code is True  # type: ignore[attr-defined]
+    assert agent.provider_name == "claude-code"
+    assert agent.provider.compat_claude_code is False  # type: ignore[attr-defined]
     assert agent.model == "claude-opus-5"
 
 

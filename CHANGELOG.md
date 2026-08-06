@@ -9,6 +9,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
+  against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
+  credential from `codex login`. Built on `httpx`, so it adds no dependency.
+  Always streams. `reasoning_effort` selects depth
+  (`low`/`medium`/`high`/`xhigh`/`max`); `$CODEX_MODEL` and `$CODEX_BASE_URL`
+  override the defaults.
+- **OpenAI provider** (`openai`) — the same Responses API with an
+  `$OPENAI_API_KEY` against `api.openai.com/v1`. Distinct from `openai-compat`,
+  which speaks Chat Completions: that API has no field able to carry a reasoning
+  model's chain of thought across a tool call, so multi-step tool use on a
+  reasoning model loses it every turn. Defaults to `gpt-5.1` and reads
+  `$OPENAI_RESPONSES_MODEL` / `$OPENAI_RESPONSES_BASE_URL`, deliberately *not*
+  `openai-compat`'s `$OPENAI_MODEL` / `$OPENAI_BASE_URL`.
+- **Claude Code provider** (`claude-code`) — the Anthropic Messages API on a
+  Claude Code subscription token, with the identity line and the OAuth beta
+  header. `anthropic` is now API-key-only.
+- **Provider discovery**, so an embedding application can build a picker without
+  hardcoding a table of its own. Three calls, separate because they cost very
+  different amounts:
+  - `provider_catalog()` / `provider_info(name)` return `ProviderInfo` — name,
+    aliases, wire API, credential kind, default model, configuring env vars, and
+    two flags a UI would otherwise hardcode: `officially_supported` (`False` for the
+    subscription backends) and `preserves_reasoning` (`False` for Chat Completions,
+    which cannot carry a reasoning model's chain of thought across a tool call).
+    Pure data — no credential is read, no provider module is imported, nothing
+    touches the network. The metadata is declared beside `register()` rather than on
+    the provider classes precisely so asking what the options are cannot drag in a
+    vendor SDK; a test pins each declaration against the class it describes.
+  - `await provider_status()` returns `ProviderStatus` — whether each backend is
+    usable right now, with `detail` carrying the same actionable message the provider
+    would have raised. Async and opt-in because it reads credential stores, including
+    a Keychain subprocess. Never raises for an absent credential.
+  - `provider.list_models()` is now implemented by **every** built-in provider, over
+    three mechanisms: `GET /models` for the Responses and Chat Completions backends,
+    and the SDK's `models.list` for the Anthropic pair. Both `GET /models` response
+    shapes are accepted (`data[].id` and the Codex backend's `models[].slug`).
+- `register()` accepts an optional `info=ProviderInfo(...)`. Third-party providers
+  that omit it stay fully resolvable and are simply absent from the catalog.
+- `CODEX_CLIENT_VERSION` — the Codex `GET /models` endpoint requires a
+  `client_version` query parameter and **gates its answer on it**; a lower version is
+  served a different, sometimes larger, set. Pinned to a constant for reproducibility
+  and overridable with `client_version=`.
+  - Model reasoning round-trips as a verbatim `RawBlock`, not a `ThinkingBlock`.
+    The Responses API returns reasoning as a sibling output item carrying an
+    opaque `encrypted_content` blob that must be resent byte-exact and in
+    position, and it has nowhere to live in `ThinkingBlock` — which also produces
+    empty-thinking blocks at low effort, where the summary is often absent.
+    `ThinkingDelta` events still stream from the summary channel.
+  - `store` is always `false`: logpose owns the history, and the subscription
+    backend requires it.
+  - `max_tokens` is omitted on the subscription endpoint, which answers
+    `400 Unsupported parameter: max_output_tokens`; it is sent and honoured on
+    `api.openai.com`. Both verified against the live backends.
+  - Whether a turn carries a reasoning item is a backend property, not a bug:
+    `api.openai.com` emits one on a tool-calling turn, the Codex subscription
+    backend frequently does not. Both observed live.
+  - The turn is assembled from `response.output_item.done` events, with a
+    *populated* terminal `response.output` preferred when one arrives. The
+    subscription backend sends `"output": []` on `response.completed` and delivers
+    everything incrementally, so an empty array is never treated as authoritative.
+  - A `Conversation` is tied to the backend that produced it. Anthropic thinking
+    blocks handed to Codex are dropped rather than raising, since a Conversation
+    crossing backends should lose reasoning, not crash.
+- **Codex / ChatGPT credential resolution** (`logpose.auth.codex`) — reads
+  `~/.codex/auth.json` (or `$CODEX_HOME`) **read-only**, takes expiry from the
+  access token's own `exp` claim since the file records none, and refreshes
+  single-flight in memory. Subscription-first precedence, with the store
+  deliberately outranking `$OPENAI_API_KEY` — the reverse of the Anthropic
+  ordering, because `codex login` writes only to `auth.json` and there is no
+  `CODEX_OAUTH_TOKEN` to sit above it. A rotated refresh token is **not** written
+  back: that would race the Codex CLI for the file.
+- **`compat_codex_cli`** — dresses subscription requests as the Codex CLI's (the
+  identity line ahead of `instructions`, plus `originator: codex_cli_rs`).
+  Defaults to on for OAuth and off for an API key, mirroring `compat_claude_code`.
+- `examples/codex.py` — a runnable Codex example.
+
+### Changed
+
+- **BREAKING — one provider per credential, not per vendor.** `anthropic` accepts
+  only an API key and `codex` only a subscription token; the subscription and
+  API-key paths for each vendor are now separate registered providers
+  (`anthropic`/`claude-code`, `openai`/`codex`) over a shared private base
+  (`providers/_anthropic_base.py`, `providers/_responses.py`). `known_providers()`
+  is now `["anthropic", "claude-code", "codex", "docker", "docker-models",
+  "openai", "openai-compat"]`.
+
+  `Agent("anthropic", auth_token=...)` and `Agent("anthropic",
+  compat_claude_code=...)` become `Agent("claude-code", ...)`.
+
+  The motivation was that both all-in-one providers branched on the credential
+  kind — endpoint, headers, identity line, and on the Responses side whether
+  `max_output_tokens` was even a legal field — and that kind is not known until
+  the first request. `AnthropicProvider` had to rebuild its SDK client if the kind
+  changed between turns, and the Responses provider had to *predict* its own
+  `base_url` before resolving anything. Both mechanisms are deleted rather than
+  moved. It also removes a precedence policy that needed three paragraphs of
+  justification: a credential of the wrong kind can no longer shadow a usable one,
+  because each provider only ever looks at sources of the kind it accepts.
+- `resolve_credential` and `CredentialProvider.resolve` gained `require_kind`,
+  which narrows the precedence chain to sources yielding that kind. Filtering
+  rather than resolving-then-rejecting is the point: otherwise a subscription token
+  in the store would hide a perfectly good `$OPENAI_API_KEY` and the API-key
+  provider would refuse a credential it was standing next to.
+- A provider handed a credential of the wrong kind now raises `AuthError` naming
+  the sibling provider to use instead.
+- The backend-neutral half of credential handling moved to `logpose.auth._common`
+  (`Credential`, `CredentialProvider`, expiry normalisation, redaction), leaving
+  `logpose.auth.claude_code` as only the Anthropic-specific half. Public names are
+  unchanged and re-exported where they were; `Credential` gained an optional
+  `account_id` for backends that name a tenant separately from the token.
+- Tolerant tool-argument parsing moved to `logpose.providers._toolargs`, so the
+  Chat Completions and Responses backends share one `UNPARSED_ARGUMENTS_KEY`.
+  Consumer code special-casing that key now covers both.
+
 - **`Agent(on_tool_call=...)`** — a gate consulted before each tool runs, so an
   embedder can put a permission prompt, a policy check, or a dry run in front of
   execution. It sees every requested call one at a time in wire order and

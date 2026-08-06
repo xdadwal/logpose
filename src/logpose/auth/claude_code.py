@@ -5,6 +5,11 @@ plain ``ANTHROPIC_API_KEY`` (BYOK). Both paths end at the same
 :class:`Credential`; the Anthropic provider decides how to present it on the
 wire (``Authorization: Bearer`` for ``oauth``, ``x-api-key`` for ``api_key``).
 
+Everything backend-neutral — the credential dataclass, expiry handling, the
+single-flight refresh loop — lives in :mod:`logpose.auth._common`. This module is
+only the Anthropic-specific half: where the store is, what the payload looks
+like, which endpoint refreshes it, and what to tell the user when it fails.
+
 .. warning::
 
    **Gray area — read this.** Using a Claude Code *subscription* token against
@@ -32,19 +37,24 @@ bodies, which can carry tokens.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
 import sys
-import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 
+from logpose.auth import _common
+from logpose.auth._common import (
+    EXPIRY_SKEW_SECONDS,
+    Credential,
+    clean,
+    expiry_from_token_response,
+    normalize_epoch,
+)
 from logpose.errors import AuthError
 
 __all__ = [
@@ -81,128 +91,12 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 """Endpoint the refresh-token grant is posted to (undocumented; may change)."""
 
-EXPIRY_SKEW_SECONDS = 60.0
-"""Refresh this many seconds before a token's actual expiry."""
-
 _KEYCHAIN_TIMEOUT_SECONDS = 5.0
-_REFRESH_TIMEOUT_SECONDS = 30.0
-_REDACT_PREFIX = 13
-_MILLISECOND_THRESHOLD = 1e11
 
 _SETUP_HINT = (
     "Run `claude setup-token` and export the result as "
     f"{ENV_OAUTH_TOKEN}, or export {ENV_API_KEY} to use an API key instead."
 )
-
-
-def _redact(value: str) -> str:
-    """Render a secret as a short quoted prefix plus an ellipsis.
-
-    Never returns more than half of the input, so short values do not leak.
-
-    Args:
-        value: The secret to redact.
-
-    Returns:
-        A quoted, truncated form safe to place in a ``repr``.
-    """
-    keep = min(_REDACT_PREFIX, len(value) // 2)
-    if keep <= 0:
-        return "'…'"
-    return f"'{value[:keep]}…'"
-
-
-@dataclass(frozen=True, repr=False)
-class Credential:
-    """A resolved Anthropic credential and how it must be presented.
-
-    Attributes:
-        kind: ``"oauth"`` for a Claude Code subscription token (sent as a
-            bearer token), ``"api_key"`` for a plain API key.
-        value: The secret itself. Never log, print, or format this into an
-            error message; use :meth:`__repr__`, which redacts.
-        expires_at: Expiry as epoch **seconds**, or ``None`` when unknown.
-            Sources reporting milliseconds are normalized on the way in.
-        refresh_token: Token usable with :func:`refresh`, when one is known.
-    """
-
-    kind: Literal["api_key", "oauth"]
-    value: str
-    expires_at: float | None = None
-    refresh_token: str | None = None
-
-    def __repr__(self) -> str:
-        """Return a representation with the secret redacted.
-
-        Returns:
-            For example ``Credential(kind='oauth', value='sk-ant-oat01-…', len=108)``.
-        """
-        return (
-            f"{type(self).__name__}(kind={self.kind!r}, "
-            f"value={_redact(self.value)}, len={len(self.value)})"
-        )
-
-    def is_expired(self, *, now: float | None = None, skew: float = 0.0) -> bool:
-        """Report whether the credential is past (or nearly past) its expiry.
-
-        Args:
-            now: Epoch seconds to compare against; defaults to the current time.
-            skew: Treat the credential as expired this many seconds early.
-
-        Returns:
-            ``False`` when no expiry is known, otherwise whether
-            ``now + skew`` has reached ``expires_at``.
-        """
-        if self.expires_at is None:
-            return False
-        current = time.time() if now is None else now
-        return current + skew >= self.expires_at
-
-
-def _clean(value: str | None) -> str | None:
-    """Strip a value and collapse blanks to ``None``.
-
-    Args:
-        value: Raw string, possibly ``None`` or whitespace-only.
-
-    Returns:
-        The stripped value, or ``None`` when it carried no content.
-    """
-    if value is None:
-        return None
-    stripped = value.strip()
-    return stripped or None
-
-
-def _normalize_expiry(raw: object) -> float | None:
-    """Coerce an undocumented ``expiresAt`` field into epoch seconds.
-
-    Claude Code writes milliseconds. Values that are already plausibly in
-    seconds are passed through, so the function is safe if that ever changes.
-    Anything non-numeric degrades to ``None`` rather than raising.
-
-    Args:
-        raw: The value found under ``claudeAiOauth.expiresAt``, if any.
-
-    Returns:
-        Epoch seconds, or ``None`` when the value is missing or unusable.
-    """
-    if raw is None or isinstance(raw, bool):
-        return None
-    if isinstance(raw, (int, float)):
-        number = float(raw)
-    elif isinstance(raw, str):
-        try:
-            number = float(raw.strip())
-        except ValueError:
-            return None
-    else:
-        return None
-    if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
-        return None
-    if abs(number) >= _MILLISECOND_THRESHOLD:
-        return number / 1000.0
-    return number
 
 
 def credentials_file_path() -> Path:
@@ -214,7 +108,7 @@ def credentials_file_path() -> Path:
     Returns:
         Path to ``.credentials.json`` (which may not exist).
     """
-    config_dir = _clean(os.environ.get(ENV_CONFIG_DIR))
+    config_dir = clean(os.environ.get(ENV_CONFIG_DIR))
     base = Path(config_dir).expanduser() if config_dir else Path.home() / ".claude"
     return base / ".credentials.json"
 
@@ -251,7 +145,7 @@ def _read_keychain() -> str | None:
         return None
     if completed.returncode != 0:
         return None
-    return _clean(completed.stdout)
+    return clean(completed.stdout)
 
 
 def _read_credentials_file(path: Path) -> str | None:
@@ -267,7 +161,7 @@ def _read_credentials_file(path: Path) -> str | None:
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    return _clean(raw)
+    return clean(raw)
 
 
 def _parse_credentials_payload(raw: str) -> Credential | None:
@@ -300,15 +194,15 @@ def _parse_credentials_payload(raw: str) -> Credential | None:
     access_token = section.get("accessToken")
     if not isinstance(access_token, str):
         return None
-    value = _clean(access_token)
+    value = clean(access_token)
     if value is None:
         return None
     raw_refresh = section.get("refreshToken")
-    refresh_token = _clean(raw_refresh) if isinstance(raw_refresh, str) else None
+    refresh_token = clean(raw_refresh) if isinstance(raw_refresh, str) else None
     return Credential(
         kind="oauth",
         value=value,
-        expires_at=_normalize_expiry(section.get("expiresAt")),
+        expires_at=normalize_epoch(section.get("expiresAt")),
         refresh_token=refresh_token,
     )
 
@@ -337,6 +231,8 @@ def load_stored_credential() -> Credential | None:
 def resolve_credential(
     explicit_api_key: str | None = None,
     explicit_auth_token: str | None = None,
+    *,
+    require_kind: Literal["api_key", "oauth"] | None = None,
 ) -> Credential:
     """Resolve the credential logpose should authenticate with.
 
@@ -358,42 +254,81 @@ def resolve_credential(
     environment variables. Within the explicit arguments the same ordering holds:
     ``explicit_auth_token`` beats ``explicit_api_key`` when both are given.
 
+    ``require_kind`` narrows that list to the sources that can produce the
+    requested kind, and is how the providers use this function: ``anthropic``
+    accepts only an API key and ``claude-code`` only a subscription token.
+    Filtering rather than resolving and then rejecting matters — otherwise a
+    subscription token in the environment would shadow a perfectly good
+    ``$ANTHROPIC_API_KEY`` and the API-key provider would refuse a credential it
+    was standing next to.
+
     Blank and whitespace-only values are treated as absent at every level.
 
     Args:
         explicit_api_key: API key supplied directly by the caller.
         explicit_auth_token: Subscription OAuth token supplied directly by the
             caller.
+        require_kind: Consider only sources yielding this kind of credential.
 
     Returns:
         The highest-precedence credential found.
 
     Raises:
-        AuthError: If no credential could be resolved. The message tells the
-            user exactly which command to run and which variable to export, and
-            contains no credential material.
+        AuthError: If no credential of the requested kind could be resolved. The
+            message tells the user exactly which command to run and which
+            variable to export, and contains no credential material.
     """
-    auth_token = _clean(explicit_auth_token)
-    if auth_token is not None:
-        return Credential(kind="oauth", value=auth_token)
+    want_oauth = require_kind != "api_key"
+    want_key = require_kind != "oauth"
 
-    api_key = _clean(explicit_api_key)
-    if api_key is not None:
-        return Credential(kind="api_key", value=api_key)
+    if want_oauth:
+        auth_token = clean(explicit_auth_token)
+        if auth_token is not None:
+            return Credential(kind="oauth", value=auth_token)
 
-    env_token = _clean(os.environ.get(ENV_OAUTH_TOKEN))
-    if env_token is not None:
-        return Credential(kind="oauth", value=env_token)
+    if want_key:
+        api_key = clean(explicit_api_key)
+        if api_key is not None:
+            return Credential(kind="api_key", value=api_key)
 
-    env_key = _clean(os.environ.get(ENV_API_KEY))
-    if env_key is not None:
-        return Credential(kind="api_key", value=env_key)
+    if want_oauth:
+        env_token = clean(os.environ.get(ENV_OAUTH_TOKEN))
+        if env_token is not None:
+            return Credential(kind="oauth", value=env_token)
 
-    stored = load_stored_credential()
-    if stored is not None:
-        return stored
+    if want_key:
+        env_key = clean(os.environ.get(ENV_API_KEY))
+        if env_key is not None:
+            return Credential(kind="api_key", value=env_key)
 
-    raise AuthError(
+    if want_oauth:
+        stored = load_stored_credential()
+        if stored is not None:
+            return stored
+
+    raise AuthError(_missing_credential_message(require_kind))
+
+
+def _missing_credential_message(require_kind: str | None) -> str:
+    """Explain what was looked for and how to supply it.
+
+    Args:
+        require_kind: The kind that was required, if any.
+
+    Returns:
+        An actionable message containing no credential material.
+    """
+    if require_kind == "oauth":
+        return (
+            "No Claude Code subscription credential found. Run `claude setup-token` and "
+            f"export the token as {ENV_OAUTH_TOKEN}, or pass auth_token=... explicitly."
+        )
+    if require_kind == "api_key":
+        return (
+            f"No Anthropic API key found. Export {ENV_API_KEY}, or pass api_key=... "
+            "explicitly."
+        )
+    return (
         "No Anthropic credential found. To use a Claude Code subscription, run "
         f"`claude setup-token` and export the token as {ENV_OAUTH_TOKEN}. To use "
         f"an API key instead, export {ENV_API_KEY}. You can also pass "
@@ -445,7 +380,8 @@ async def refresh(
     }
 
     owns_client = client is None
-    http = client if client is not None else httpx.AsyncClient(timeout=_REFRESH_TIMEOUT_SECONDS)
+    timeout = _common.REFRESH_TIMEOUT_SECONDS
+    http = client if client is not None else httpx.AsyncClient(timeout=timeout)
     try:
         try:
             response = await http.post(OAUTH_TOKEN_URL, json=payload)
@@ -480,7 +416,7 @@ async def refresh(
         )
 
     raw_access = body.get("access_token")
-    access_token = _clean(raw_access) if isinstance(raw_access, str) else None
+    access_token = clean(raw_access) if isinstance(raw_access, str) else None
     if access_token is None:
         raise AuthError(
             f"The Anthropic OAuth token endpoint returned no access token (HTTP "
@@ -488,9 +424,9 @@ async def refresh(
         )
 
     raw_refresh = body.get("refresh_token")
-    next_refresh = _clean(raw_refresh) if isinstance(raw_refresh, str) else None
+    next_refresh = clean(raw_refresh) if isinstance(raw_refresh, str) else None
 
-    expires_at = _expiry_from_token_response(body)
+    expires_at = expiry_from_token_response(body)
 
     return Credential(
         kind="oauth",
@@ -500,68 +436,37 @@ async def refresh(
     )
 
 
-def _expiry_from_token_response(body: dict[str, Any]) -> float | None:
-    """Derive an absolute expiry from a token-endpoint payload.
-
-    Prefers the OAuth-standard ``expires_in`` (relative seconds) and falls back
-    to an absolute ``expires_at`` / ``expiresAt``.
-
-    Args:
-        body: The parsed JSON response.
-
-    Returns:
-        Epoch seconds, or ``None`` when the payload said nothing usable.
-    """
-    expires_in = body.get("expires_in")
-    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
-        return time.time() + float(expires_in)
-    if isinstance(expires_in, str):
-        try:
-            return time.time() + float(expires_in.strip())
-        except ValueError:
-            pass
-    for key in ("expires_at", "expiresAt"):
-        if key in body:
-            normalized = _normalize_expiry(body[key])
-            if normalized is not None:
-                return normalized
-    return None
-
-
-class CredentialProvider:
-    """Holds a credential and refreshes it on demand, single-flight.
+class CredentialProvider(_common.CredentialProvider):
+    """Holds an Anthropic credential and refreshes it on demand, single-flight.
 
     Wrap the credential the provider was built with, then call :meth:`get`
-    before every request. Concurrent callers cannot stampede the refresh
-    endpoint: the first one through takes the lock and does the work, and the
-    rest re-check expiry after acquiring it and reuse the result.
+    before every request. The refresh loop itself lives in
+    :class:`logpose.auth._common.CredentialProvider`; this subclass supplies the
+    Anthropic refresh call and the Claude-Code-specific failure message.
 
     Attributes:
         skew: How many seconds before expiry a refresh is triggered.
     """
 
-    def __init__(
-        self,
-        credential: Credential,
-        *,
-        skew: float = EXPIRY_SKEW_SECONDS,
-        refresher: Callable[[Credential], Awaitable[Credential]] | None = None,
-    ) -> None:
-        """Initialize the provider.
+    EXPIRED_MESSAGE = (
+        "The Claude Code subscription token has expired and no refresh "
+        "token is available. Re-authenticate with `claude setup-token` "
+        f"and export the new token as {ENV_OAUTH_TOKEN}."
+    )
+
+    async def _refresh(self, credential: Credential) -> Credential:
+        """Refresh via the Claude Code OAuth token endpoint.
 
         Args:
-            credential: The starting credential, e.g. from
-                :func:`resolve_credential`.
-            skew: Refresh this many seconds before the recorded expiry.
-            refresher: Coroutine used to perform the refresh. Defaults to
-                :func:`refresh`; override it in tests or to share an HTTP client.
+            credential: The expiring subscription credential.
+
+        Returns:
+            A refreshed credential.
+
+        Raises:
+            AuthError: On any refresh failure — see :func:`refresh`.
         """
-        self._credential = credential
-        self.skew = skew
-        self._refresher: Callable[[Credential], Awaitable[Credential]] = (
-            refresher if refresher is not None else refresh
-        )
-        self._lock = asyncio.Lock()
+        return await refresh(credential)
 
     @classmethod
     def resolve(
@@ -569,6 +474,7 @@ class CredentialProvider:
         explicit_api_key: str | None = None,
         explicit_auth_token: str | None = None,
         *,
+        require_kind: Literal["api_key", "oauth"] | None = None,
         skew: float = EXPIRY_SKEW_SECONDS,
         refresher: Callable[[Credential], Awaitable[Credential]] | None = None,
     ) -> CredentialProvider:
@@ -577,6 +483,7 @@ class CredentialProvider:
         Args:
             explicit_api_key: API key supplied directly by the caller.
             explicit_auth_token: Subscription OAuth token supplied directly.
+            require_kind: Consider only sources yielding this kind of credential.
             skew: Refresh this many seconds before the recorded expiry.
             refresher: Coroutine used to perform the refresh.
 
@@ -586,67 +493,7 @@ class CredentialProvider:
         Raises:
             AuthError: If no credential could be resolved.
         """
-        credential = resolve_credential(explicit_api_key, explicit_auth_token)
+        credential = resolve_credential(
+            explicit_api_key, explicit_auth_token, require_kind=require_kind
+        )
         return cls(credential, skew=skew, refresher=refresher)
-
-    @property
-    def current(self) -> Credential:
-        """The credential held right now, without refreshing.
-
-        Returns:
-            The most recently resolved or refreshed credential.
-        """
-        return self._credential
-
-    def __repr__(self) -> str:
-        """Return a representation that redacts the held credential.
-
-        Returns:
-            A ``repr`` safe to log.
-        """
-        return f"{type(self).__name__}(credential={self._credential!r}, skew={self.skew!r})"
-
-    async def get(self) -> Credential:
-        """Return a usable credential, refreshing it first if it is due.
-
-        A credential is due when its ``expires_at`` is within ``skew`` seconds.
-        The refresh happens under a lock and is re-checked after acquisition, so
-        N concurrent callers trigger exactly one refresh.
-
-        Returns:
-            A credential that is not (yet) expired.
-
-        Raises:
-            AuthError: If the credential has already expired and cannot be
-                refreshed, or if the refresh itself fails.
-        """
-        credential = self._credential
-        if not self._is_due(credential):
-            return credential
-
-        async with self._lock:
-            credential = self._credential
-            if not self._is_due(credential):
-                return credential
-            if credential.refresh_token is None:
-                if credential.is_expired():
-                    raise AuthError(
-                        "The Claude Code subscription token has expired and no refresh "
-                        "token is available. Re-authenticate with `claude setup-token` "
-                        f"and export the new token as {ENV_OAUTH_TOKEN}."
-                    )
-                return credential
-            refreshed = await self._refresher(credential)
-            self._credential = refreshed
-            return refreshed
-
-    def _is_due(self, credential: Credential) -> bool:
-        """Report whether a credential is inside the refresh window.
-
-        Args:
-            credential: The credential to test.
-
-        Returns:
-            ``True`` when a refresh should be attempted.
-        """
-        return credential.is_expired(skew=self.skew)

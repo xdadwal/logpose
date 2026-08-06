@@ -8,10 +8,7 @@ SDK rather than assumed.
 
 from __future__ import annotations
 
-import asyncio
-import time
 import traceback
-from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import anthropic
@@ -32,12 +29,7 @@ from logpose.messages import (
     ToolUseBlock,
 )
 from logpose.providers import resolve
-from logpose.providers.anthropic import (
-    CLAUDE_CODE_IDENTITY,
-    OAUTH_BETA_HEADER,
-    AnthropicProvider,
-    redact,
-)
+from logpose.providers.anthropic import AnthropicProvider, redact
 from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
@@ -46,139 +38,24 @@ from logpose.providers.base import (
     ProviderThinkingDelta,
     ToolSpec,
 )
+from logpose.providers.claude_code import OAUTH_BETA_HEADER
+from tests.anthropic_helpers import (
+    FakeClient,
+    FakeMessages,
+    FakeStream,
+    drain,
+    sdk_message,
+    simple_request,
+    text_delta,
+    thinking_delta,
+)
 
 SIGNATURE = "ErUBCkYIBRgCIkDdQ7/vNdkKgFQ0oX+signature+bytes+must+survive=="
 REDACTED_DATA = "EroBCkYIBRgCKkB0aGlzLWlzLWVuY3J5cHRlZA=="
 
-# ---------------------------------------------------------------------------
-# fakes
-# ---------------------------------------------------------------------------
-
-
-class FakeStream:
-    """Stands in for ``AsyncMessageStreamManager`` / ``AsyncMessageStream``."""
-
-    def __init__(
-        self,
-        events: Sequence[Any],
-        final: sdk.Message | None,
-        *,
-        error: BaseException | None = None,
-    ) -> None:
-        self._events = list(events)
-        self._final = final
-        self._error = error
-
-    async def __aenter__(self) -> FakeStream:
-        if self._error is not None:
-            raise self._error
-        return self
-
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-    def __aiter__(self) -> AsyncIterator[Any]:
-        return self._iterate()
-
-    async def _iterate(self) -> AsyncIterator[Any]:
-        for event in self._events:
-            yield event
-
-    async def get_final_message(self) -> sdk.Message:
-        assert self._final is not None
-        return self._final
-
-
-class FakeMessages:
-    """Records the kwargs the provider builds and replays a scripted stream."""
-
-    def __init__(
-        self,
-        events: Sequence[Any],
-        final: sdk.Message | None,
-        *,
-        error: BaseException | None = None,
-    ) -> None:
-        self._events = events
-        self._final = final
-        self._error = error
-        self.calls: list[dict[str, Any]] = []
-
-    def stream(self, **kwargs: Any) -> FakeStream:
-        self.calls.append(kwargs)
-        return FakeStream(self._events, self._final, error=self._error)
-
-
-class FakeClient:
-    """An ``AsyncAnthropic``-shaped object exposing ``messages.stream`` and auth.
-
-    ``api_key`` / ``auth_token`` mirror the plain attributes the real client
-    carries; the scrubbing tests read them the same way the provider does.
-    """
-
-    def __init__(
-        self,
-        events: Sequence[Any] = (),
-        final: sdk.Message | None = None,
-        *,
-        error: BaseException | None = None,
-        api_key: str | None = None,
-        auth_token: str | None = None,
-    ) -> None:
-        self.messages = FakeMessages(events, final, error=error)
-        self.api_key = api_key
-        self.auth_token = auth_token
-
-
-def sdk_message(
-    content: Sequence[Any],
-    *,
-    stop_reason: str | None = "end_turn",
-    usage: sdk.Usage | None = None,
-) -> sdk.Message:
-    """Build a realistic final ``Message`` as the SDK would hand it back."""
-    return sdk.Message.model_construct(
-        id="msg_01FAKE",
-        content=list(content),
-        model="claude-opus-5",
-        role="assistant",
-        stop_reason=stop_reason,
-        stop_sequence=None,
-        type="message",
-        usage=usage or sdk.Usage(input_tokens=0, output_tokens=0),
-    )
-
-
-def text_delta(text: str) -> sdk.RawContentBlockDeltaEvent:
-    return sdk.RawContentBlockDeltaEvent(
-        type="content_block_delta", index=0, delta=sdk.TextDelta(type="text_delta", text=text)
-    )
-
-
-def thinking_delta(text: str) -> sdk.RawContentBlockDeltaEvent:
-    return sdk.RawContentBlockDeltaEvent(
-        type="content_block_delta",
-        index=0,
-        delta=sdk.ThinkingDelta(type="thinking_delta", thinking=text),
-    )
-
-
 def make_provider(client: FakeClient, **kwargs: Any) -> AnthropicProvider:
+    """Build an API-key provider around a fake SDK client."""
     return AnthropicProvider(client=client, **kwargs)  # type: ignore[arg-type]
-
-
-async def drain(provider: AnthropicProvider, req: CompletionRequest) -> list[Any]:
-    return [event async for event in provider.stream(req)]
-
-
-def simple_request(**kwargs: Any) -> CompletionRequest:
-    params: dict[str, Any] = {
-        "messages": [Message.user("hi")],
-        "model": "claude-opus-5",
-        "max_tokens": 1024,
-    }
-    params.update(kwargs)
-    return CompletionRequest(**params)
 
 
 @pytest.fixture(autouse=True)
@@ -357,73 +234,10 @@ async def test_tools_omitted_when_empty() -> None:
     assert "tools" not in client.messages.calls[0]
 
 
-async def test_compat_claude_code_prepends_identity() -> None:
-    client = FakeClient(final=sdk_message([]))
-    provider = make_provider(client, compat_claude_code=True)
-
-    await drain(provider, simple_request(system="You are terse."))
-
-    assert client.messages.calls[0]["system"] == [
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": "You are terse."},
-    ]
-
-
 async def test_api_key_auth_sends_no_identity() -> None:
     client = FakeClient(final=sdk_message([]), api_key="sk-ant-api-test")
     await drain(make_provider(client), simple_request(system="You are terse."))
     assert client.messages.calls[0]["system"] == "You are terse."
-
-
-async def test_oauth_auth_prepends_identity_by_default() -> None:
-    # A bare OAuth request (no identity line) is answered with HTTP 429
-    # rate_limit_error even when the account has quota left, so subscription
-    # tokens must carry the identity unless the caller opts out.
-    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
-
-    await drain(make_provider(client), simple_request(system="You are terse."))
-
-    assert client.messages.calls[0]["system"] == [
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": "You are terse."},
-    ]
-
-
-async def test_oauth_identity_is_sent_without_a_caller_system_prompt() -> None:
-    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
-
-    await drain(make_provider(client), simple_request())
-
-    assert client.messages.calls[0]["system"] == [{"type": "text", "text": CLAUDE_CODE_IDENTITY}]
-
-
-async def test_compat_claude_code_false_suppresses_identity_for_oauth() -> None:
-    client = FakeClient(final=sdk_message([]), auth_token="sk-ant-oat01-token")
-
-    await drain(
-        make_provider(client, compat_claude_code=False),
-        simple_request(system="You are terse."),
-    )
-
-    assert client.messages.calls[0]["system"] == "You are terse."
-
-
-async def test_resolved_oauth_credential_enables_identity(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The provider owns its client here, so the identity decision has to come
-    # from the credential it resolved rather than from a caller-supplied client.
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-token")
-    provider = AnthropicProvider()
-    real = await provider.get_client()
-    await real.close()
-    client = FakeClient(final=sdk_message([]))
-    provider._client = client
-
-    await drain(provider, simple_request(system="You are terse."))
-
-    assert client.messages.calls[0]["system"] == [
-        {"type": "text", "text": CLAUDE_CODE_IDENTITY},
-        {"type": "text", "text": "You are terse."},
-    ]
 
 
 async def test_extra_is_merged_into_the_wire_request() -> None:
@@ -774,26 +588,6 @@ def built_headers(client: anthropic.AsyncAnthropic) -> dict[str, str]:
     return {key.lower(): value for key, value in request.headers.items()}
 
 
-async def test_oauth_mode_sends_only_bearer_even_with_ANTHROPIC_API_KEY_set(
-    monkeypatch: pytest.MonkeyPatch,
-    no_stored_credential: None,
-) -> None:
-    # The SDK reads ANTHROPIC_API_KEY when api_key is not supplied; if that
-    # leaked through, both auth headers would go out and the API would 401.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-env-key-must-not-leak")
-    provider = AnthropicProvider(auth_token="sk-ant-oat01-subscription-token")
-
-    client = await provider.get_client()
-    headers = built_headers(client)
-
-    assert headers["authorization"] == "Bearer sk-ant-oat01-subscription-token"
-    assert "x-api-key" not in headers
-    assert headers["anthropic-beta"] == OAUTH_BETA_HEADER
-    assert client.api_key is None
-    assert set(client.auth_headers) == {"Authorization"}
-    await provider.aclose()
-
-
 async def test_api_key_mode_sends_only_x_api_key(
     monkeypatch: pytest.MonkeyPatch,
     no_stored_credential: None,
@@ -833,14 +627,6 @@ async def test_injected_client_is_used_verbatim_and_never_resolves_credentials()
 # ---------------------------------------------------------------------------
 
 
-async def test_explicit_auth_token_wins_over_api_key(no_stored_credential: None) -> None:
-    provider = AnthropicProvider(api_key="sk-ant-api-key", auth_token="sk-ant-oat01-token")
-    client = await provider.get_client()
-    assert client.auth_token == "sk-ant-oat01-token"
-    assert client.api_key is None
-    await provider.aclose()
-
-
 async def test_env_api_key_is_used_when_nothing_explicit(
     monkeypatch: pytest.MonkeyPatch, no_stored_credential: None
 ) -> None:
@@ -851,25 +637,9 @@ async def test_env_api_key_is_used_when_nothing_explicit(
     await provider.aclose()
 
 
-async def test_subscription_token_outranks_an_ambient_api_key(
-    monkeypatch: pytest.MonkeyPatch, no_stored_credential: None
-) -> None:
-    """Subscription-first: an ANTHROPIC_API_KEY left over from other tooling must
-    not silently divert a subscription user onto per-token billing."""
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-from-env")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-ambient")
-    provider = AnthropicProvider()
-
-    client = await provider.get_client()
-
-    assert client.auth_token == "sk-ant-oat01-from-env"
-    assert client.api_key is None
-    await provider.aclose()
-
-
 async def test_auth_error_when_no_credential_anywhere(no_stored_credential: None) -> None:
     provider = AnthropicProvider()
-    with pytest.raises(AuthError, match="claude setup-token"):
+    with pytest.raises(AuthError, match="No Anthropic API key found"):
         await provider.get_client()
 
 
@@ -877,46 +647,6 @@ async def test_constructing_the_provider_never_raises_auth_error(
     no_stored_credential: None,
 ) -> None:
     AnthropicProvider()  # lazy: resolution is deferred to the first request
-
-
-async def test_credential_provider_refresh_reaches_the_wire(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An expiring subscription token is refreshed and swapped in, in place."""
-    stale = claude_code.Credential(
-        kind="oauth",
-        value="sk-ant-oat01-stale",
-        expires_at=time.time() - 1,
-        refresh_token="rt_1",
-    )
-    fresh = claude_code.Credential(
-        kind="oauth",
-        value="sk-ant-oat01-refreshed",
-        expires_at=time.time() + 3600,
-    )
-    refreshes = 0
-
-    async def refresher(credential: claude_code.Credential) -> claude_code.Credential:
-        nonlocal refreshes
-        refreshes += 1
-        return fresh
-
-    credentials = claude_code.CredentialProvider(stale, refresher=refresher)
-    monkeypatch.setattr(
-        claude_code.CredentialProvider,
-        "resolve",
-        classmethod(lambda cls, *args, **kwargs: credentials),
-    )
-    provider = AnthropicProvider()
-
-    first = await provider.get_client()
-    second = await provider.get_client()
-
-    assert refreshes == 1
-    assert first is second, "a refreshed token must not cost a new connection pool"
-    assert second.auth_token == "sk-ant-oat01-refreshed"
-    assert second.api_key is None
-    await provider.aclose()
 
 
 async def test_credential_resolution_is_deferred_to_the_first_request(
@@ -941,63 +671,6 @@ async def test_credential_resolution_is_deferred_to_the_first_request(
     await provider.get_client()
     assert calls == 1, "the CredentialProvider is built once and reused"
     await provider.aclose()
-
-
-async def test_concurrent_first_requests_resolve_and_refresh_exactly_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Regression: the lazy build of the CredentialProvider was unguarded.
-
-    N concurrent first requests each saw ``self._credentials is None``, each
-    built its own provider — and therefore its own lock — so the single-flight
-    re-check inside ``CredentialProvider.get`` never saw the others. On an
-    already-expired subscription token that meant N keychain subprocesses and N
-    refresh grants replaying the same single-use refresh token, so all but one
-    came back ``invalid_grant``.
-    """
-    resolves = 0
-    refreshes = 0
-
-    async def refresher(credential: claude_code.Credential) -> claude_code.Credential:
-        nonlocal refreshes
-        refreshes += 1
-        await asyncio.sleep(0.01)
-        return claude_code.Credential(
-            kind="oauth",
-            value="sk-ant-oat01-refreshed",
-            expires_at=time.time() + 3600,
-            refresh_token="rt_2",
-        )
-
-    def resolve(cls: object, *args: object, **kwargs: object) -> claude_code.CredentialProvider:
-        nonlocal resolves
-        resolves += 1
-        time.sleep(0.02)  # the keychain subprocess, which is why resolve() is threaded
-        return claude_code.CredentialProvider(
-            claude_code.Credential(
-                kind="oauth",
-                value="sk-ant-oat01-expired",
-                expires_at=time.time() - 1,
-                refresh_token="rt_1",
-            ),
-            refresher=refresher,
-        )
-
-    monkeypatch.setattr(claude_code.CredentialProvider, "resolve", classmethod(resolve))
-    provider = AnthropicProvider()
-
-    clients = await asyncio.gather(*(provider.get_client() for _ in range(10)))
-
-    assert resolves == 1
-    assert refreshes == 1
-    assert len({id(client) for client in clients}) == 1
-    assert clients[0].auth_token == "sk-ant-oat01-refreshed"
-    await provider.aclose()
-
-
-# ---------------------------------------------------------------------------
-# error mapping
-# ---------------------------------------------------------------------------
 
 
 def status_error(status_code: int, message: str = "boom") -> anthropic.APIStatusError:
@@ -1087,31 +760,6 @@ async def test_error_raised_mid_stream_is_wrapped_too() -> None:
 
     assert excinfo.value.status_code == 529
     assert excinfo.value.retryable is True
-
-
-async def test_error_message_never_contains_the_token(no_stored_credential: None) -> None:
-    token = "sk-ant-oat01-super-secret-subscription-token"
-    provider = AnthropicProvider(auth_token=token)
-    await provider.get_client()
-    # A server that echoed the credential back in its error body must not be
-    # able to smuggle it into our exception message.
-    provider._client = FakeClient(error=status_error(401, f"invalid bearer {token}"))
-
-    with pytest.raises(ProviderError) as excinfo:
-        await drain(provider, simple_request())
-
-    rendered = f"{excinfo.value.message} {excinfo.value!r} {excinfo.value}"
-    assert token not in rendered
-    assert "<redacted" in rendered
-    # The wrapper is not the only place the token can surface: `raise ... from
-    # exc` keeps the SDK exception as __cause__, and every traceback renders
-    # str(__cause__). Scrubbing only the wrapper still wrote the raw token to
-    # logs, Sentry, and pytest failure output.
-    formatted = "".join(traceback.format_exception(excinfo.value))
-    assert token not in formatted
-    assert "<redacted" in formatted
-    cause = excinfo.value.__cause__
-    assert cause is not None and token not in str(cause)
 
 
 async def test_the_real_sdk_client_exposes_the_attributes_scrubbing_reads() -> None:
