@@ -463,6 +463,10 @@ Planned areas of expansion include:
 Roadmap items are directional and may evolve with community feedback. Feature
 requests and focused proposals are welcome in GitHub issues.
 
+The approved runtime-hardening milestones, defaults, acceptance criteria, and PR
+sequence are documented in the
+[robustness and release-readiness plan](docs/robustness-plan.md).
+
 ## Contributing
 
 Contributions are welcome. To set up a development environment:
