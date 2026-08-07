@@ -20,6 +20,7 @@ from logpose.agent import (
     EMPTY_TOOL_RESULT,
     Agent,
     Conversation,
+    ToolErrorContext,
     ToolGateResult,
 )
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError
@@ -569,13 +570,16 @@ async def test_failing_tool_becomes_an_error_result_and_the_run_continues() -> N
     error_events = [event for event in events if isinstance(event, ToolResult)]
     assert len(error_events) == 1
     assert error_events[0].is_error is True
-    assert "kaboom" in error_events[0].content
+    assert "kaboom" not in error_events[0].content
+    assert "RuntimeError" in error_events[0].content
+    assert "Error ID: toolerr_" in error_events[0].content
 
     block = result.messages[2].content[0]
     assert isinstance(block, ToolResultBlock)
     assert block.is_error is True
     assert block.tool_use_id == "t1"
     assert "RuntimeError" in block.content
+    assert "kaboom" not in block.content
     assert result.text == "I could not do that, sorry."
     assert result.stop_reason == "end_turn"
     assert result.iterations == 2
@@ -594,6 +598,97 @@ async def test_invalid_tool_arguments_become_an_error_result() -> None:
     assert block.is_error is True
     assert "a:" in block.content
     assert result.text == "recovered"
+
+
+async def test_validation_feedback_does_not_echo_the_rejected_value() -> None:
+    secret = "credential-that-must-not-reach-the-model"
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("add", {"a": secret, "b": 1}, id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[add]).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "Invalid arguments for tool 'add'" in block.content
+    assert secret not in block.content
+
+
+async def test_tool_error_message_mode_exposes_the_exception_message() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[boom], tool_error_mode="message").run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "RuntimeError: kaboom" in block.content
+    assert "Error ID: toolerr_" in block.content
+
+
+async def test_tool_error_traceback_mode_exposes_the_full_traceback() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[boom], tool_error_mode="traceback").run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "Traceback (most recent call last)" in block.content
+    assert "RuntimeError: kaboom" in block.content
+
+
+async def test_custom_tool_error_formatter_receives_raw_failure_context() -> None:
+    seen: list[ToolErrorContext] = []
+
+    def format_error(context: ToolErrorContext) -> str:
+        seen.append(context)
+        return f"retry using error reference {context.error_id}"
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    result = await Agent(provider, tools=[boom], tool_error_formatter=format_error).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert block.content == f"retry using error reference {seen[0].error_id}"
+    assert seen[0].tool_name == "boom"
+    assert isinstance(seen[0].exception, RuntimeError)
+    assert str(seen[0].exception) == "kaboom"
+
+
+async def test_broken_tool_error_formatter_falls_back_to_the_safe_message() -> None:
+    def broken(_: ToolErrorContext) -> str:
+        raise RuntimeError("formatter secret")
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    result = await Agent(provider, tools=[boom], tool_error_formatter=broken).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "RuntimeError" in block.content
+    assert "formatter secret" not in block.content
+    assert "kaboom" not in block.content
 
 
 async def test_unknown_tool_name_reports_the_available_tools() -> None:
@@ -1354,6 +1449,17 @@ async def test_without_a_gate_every_call_runs() -> None:
 def test_on_tool_call_must_be_callable() -> None:
     with pytest.raises(LogposeError, match="on_tool_call must be callable"):
         Agent(FakeProvider(), on_tool_call="nope")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("mode", ["", "verbose", 3])
+def test_tool_error_mode_must_be_supported(mode: object) -> None:
+    with pytest.raises(LogposeError, match="tool_error_mode must be"):
+        Agent(FakeProvider(), tool_error_mode=mode)  # type: ignore[arg-type]
+
+
+def test_tool_error_formatter_must_be_callable() -> None:
+    with pytest.raises(LogposeError, match="tool_error_formatter must be callable"):
+        Agent(FakeProvider(), tool_error_formatter="nope")  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

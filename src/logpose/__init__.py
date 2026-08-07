@@ -43,6 +43,9 @@ from __future__ import annotations
 from logpose.agent import (
     Agent,
     Conversation,
+    ToolErrorContext,
+    ToolErrorFormatter,
+    ToolErrorMode,
     ToolGate,
     ToolGateOutcome,
     ToolGateResult,
@@ -107,6 +110,9 @@ __all__ = [
     # the loop
     "Agent",
     "Conversation",
+    "ToolErrorContext",
+    "ToolErrorFormatter",
+    "ToolErrorMode",
     "ToolGate",
     "ToolGateOutcome",
     "ToolGateResult",

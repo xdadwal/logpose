@@ -383,6 +383,35 @@ When a call times out, logpose returns an error result to the model and continue
 the run. Asynchronous tools are cancelled; a synchronous tool may continue in
 its worker thread, but any late result is discarded and never sent to the model.
 
+### Tool error detail
+
+Tool errors are safe by default: logpose returns the tool name, exception type,
+and a generated error ID, without returning an exception message or traceback to
+the model. Argument-validation feedback remains actionable but does not echo
+the rejected values.
+
+Use `tool_error_mode="message"` or `tool_error_mode="traceback"` only when the
+model is allowed to see that diagnostic detail:
+
+```python
+agent = Agent("anthropic", tools=[get_weather], tool_error_mode="message")
+```
+
+For application-specific redaction, supply a formatter. It receives raw failure
+context, so the formatter is responsible for keeping secrets out of its result.
+If it fails, logpose uses the safe default instead.
+
+```python
+from logpose import Agent, ToolErrorContext
+
+
+def tool_error(context: ToolErrorContext) -> str:
+    return f"{context.tool_name} failed; reference {context.error_id}."
+
+
+agent = Agent("anthropic", tools=[get_weather], tool_error_formatter=tool_error)
+```
+
 ## Multi-turn conversations
 
 Pass a `Conversation` to retain history across calls:
@@ -471,8 +500,10 @@ All library-defined errors inherit from `LogposeError`.
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
 | `ToolExecutionError` | The tool execution machinery failed. |
 
-Ordinary exceptions raised inside a tool are returned to the model as error tool
-results rather than raised from the run.
+Ordinary exceptions raised inside a tool are returned to the model as safe error
+results rather than raised from the run. Configure `tool_error_mode` or
+`tool_error_formatter` only when exposing additional diagnostic detail is
+appropriate for that model-facing context.
 
 ## Extending logpose
 

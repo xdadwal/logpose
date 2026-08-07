@@ -31,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its runs, queues additional calls, and applies a 300-second execution timeout
   after capacity is acquired. Timed-out calls return error results; late
   synchronous results are discarded.
+- **Safe tool errors** — tool handler failures now return only the tool name,
+  exception type, and a correlation ID by default. Use the explicit
+  `tool_error_mode="message"` / `"traceback"` options or a custom
+  `tool_error_formatter` when the model is allowed to receive more detail.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

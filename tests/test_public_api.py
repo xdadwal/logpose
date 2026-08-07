@@ -30,6 +30,9 @@ EXPECTED_API = {
     # the loop
     "Agent",
     "Conversation",
+    "ToolErrorContext",
+    "ToolErrorFormatter",
+    "ToolErrorMode",
     "ToolGate",
     "ToolGateOutcome",
     "ToolGateResult",
@@ -97,6 +100,9 @@ EXPECTED_API = {
 OWNERS = {
     "Agent": "logpose.agent",
     "Conversation": "logpose.agent",
+    "ToolErrorContext": "logpose.agent",
+    "ToolErrorFormatter": "logpose.agent",
+    "ToolErrorMode": "logpose.agent",
     "ToolGate": "logpose.agent",
     "ToolGateOutcome": "logpose.agent",
     "ToolGateResult": "logpose.agent",
