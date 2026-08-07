@@ -73,9 +73,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from time import monotonic
 from typing import Any, Literal, Union
 from uuid import uuid4
 
@@ -102,6 +104,14 @@ from logpose.providers.base import (
     ToolSpec,
 )
 from logpose.retry import DEFAULT_RETRY_POLICY, RetryPolicy
+from logpose.runtime import (
+    RuntimeContext,
+    RuntimeEvent,
+    RuntimeObserver,
+    _reset_runtime_context,
+    _set_runtime_context,
+    current_runtime_context,
+)
 from logpose.tools import ToolDef
 
 __all__ = [
@@ -113,6 +123,7 @@ __all__ = [
     "ToolErrorContext",
     "ToolErrorFormatter",
     "ToolErrorMode",
+    "RuntimeObserver",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_PROVIDER_TURN_TIMEOUT",
@@ -149,6 +160,8 @@ EMPTY_TOOL_RESULT = "(no output)"
 Providers reject empty content blocks, so a tool that returns ``""`` would
 otherwise fail the *next* request rather than its own.
 """
+
+_RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
 
 
 @dataclass(frozen=True)
@@ -344,6 +357,7 @@ class Agent:
         tool_error_formatter: ToolErrorFormatter | None = None,
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
+        observers: Sequence[RuntimeObserver] = (),
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -388,6 +402,10 @@ class Agent:
                 order, before any handler starts. Return ``None`` to let the call
                 run, or a ``str`` / :class:`ToolGateResult` to block it and hand
                 that text back to the model instead. See :data:`ToolGate`.
+            observers: Synchronous callbacks that receive content-free
+                :class:`~logpose.runtime.RuntimeEvent` lifecycle records. They
+                run in registration order; a callback failure is isolated and
+                never affects the agent run.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("anthropic", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -448,6 +466,8 @@ class Agent:
             raise LogposeError(
                 f"on_tool_call must be callable, got {type(on_tool_call).__name__}."
             )
+        if not all(callable(observer) for observer in observers):
+            raise LogposeError("observers must contain only callable callbacks.")
 
         if isinstance(provider, str):
             self.provider: Provider = resolve(provider, **provider_kwargs)
@@ -483,6 +503,7 @@ class Agent:
         self._tool_slots = asyncio.Semaphore(max_concurrent_tools)
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
+        self.observers: tuple[RuntimeObserver, ...] = tuple(observers)
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -605,6 +626,62 @@ class Agent:
         """The provider's short name, used in error messages."""
         return str(getattr(self.provider, "name", type(self.provider).__name__))
 
+    def _emit_runtime(
+        self,
+        name: str,
+        *,
+        context: RuntimeContext | None = None,
+        **fields: Any,
+    ) -> RuntimeEvent | None:
+        """Publish one content-free runtime event to logging and observers.
+
+        Reporting is deliberately best-effort: a consumer's logging handler or
+        observer must not turn a successful model run into a failed one. The
+        event type exposes only primitive metadata fields, so this method never
+        serializes prompts, model output, tool payloads, or exception messages.
+        """
+        runtime_context = context if context is not None else current_runtime_context()
+        if runtime_context is None:  # pragma: no cover - every internal call has a run context
+            return None
+        token = _set_runtime_context(runtime_context)
+        try:
+            event = RuntimeEvent(
+                name=name,
+                run_id=runtime_context.run_id,
+                provider=runtime_context.provider,
+                model=runtime_context.model,
+                turn_id=runtime_context.turn_id,
+                attempt_id=runtime_context.attempt_id,
+                request_id=runtime_context.request_id,
+                tool_call_id=runtime_context.tool_call_id,
+                tool_name=runtime_context.tool_name,
+                **fields,
+            )
+            level = (
+                logging.INFO
+                if name == "run.completed"
+                else logging.WARNING
+                if name in {"provider.retry.scheduled", "tool.failed", "tool.timed_out"}
+                else logging.DEBUG
+            )
+            try:
+                _RUNTIME_LOGGER.log(level, name, extra=event.log_fields())
+            except Exception:  # noqa: BLE001 - application-owned handlers are isolated
+                pass
+            for observer in self.observers:
+                try:
+                    observer(event)
+                except Exception:  # noqa: BLE001 - observers are isolated by contract
+                    pass
+        finally:
+            _reset_runtime_context(token)
+        return event
+
+    @staticmethod
+    def _runtime_id(kind: str) -> str:
+        """Return an opaque identifier without embedding application data."""
+        return f"{kind}_{uuid4().hex}"
+
     # -- the loop -----------------------------------------------------------
 
     async def _loop(
@@ -627,100 +704,132 @@ class Agent:
             MaxIterationsError: If the run exceeds ``max_iterations``.
             ProviderError: If the provider fails or violates its contract.
         """
-        history: list[Message] = conversation.messages if conversation is not None else []
-        if prompt is not None:
-            history.append(prompt)
+        model = self._model()
+        run_context = RuntimeContext(
+            run_id=self._runtime_id("run"), provider=self.provider_name, model=model
+        )
+        started_at = monotonic()
+        self._emit_runtime("run.started", context=run_context)
+        try:
+            history: list[Message] = conversation.messages if conversation is not None else []
+            if prompt is not None:
+                history.append(prompt)
 
-        total_usage = Usage()
-        iterations = 0
-        last: CompletionDone | None = None
+            total_usage = Usage()
+            iterations = 0
+            last: CompletionDone | None = None
 
-        while True:
-            if iterations >= self.max_iterations:
-                raise MaxIterationsError(
-                    f"Gave up after {iterations} provider iterations without a final answer "
-                    f"(max_iterations={self.max_iterations}).",
-                    list(history),
-                    self.max_iterations,
-                )
-            iterations += 1
-
-            done: CompletionDone | None = None
-            turn_stream = self._provider_turn(self._request(history))
-            try:
-                async for event in turn_stream:
-                    if isinstance(event, ProviderTextDelta):
-                        yield TextDelta(text=event.text)
-                    elif isinstance(event, ProviderThinkingDelta):
-                        yield ThinkingDelta(text=event.text)
-                    else:
-                        done = event
-            finally:
-                await _aclose(turn_stream)
-
-            if done is None:
-                raise ProviderError(
-                    f"Provider {self.provider_name!r} ended its stream without a "
-                    "CompletionDone event."
-                )
-
-            # Verbatim: thinking blocks and their signatures must survive to the
-            # next request untouched or the provider rejects the turn. The one
-            # thing that must NOT be appended is a turn with no content blocks —
-            # the documented shape of a pre-output refusal, and of any turn the
-            # provider assembled with nothing representable in it. Providers
-            # reject an empty content array, so storing it would break every
-            # later turn on this conversation with an error naming a message the
-            # consumer never wrote. `last` still carries the stop reason.
-            stored = bool(done.message.content)
-            if stored:
-                history.append(done.message)
-            total_usage = total_usage + done.usage
-            last = done
-            yield TurnEnd(stop_reason=done.stop_reason, usage=done.usage)
-
-            if done.stop_reason == "pause_turn":
-                # Not a termination: re-issue with the paused turn in history.
-                # Unless there was no paused turn to store — re-issuing an
-                # identical request would spin against the API until the
-                # iteration cap, so end the run instead.
-                if not stored:
-                    break
-                continue
-
-            if done.stop_reason == "tool_use":
-                calls = [block for block in done.message.content if isinstance(block, ToolUseBlock)]
-                if not calls:
-                    # The model asked for tools without naming any. Re-sending
-                    # would loop forever, so treat it as the end of the run.
-                    break
-                for call in calls:
-                    yield ToolCall(id=call.id, name=call.name, input=call.input)
-                results = await self._execute(calls)
-                for call, result in zip(calls, results, strict=True):
-                    yield ToolResult(
-                        id=result.tool_use_id,
-                        name=call.name,
-                        content=result.content,
-                        is_error=result.is_error,
+            while True:
+                if iterations >= self.max_iterations:
+                    raise MaxIterationsError(
+                        f"Gave up after {iterations} provider iterations without a final answer "
+                        f"(max_iterations={self.max_iterations}).",
+                        list(history),
+                        self.max_iterations,
                     )
-                # ONE user message holding every result, in request order.
-                history.append(Message(role="user", content=list(results)))
-                continue
+                iterations += 1
+                turn_context = replace(
+                    run_context,
+                    turn_id=self._runtime_id("turn"),
+                    request_id=self._runtime_id("request"),
+                )
+                done: CompletionDone | None = None
+                turn_stream = self._provider_turn(self._request(history), turn_context)
+                try:
+                    async for event in turn_stream:
+                        if isinstance(event, ProviderTextDelta):
+                            yield TextDelta(text=event.text)
+                        elif isinstance(event, ProviderThinkingDelta):
+                            yield ThinkingDelta(text=event.text)
+                        else:
+                            done = event
+                finally:
+                    await _aclose(turn_stream)
 
-            break
+                if done is None:
+                    raise ProviderError(
+                        f"Provider {self.provider_name!r} ended its stream without a "
+                        "CompletionDone event."
+                    )
 
-        yield RunEnd(
-            result=RunResult(
+                # Verbatim: thinking blocks and their signatures must survive to the
+                # next request untouched or the provider rejects the turn. The one
+                # thing that must NOT be appended is a turn with no content blocks —
+                # the documented shape of a pre-output refusal, and of any turn the
+                # provider assembled with nothing representable in it. Providers
+                # reject an empty content array, so storing it would break every
+                # later turn on this conversation with an error naming a message the
+                # consumer never wrote. `last` still carries the stop reason.
+                stored = bool(done.message.content)
+                if stored:
+                    history.append(done.message)
+                total_usage = total_usage + done.usage
+                last = done
+                yield TurnEnd(stop_reason=done.stop_reason, usage=done.usage)
+
+                if done.stop_reason == "pause_turn":
+                    # Not a termination: re-issue with the paused turn in history.
+                    # Unless there was no paused turn to store — re-issuing an
+                    # identical request would spin against the API until the
+                    # iteration cap, so end the run instead.
+                    if not stored:
+                        break
+                    continue
+
+                if done.stop_reason == "tool_use":
+                    calls = [
+                        block for block in done.message.content if isinstance(block, ToolUseBlock)
+                    ]
+                    if not calls:
+                        # The model asked for tools without naming any. Re-sending
+                        # would loop forever, so treat it as the end of the run.
+                        break
+                    for call in calls:
+                        yield ToolCall(id=call.id, name=call.name, input=call.input)
+                    results = await self._execute(calls, turn_context)
+                    for call, tool_result in zip(calls, results, strict=True):
+                        yield ToolResult(
+                            id=tool_result.tool_use_id,
+                            name=call.name,
+                            content=tool_result.content,
+                            is_error=tool_result.is_error,
+                        )
+                    # ONE user message holding every result, in request order.
+                    history.append(Message(role="user", content=list(results)))
+                    continue
+
+                break
+
+            if last is None:  # pragma: no cover - a provider turn always completes
+                raise LogposeError("The agentic loop finished without a provider completion.")
+            result = RunResult(
                 text=last.message.text,
                 messages=list(history),
                 usage=total_usage,
                 stop_reason=last.stop_reason,
                 iterations=iterations,
             )
-        )
+            self._emit_runtime(
+                "run.completed",
+                context=run_context,
+                duration_seconds=monotonic() - started_at,
+                stop_reason=result.stop_reason,
+                iterations=result.iterations,
+                input_tokens=result.usage.input_tokens,
+                output_tokens=result.usage.output_tokens,
+                cache_read_input_tokens=result.usage.cache_read_input_tokens,
+                cache_creation_input_tokens=result.usage.cache_creation_input_tokens,
+            )
+            yield RunEnd(result=result)
+        except asyncio.CancelledError:
+            self._emit_runtime(
+                "run.cancelled", context=run_context, duration_seconds=monotonic() - started_at
+            )
+            raise
 
-    async def _provider_turn(self, request: CompletionRequest) -> AsyncIterator[ProviderEvent]:
+    async def _provider_turn(
+        self, request: CompletionRequest, turn_context: RuntimeContext
+    ) -> AsyncIterator[ProviderEvent]:
         """Stream one provider turn with safe, pre-delta retries.
 
         A retry can replay a request only while nothing has reached the caller.
@@ -741,10 +850,23 @@ class Agent:
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             done: CompletionDone | None = None
             emitted = False
-            provider_stream = self.provider.stream(request)
+            attempt_context = replace(turn_context, attempt_id=self._runtime_id("attempt"))
+            started_at = monotonic()
+            self._emit_runtime("provider.attempt.started", context=attempt_context)
+            provider_token = _set_runtime_context(attempt_context)
+            try:
+                provider_stream = self.provider.stream(request)
+            finally:
+                _reset_runtime_context(provider_token)
             try:
                 async with _deadline(self._turn_timeout()):
-                    async for event in provider_stream:
+                    while True:
+                        try:
+                            event = await _next_with_runtime_context(
+                                provider_stream, attempt_context
+                            )
+                        except StopAsyncIteration:
+                            break
                         if done is not None:
                             raise ProviderError(
                                 f"Provider {self.provider_name!r} yielded "
@@ -771,25 +893,95 @@ class Agent:
                 if emitted:
                     exc.partial = True
                 if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    self._emit_runtime(
+                        "provider.attempt.failed",
+                        context=attempt_context,
+                        duration_seconds=monotonic() - started_at,
+                        error_id=self._runtime_id("error"),
+                        exception_type=type(exc).__name__,
+                        status_code=exc.status_code,
+                    )
                     raise exc from None
-                await asyncio.sleep(self.retry_policy.delay(attempt))
+                delay = self.retry_policy.delay(attempt)
+                self._emit_runtime(
+                    "provider.attempt.failed",
+                    context=attempt_context,
+                    duration_seconds=monotonic() - started_at,
+                    error_id=self._runtime_id("error"),
+                    exception_type=type(exc).__name__,
+                    status_code=exc.status_code,
+                )
+                self._emit_runtime(
+                    "provider.retry.scheduled",
+                    context=attempt_context,
+                    retry_delay_seconds=delay,
+                )
+                await asyncio.sleep(delay)
                 continue
             except ProviderError as exc:
                 exc.attempts = attempt
                 if emitted:
                     exc.partial = True
                 if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    self._emit_runtime(
+                        "provider.attempt.failed",
+                        context=attempt_context,
+                        duration_seconds=monotonic() - started_at,
+                        error_id=self._runtime_id("error"),
+                        exception_type=type(exc).__name__,
+                        status_code=exc.status_code,
+                    )
                     raise
-                await asyncio.sleep(self.retry_policy.delay(attempt, retry_after=exc.retry_after))
+                delay = self.retry_policy.delay(attempt, retry_after=exc.retry_after)
+                self._emit_runtime(
+                    "provider.attempt.failed",
+                    context=attempt_context,
+                    duration_seconds=monotonic() - started_at,
+                    error_id=self._runtime_id("error"),
+                    exception_type=type(exc).__name__,
+                    status_code=exc.status_code,
+                )
+                self._emit_runtime(
+                    "provider.retry.scheduled",
+                    context=attempt_context,
+                    retry_delay_seconds=delay,
+                )
+                await asyncio.sleep(delay)
                 continue
+            except Exception as exc:
+                self._emit_runtime(
+                    "provider.attempt.failed",
+                    context=attempt_context,
+                    duration_seconds=monotonic() - started_at,
+                    error_id=self._runtime_id("error"),
+                    exception_type=type(exc).__name__,
+                )
+                raise
             finally:
-                await _aclose(provider_stream)
+                await _aclose_with_runtime_context(provider_stream, attempt_context)
 
             if done is None:
-                raise ProviderError(
+                error = ProviderError(
                     f"Provider {self.provider_name!r} ended its stream without a "
                     "CompletionDone event."
                 )
+                self._emit_runtime(
+                    "provider.attempt.failed",
+                    context=attempt_context,
+                    duration_seconds=monotonic() - started_at,
+                    error_id=self._runtime_id("error"),
+                    exception_type=type(error).__name__,
+                )
+                raise error
+            self._emit_runtime(
+                "provider.attempt.completed",
+                context=attempt_context,
+                duration_seconds=monotonic() - started_at,
+                input_tokens=done.usage.input_tokens,
+                output_tokens=done.usage.output_tokens,
+                cache_read_input_tokens=done.usage.cache_read_input_tokens,
+                cache_creation_input_tokens=done.usage.cache_creation_input_tokens,
+            )
             yield done
             return
 
@@ -875,7 +1067,9 @@ class Agent:
 
     # -- tools --------------------------------------------------------------
 
-    async def _execute(self, calls: Sequence[ToolUseBlock]) -> list[ToolResultBlock]:
+    async def _execute(
+        self, calls: Sequence[ToolUseBlock], turn_context: RuntimeContext
+    ) -> list[ToolResultBlock]:
         """Gate every requested call, then run the survivors concurrently.
 
         Gating is a sequential pre-pass and running is concurrent: a gate that
@@ -891,7 +1085,16 @@ class Agent:
         """
         blocked = await self._gate(calls)
         runnable = [(index, call) for index, call in enumerate(calls) if index not in blocked]
-        tasks = [asyncio.create_task(self._invoke(call)) for _, call in runnable]
+        queued: list[tuple[int, ToolUseBlock, float]] = []
+        for index, call in runnable:
+            queued_at = monotonic()
+            context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
+            self._emit_runtime("tool.queued", context=context)
+            queued.append((index, call, queued_at))
+        tasks = [
+            asyncio.create_task(self._invoke(call, queued_at, turn_context))
+            for _, call, queued_at in queued
+        ]
         try:
             ran: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
         finally:
@@ -902,7 +1105,7 @@ class Agent:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         results = dict(blocked)
-        for (index, _call), result in zip(runnable, ran, strict=True):
+        for (index, _call, _queued_at), result in zip(queued, ran, strict=True):
             results[index] = result
         return [results[index] for index in range(len(calls))]
 
@@ -955,7 +1158,9 @@ class Agent:
             )
         return blocked
 
-    async def _invoke(self, call: ToolUseBlock) -> ToolResultBlock:
+    async def _invoke(
+        self, call: ToolUseBlock, queued_at: float, turn_context: RuntimeContext
+    ) -> ToolResultBlock:
         """Execute one tool call and render the outcome for the model.
 
         Args:
@@ -966,43 +1171,97 @@ class Agent:
             tools and handler failures produce ``is_error=True`` results so the
             model can correct itself; they never raise.
         """
-        tool_def = self._tools_by_name.get(call.name)
-        if tool_def is None:
-            return ToolResultBlock(
-                tool_use_id=call.id,
-                content=self._unknown_tool_message(call.name),
-                is_error=True,
-            )
+        context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
+        token = _set_runtime_context(context)
         try:
+            tool_def = self._tools_by_name.get(call.name)
+            if tool_def is None:
+                result = ToolResultBlock(
+                    tool_use_id=call.id,
+                    content=self._unknown_tool_message(call.name),
+                    is_error=True,
+                )
+                self._emit_runtime(
+                    "tool.failed",
+                    result_bytes=len(result.content.encode()),
+                    exception_type="UnknownTool",
+                )
+                return result
             async with self._tool_slots:
-                if self.tool_timeout is None:
-                    content = await tool_def.invoke(call.input)
-                else:
-                    content = await asyncio.wait_for(
-                        tool_def.invoke(call.input),
-                        timeout=self.tool_timeout,
+                started_at = monotonic()
+                self._emit_runtime("tool.started", queue_seconds=started_at - queued_at)
+                try:
+                    if self.tool_timeout is None:
+                        content = await tool_def.invoke(call.input)
+                    else:
+                        content = await asyncio.wait_for(
+                            tool_def.invoke(call.input),
+                            timeout=self.tool_timeout,
+                        )
+                except asyncio.TimeoutError:
+                    result = ToolResultBlock(
+                        tool_use_id=call.id,
+                        content=(
+                            f"Tool {call.name!r} exceeded its "
+                            f"{self.tool_timeout:g}-second execution limit."
+                        ),
+                        is_error=True,
                     )
-        except asyncio.TimeoutError:
-            return ToolResultBlock(
+                    self._emit_runtime(
+                        "tool.timed_out",
+                        execution_seconds=monotonic() - started_at,
+                        tool_timed_out=True,
+                        result_bytes=len(result.content.encode()),
+                    )
+                    return result
+                except ToolExecutionError as exc:
+                    error_id = self._runtime_id("toolerr")
+                    result = self._tool_error_result(call, exc, error_id=error_id)
+                    self._emit_runtime(
+                        "tool.failed",
+                        execution_seconds=monotonic() - started_at,
+                        error_id=error_id,
+                        exception_type=type(exc.__cause__ or exc).__name__,
+                        result_bytes=len(result.content.encode()),
+                    )
+                    return result
+                except Exception as exc:  # noqa: BLE001 - a tool must never crash the loop
+                    error_id = self._runtime_id("toolerr")
+                    result = self._tool_error_result(call, exc, error_id=error_id)
+                    self._emit_runtime(
+                        "tool.failed",
+                        execution_seconds=monotonic() - started_at,
+                        error_id=error_id,
+                        exception_type=type(exc).__name__,
+                        result_bytes=len(result.content.encode()),
+                    )
+                    return result
+            result = ToolResultBlock(
                 tool_use_id=call.id,
-                content=(
-                    f"Tool {call.name!r} exceeded its {self.tool_timeout:g}-second execution limit."
-                ),
-                is_error=True,
+                content=content if content.strip() else EMPTY_TOOL_RESULT,
+                is_error=False,
             )
-        except ToolExecutionError as exc:
-            return self._tool_error_result(call, exc)
-        except Exception as exc:  # noqa: BLE001 - a tool must never crash the loop
-            return self._tool_error_result(call, exc)
-        return ToolResultBlock(
-            tool_use_id=call.id,
-            content=content if content.strip() else EMPTY_TOOL_RESULT,
-            is_error=False,
-        )
+            self._emit_runtime(
+                "tool.completed",
+                execution_seconds=monotonic() - started_at,
+                result_bytes=len(result.content.encode()),
+            )
+            return result
+        except asyncio.CancelledError:
+            self._emit_runtime("tool.cancelled")
+            raise
+        finally:
+            _reset_runtime_context(token)
 
-    def _tool_error_result(self, call: ToolUseBlock, exc: BaseException) -> ToolResultBlock:
+    def _tool_error_result(
+        self,
+        call: ToolUseBlock,
+        exc: BaseException,
+        *,
+        error_id: str | None = None,
+    ) -> ToolResultBlock:
         """Render a tool failure without leaking handler data by default."""
-        error_id = f"toolerr_{uuid4().hex}"
+        error_id = error_id or self._runtime_id("toolerr")
         original = exc.__cause__ if isinstance(exc, ToolExecutionError) and exc.__cause__ else exc
         context = ToolErrorContext(error_id=error_id, tool_name=call.name, exception=original)
 
@@ -1093,6 +1352,33 @@ async def _aclose(iterator: AsyncIterator[Any]) -> None:
         return
     with contextlib.suppress(RuntimeError):
         await closer()
+
+
+async def _next_with_runtime_context(
+    iterator: AsyncIterator[ProviderEvent], context: RuntimeContext
+) -> ProviderEvent:
+    """Advance a provider stream while making its correlation context current.
+
+    The context is reset before a provider delta is re-yielded to the agent's
+    caller. That boundary is important for the synchronous streaming facade,
+    which resumes an async generator from a fresh task for each event.
+    """
+    token = _set_runtime_context(context)
+    try:
+        return await iterator.__anext__()
+    finally:
+        _reset_runtime_context(token)
+
+
+async def _aclose_with_runtime_context(
+    iterator: AsyncIterator[ProviderEvent], context: RuntimeContext
+) -> None:
+    """Close a provider stream while preserving its application log context."""
+    token = _set_runtime_context(context)
+    try:
+        await _aclose(iterator)
+    finally:
+        _reset_runtime_context(token)
 
 
 @contextlib.asynccontextmanager
