@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supported authentication paths, local-model workflow, and future roadmap.
 - Made API-key authentication the default in the primary weather example and
   labeled the Claude Code and Codex subscription integrations as experimental.
+- Added the approved runtime robustness and release-readiness implementation
+  plan, including locked decisions, acceptance gates, and a PR tracker.
 
 ### Added
 
