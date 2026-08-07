@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProviderError` now carries optional request ID, provider error code,
   retry-after delay, partial-stream state, and attempt count. Anthropic SDK
   retries are disabled so logpose remains the sole retry owner.
+- Complete provider-turn deadlines are now enforced by `Agent`: 15 minutes for
+  cloud and generic providers, and 30 minutes for Docker Model Runner. Pass
+  `provider_turn_timeout=` to override the default or `None` to disable it.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

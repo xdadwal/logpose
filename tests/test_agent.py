@@ -1425,6 +1425,64 @@ async def test_retryable_failure_reports_exhausted_attempt_count() -> None:
     assert excinfo.value.attempts == 2
 
 
+async def test_pre_delta_provider_turn_timeout_is_retried() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.text("late", delay=0.05),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(
+        provider,
+        provider_turn_timeout=0.01,
+        retry_policy=RetryPolicy(initial_delay=0, jitter=0),
+    )
+
+    result = await agent.run("go")
+
+    assert result.text == "recovered"
+    assert provider.call_count == 2
+
+
+async def test_post_delta_provider_turn_timeout_is_partial_and_not_retried() -> None:
+    class SlowAfterDelta:
+        name = "slow"
+        model_default = "slow-1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, req: Any) -> Any:
+            self.calls += 1
+            yield ProviderTextDelta(text="half")
+            await asyncio.sleep(0.05)
+            yield CompletionDone(
+                message=Message.assistant_text("half"),
+                stop_reason="end_turn",
+                usage=Usage(),
+            )
+
+    provider = SlowAfterDelta()
+    agent = Agent(
+        provider,
+        provider_turn_timeout=0.01,
+        retry_policy=RetryPolicy(initial_delay=0, jitter=0),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await agent.run("go")
+
+    assert provider.calls == 1
+    assert excinfo.value.error_code == "turn_timeout"
+    assert excinfo.value.partial is True
+
+
+async def test_none_disables_the_provider_turn_deadline() -> None:
+    provider = FakeProvider([ScriptedTurn.text("slow but complete", delay=0.02)])
+    result = await Agent(provider, provider_turn_timeout=None).run("go")
+    assert result.text == "slow but complete"
+
+
 async def test_a_stream_without_completion_done_is_a_provider_error() -> None:
     provider = FakeProvider([ScriptedTurn(emit_done=False)])
     with pytest.raises(ProviderError, match="without a CompletionDone"):

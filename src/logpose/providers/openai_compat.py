@@ -306,6 +306,8 @@ class OpenAICompatProvider:
     """
 
     name = "openai-compat"
+    turn_timeout = 900.0
+    """Recommended complete-turn deadline in seconds for generic servers."""
 
     def __init__(
         self,
@@ -714,6 +716,8 @@ class DockerModelsProvider(OpenAICompatProvider):
     """
 
     name = "docker"
+    turn_timeout = 1800.0
+    """Recommended complete-turn deadline in seconds for local inference."""
 
     def __init__(
         self,

@@ -75,7 +75,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Literal, Union
 
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
@@ -110,6 +110,7 @@ __all__ = [
     "ToolGateResult",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
+    "DEFAULT_PROVIDER_TURN_TIMEOUT",
     "EMPTY_TOOL_RESULT",
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",
@@ -125,6 +126,9 @@ An explicit ``Agent(max_tokens=...)`` wins; failing that the provider's own
 ``max_tokens`` is honoured, so configuring a provider to cap output cost is not
 silently overridden.
 """
+
+DEFAULT_PROVIDER_TURN_TIMEOUT = 900.0
+"""Fallback deadline, in seconds, for one complete cloud provider turn."""
 
 EMPTY_TOOL_RESULT = "(no output)"
 """Stand-in for a tool result that is empty or only whitespace.
@@ -287,6 +291,7 @@ class Agent:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        provider_turn_timeout: float | None | Literal["default"] = "default",
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
         **provider_kwargs: Any,
@@ -310,6 +315,9 @@ class Agent:
             retry_policy: Provider retry timing. Retryable failures are replayed
                 only before a text or reasoning delta reaches the caller;
                 ``RetryPolicy(max_attempts=1)`` disables retries.
+            provider_turn_timeout: Complete-turn deadline in seconds. The
+                default uses the provider's recommendation; ``None`` disables
+                the deadline.
             extra: Provider-specific request parameters, merged into every wire
                 request (:attr:`CompletionRequest.extra`). This is the escape
                 hatch for options logpose does not model — ``tool_choice``,
@@ -330,7 +338,8 @@ class Agent:
                 tool is not a :class:`~logpose.tools.ToolDef`, if
                 ``on_tool_call`` is not callable, or if ``max_iterations`` /
             ``max_tokens`` are not positive, or if ``retry_policy`` is not a
-            :class:`~logpose.retry.RetryPolicy`.
+            :class:`~logpose.retry.RetryPolicy`, or if
+            ``provider_turn_timeout`` is invalid.
         """
         if max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
@@ -339,6 +348,14 @@ class Agent:
         if not isinstance(retry_policy, RetryPolicy):
             raise LogposeError(
                 f"retry_policy must be a RetryPolicy, got {type(retry_policy).__name__}."
+            )
+        if provider_turn_timeout != "default" and (
+            provider_turn_timeout is not None
+            and (not isinstance(provider_turn_timeout, (int, float)) or provider_turn_timeout <= 0)
+        ):
+            raise LogposeError(
+                "provider_turn_timeout must be a positive number, None, or 'default'; "
+                f"got {provider_turn_timeout!r}."
             )
         if on_tool_call is not None and not callable(on_tool_call):
             raise LogposeError(
@@ -369,6 +386,7 @@ class Agent:
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
         self.retry_policy = retry_policy
+        self.provider_turn_timeout = provider_turn_timeout
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
 
@@ -631,23 +649,37 @@ class Agent:
             emitted = False
             provider_stream = self.provider.stream(request)
             try:
-                async for event in provider_stream:
-                    if done is not None:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded "
-                            f"{type(event).__name__} after CompletionDone; a provider stream "
-                            "must end with exactly one CompletionDone.",
-                        )
-                    if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
-                        emitted = True
-                        yield event
-                    elif isinstance(event, CompletionDone):
-                        done = event
-                    else:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded an unsupported event "
-                            f"of type {type(event).__name__}."
-                        )
+                async with _deadline(self._turn_timeout()):
+                    async for event in provider_stream:
+                        if done is not None:
+                            raise ProviderError(
+                                f"Provider {self.provider_name!r} yielded "
+                                f"{type(event).__name__} after CompletionDone; a provider stream "
+                                "must end with exactly one CompletionDone.",
+                            )
+                        if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
+                            emitted = True
+                            yield event
+                        elif isinstance(event, CompletionDone):
+                            done = event
+                        else:
+                            raise ProviderError(
+                                f"Provider {self.provider_name!r} yielded an unsupported event "
+                                f"of type {type(event).__name__}."
+                            )
+            except TimeoutError:
+                exc = ProviderError(
+                    f"Provider {self.provider_name!r} exceeded its complete-turn deadline.",
+                    retryable=True,
+                    error_code="turn_timeout",
+                )
+                exc.attempts = attempt
+                if emitted:
+                    exc.partial = True
+                if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    raise exc from None
+                await asyncio.sleep(self.retry_policy.delay(attempt))
+                continue
             except ProviderError as exc:
                 exc.attempts = attempt
                 if emitted:
@@ -679,6 +711,15 @@ class Agent:
             and not emitted
             and attempt < self.retry_policy.max_attempts
         )
+
+    def _turn_timeout(self) -> float | None:
+        """Resolve the complete-turn deadline for the selected provider."""
+        if self.provider_turn_timeout != "default":
+            return self.provider_turn_timeout
+        candidate = getattr(self.provider, "turn_timeout", DEFAULT_PROVIDER_TURN_TIMEOUT)
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            return float(candidate)
+        return DEFAULT_PROVIDER_TURN_TIMEOUT
 
     def _request(self, history: Sequence[Message]) -> CompletionRequest:
         """Build the request for the next turn.
@@ -918,3 +959,36 @@ async def _aclose(iterator: AsyncIterator[Any]) -> None:
         return
     with contextlib.suppress(RuntimeError):
         await closer()
+
+
+@contextlib.asynccontextmanager
+async def _deadline(seconds: float | None) -> AsyncIterator[None]:
+    """Cancel the current task at a complete-operation deadline.
+
+    ``asyncio.timeout`` would provide this directly, but logpose supports Python
+    3.10. The context distinguishes its own scheduled cancellation from a
+    caller's cancellation and turns only the former into ``TimeoutError``.
+    """
+    if seconds is None:
+        yield
+        return
+    task = asyncio.current_task()
+    if task is None:  # pragma: no cover - async code always has a task
+        yield
+        return
+    expired = False
+
+    def expire() -> None:
+        nonlocal expired
+        expired = True
+        task.cancel()
+
+    handle = asyncio.get_running_loop().call_later(seconds, expire)
+    try:
+        yield
+    except asyncio.CancelledError:
+        if expired:
+            raise TimeoutError from None
+        raise
+    finally:
+        handle.cancel()

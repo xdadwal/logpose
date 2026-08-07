@@ -274,6 +274,24 @@ logpose does not replay the turn because doing so could duplicate streamed outpu
 The resulting `ProviderError` is marked `partial=True` and carries its attempt
 count, request ID, retry delay, and provider error code when available.
 
+### Provider deadlines
+
+Each provider turn has a complete-turn deadline in addition to its transport
+timeouts: 15 minutes for cloud and generic providers, and 30 minutes for Docker
+Model Runner. A timeout before any delta can use the retry policy; a timeout
+after output is partial and is not replayed.
+
+Override the selected provider's recommendation, or disable the complete-turn
+deadline explicitly:
+
+```python
+agent = Agent("anthropic", provider_turn_timeout=600)
+agent = Agent("docker", provider_turn_timeout=None)
+```
+
+HTTPX-backed providers also accept `timeout=` for connection, pool, write, and
+idle-read settings. Anthropic providers accept a transport timeout in seconds.
+
 ## Defining tools
 
 The `@tool` decorator keeps the function callable in normal Python while adding

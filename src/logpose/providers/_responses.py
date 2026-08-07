@@ -496,6 +496,9 @@ class ResponsesProvider:
     SIBLING_HINT: ClassVar[str] = ""
     """One line appended to a credential failure, naming the provider to use instead."""
 
+    turn_timeout = 900.0
+    """Recommended complete-turn deadline in seconds for cloud inference."""
+
     def __init__(
         self,
         *,
