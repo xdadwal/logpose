@@ -982,7 +982,11 @@ async def test_end_to_end_over_a_mock_transport(monkeypatch: pytest.MonkeyPatch)
 
 async def test_real_sdk_status_error_maps_to_provider_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, json={"type": "error", "error": {"type": "rate_limit_error"}})
+        return httpx.Response(
+            429,
+            json={"type": "error", "error": {"type": "rate_limit_error"}},
+            headers={"request-id": "req_anthropic", "retry-after": "4"},
+        )
 
     http_client = anthropic.DefaultAsyncHttpxClient(transport=httpx.MockTransport(handler))
     client = anthropic.AsyncAnthropic(
@@ -998,7 +1002,18 @@ async def test_real_sdk_status_error_maps_to_provider_error() -> None:
 
     assert excinfo.value.status_code == 429
     assert excinfo.value.retryable is True
+    assert excinfo.value.request_id == "req_anthropic"
+    assert excinfo.value.retry_after == 4.0
     assert isinstance(excinfo.value.__cause__, anthropic.RateLimitError)
+
+
+async def test_owned_sdk_client_disables_sdk_retries() -> None:
+    provider = AnthropicProvider(api_key="sk-ant-api-test")
+    client = await provider.get_client()
+    try:
+        assert client.max_retries == 0
+    finally:
+        await provider.aclose()
 
 
 def test_redact_never_reveals_the_whole_secret() -> None:

@@ -33,12 +33,17 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
 
-from logpose.errors import LogposeError, ProviderError
+from logpose.errors import (
+    LogposeError,
+    ProviderError,
+    _provider_error_code_from_body,
+    _provider_metadata_from_headers,
+)
 from logpose.messages import (
     ContentBlock,
     Message,
@@ -410,7 +415,7 @@ class OpenAICompatProvider:
         except httpx.HTTPError as exc:
             raise self._transport_error(exc) from exc
         if response.status_code >= 400:
-            raise self._status_error(response.status_code, response.text)
+            raise self._status_error(response.status_code, response.text, response.headers)
         payload = response.json()
         entries = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
@@ -457,12 +462,19 @@ class OpenAICompatProvider:
             text = text.replace(secret, redact(secret))
         return text
 
-    def _status_error(self, status: int, body: str) -> ProviderError:
+    def _status_error(
+        self,
+        status: int,
+        body: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> ProviderError:
         """Build a :class:`~logpose.errors.ProviderError` from an HTTP failure."""
         return ProviderError(
             f"{self.name} request failed with status {status}: {self._scrub(body[:2000])}",
             status_code=status,
             retryable=_status_is_retryable(status),
+            error_code=_provider_error_code_from_body(body),
+            **_provider_metadata_from_headers(headers),
         )
 
     def _transport_error(self, exc: httpx.HTTPError) -> ProviderError:
@@ -529,7 +541,9 @@ class OpenAICompatProvider:
                 if response.status_code >= 400:
                     raw = await response.aread()
                     raise self._status_error(
-                        response.status_code, raw.decode("utf-8", "replace")
+                        response.status_code,
+                        raw.decode("utf-8", "replace"),
+                        response.headers,
                     )
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_line(line)

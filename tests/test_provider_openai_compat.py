@@ -520,6 +520,25 @@ async def test_client_error_is_not_retryable() -> None:
     assert excinfo.value.retryable is False
 
 
+async def test_http_failure_carries_normalized_retry_metadata() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": "rate_limit_exceeded", "message": "slow down"}},
+            headers={"x-request-id": "req_compat", "retry-after": "2.5"},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAICompatProvider(base_url=BASE, model="m", client=client)
+    with pytest.raises(ProviderError) as excinfo:
+        await drain(provider, request())
+
+    error = excinfo.value
+    assert error.error_code == "rate_limit_exceeded"
+    assert error.request_id == "req_compat"
+    assert error.retry_after == 2.5
+
+
 @pytest.mark.parametrize("status", [429, 500, 503])
 async def test_server_and_rate_limit_errors_are_retryable(status: int) -> None:
     def handler(request: httpx.Request) -> httpx.Response:

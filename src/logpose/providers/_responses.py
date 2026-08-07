@@ -54,13 +54,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, ClassVar, Literal
 
 import httpx
 
 from logpose.auth.codex import Credential, CredentialProvider
-from logpose.errors import AuthError, LogposeError, ProviderError
+from logpose.errors import (
+    AuthError,
+    LogposeError,
+    ProviderError,
+    _provider_error_code_from_body,
+    _provider_metadata_from_headers,
+)
 from logpose.messages import (
     ContentBlock,
     Message,
@@ -669,7 +675,7 @@ class ResponsesProvider:
         except httpx.HTTPError as exc:
             raise self._transport_error(exc) from exc
         if response.status_code >= 400:
-            raise self._status_error(response.status_code, response.text)
+            raise self._status_error(response.status_code, response.text, response.headers)
         return _model_ids(response.json())
 
     async def aclose(self) -> None:
@@ -771,7 +777,12 @@ class ResponsesProvider:
             text = text.replace(secret, redact(secret))
         return text
 
-    def _status_error(self, status: int, body: str) -> ProviderError:
+    def _status_error(
+        self,
+        status: int,
+        body: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> ProviderError:
         """Build a :class:`~logpose.errors.ProviderError` from an HTTP failure.
 
         Args:
@@ -787,6 +798,8 @@ class ResponsesProvider:
             f"{self._scrub(body[:2000])}{hint}",
             status_code=status,
             retryable=_status_is_retryable(status),
+            error_code=_provider_error_code_from_body(body),
+            **_provider_metadata_from_headers(headers),
         )
 
     def _transport_error(self, exc: httpx.HTTPError) -> ProviderError:
@@ -838,6 +851,7 @@ class ResponsesProvider:
             f"{self.name} stream failed: {self._scrub(detail)}{suffix}",
             status_code=None,
             retryable=isinstance(code, str) and code in _RETRYABLE_ERROR_CODES,
+            error_code=code if isinstance(code, str) and code else None,
         )
 
     # -- streaming ----------------------------------------------------------
@@ -878,7 +892,9 @@ class ResponsesProvider:
                 if response.status_code >= 400:
                     raw = await response.aread()
                     raise self._status_error(
-                        response.status_code, raw.decode("utf-8", "replace")
+                        response.status_code,
+                        raw.decode("utf-8", "replace"),
+                        response.headers,
                     )
                 async for line in response.aiter_lines():
                     event = parse_sse_data(line)
