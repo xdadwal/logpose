@@ -57,11 +57,19 @@ or:
 python -m pip install "git+https://github.com/xdadwal/logpose.git"
 ```
 
+The base install supports OpenAI, Codex, Docker Model Runner, and
+OpenAI-compatible providers. To use the Anthropic API or the experimental Claude
+Code integration, add the Anthropic extra:
+
+```bash
+python -m pip install "logpose[anthropic] @ git+https://github.com/xdadwal/logpose.git"
+```
+
 > The `logpose` name on PyPI currently belongs to an unrelated project. Until a
 > distribution name is announced here, use the Git URL above.
 
-Runtime dependencies are `anthropic`, `pydantic`, and `httpx`. Docker Model
-Runner and OpenAI-compatible servers require no additional Python packages.
+Base runtime dependencies are `pydantic` and `httpx`. Docker Model Runner and
+OpenAI-compatible servers require no additional Python packages.
 
 ## Quickstart
 

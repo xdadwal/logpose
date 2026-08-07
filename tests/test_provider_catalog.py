@@ -28,7 +28,7 @@ from logpose import (
 from logpose.auth import claude_code as claude_auth
 from logpose.auth import codex as codex_auth
 from logpose.errors import AuthError, LogposeError
-from logpose.providers import register
+from logpose.providers import register, resolve
 from tests.jwt_helpers import make_jwt
 from tests.responses_helpers import API_KEY, Recorder, completed, message_item, mock_client, sse
 
@@ -73,6 +73,25 @@ def write_codex_auth(home: Path, **tokens: Any) -> None:
 
 def test_the_catalog_covers_every_built_in_backend() -> None:
     assert {info.name for info in provider_catalog()} == BUILT_INS
+
+
+@pytest.mark.parametrize("name", ["anthropic", "claude-code"])
+def test_anthropic_providers_name_their_optional_extra_when_sdk_is_missing(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    import logpose.providers as providers
+
+    original = providers.importlib.import_module
+
+    def unavailable(module_path: str, package: str | None = None) -> Any:
+        if module_path in {"logpose.providers.anthropic", "logpose.providers.claude_code"}:
+            raise ModuleNotFoundError("No module named 'anthropic'", name="anthropic")
+        return original(module_path, package)
+
+    monkeypatch.setattr(providers.importlib, "import_module", unavailable)
+
+    with pytest.raises(LogposeError, match=r"logpose\[anthropic\]"):
+        resolve(name)
 
 
 def test_the_catalog_is_sorted_and_has_one_entry_per_backend() -> None:
