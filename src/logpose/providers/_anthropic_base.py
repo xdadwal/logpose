@@ -66,6 +66,7 @@ from logpose.messages import (
 )
 from logpose.providers._redact import redact
 from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -350,7 +351,7 @@ class AnthropicBaseProvider:
     SIBLING_HINT: ClassVar[str] = ""
     """One line appended to a credential failure, naming the provider to use instead."""
 
-    turn_timeout = 900.0
+    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
     """Recommended complete-turn deadline in seconds for cloud inference."""
 
     def __init__(
