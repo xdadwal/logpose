@@ -29,7 +29,7 @@ from logpose import (
     ToolUseBlock,
 )
 from logpose.auth import codex as codex_auth
-from logpose.errors import LogposeError, ProviderError
+from logpose.errors import AuthError, LogposeError, ProviderError
 from logpose.providers._responses import messages_to_input
 from logpose.providers._toolargs import UNPARSED_ARGUMENTS_KEY
 from logpose.providers.base import ProviderTextDelta, ProviderThinkingDelta, ToolSpec
@@ -691,10 +691,10 @@ async def test_a_reasoning_ordering_400_surfaces_the_api_message() -> None:
 
 
 async def test_the_api_key_never_appears_in_an_error_body() -> None:
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await run_turn(Recorder(status=401, text=f"bad key {API_KEY}"))
     assert API_KEY not in str(excinfo.value)
-    assert "<redacted" in str(excinfo.value)
+    assert "$OPENAI_API_KEY" in str(excinfo.value)
 
 
 async def test_a_credential_never_appears_in_a_stream_failure() -> None:

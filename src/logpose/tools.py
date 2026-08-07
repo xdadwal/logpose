@@ -725,7 +725,8 @@ class ToolDef:
         if not isinstance(args, Mapping):
             raise ToolExecutionError(
                 f"Tool {self.name!r} expected an object of arguments, "
-                f"got {type(args).__name__}."
+                f"got {type(args).__name__}.",
+                safe_to_expose=True,
             )
         if self.args_model is None:
             return (), dict(args)
@@ -733,7 +734,8 @@ class ToolDef:
             validated = self.args_model.model_validate(dict(args))
         except ValidationError as exc:
             raise ToolExecutionError(
-                f"Invalid arguments for tool {self.name!r}: {_format_validation_error(exc)}"
+                f"Invalid arguments for tool {self.name!r}: {_format_validation_error(exc)}",
+                safe_to_expose=True,
             ) from exc
 
         values = {name: getattr(validated, name) for name in type(validated).model_fields}

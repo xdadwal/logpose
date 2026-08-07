@@ -23,7 +23,7 @@ from logpose import (
     resolve,
     tool,
 )
-from logpose.errors import LogposeError, ProviderError
+from logpose.errors import AuthError, LogposeError, ProviderError
 from logpose.providers.base import CompletionRequest, ToolSpec
 from logpose.providers.openai_compat import (
     AUTO_MODEL,
@@ -572,10 +572,10 @@ async def test_api_key_never_appears_in_an_error_body() -> None:
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     provider = OpenAICompatProvider(base_url=BASE, model="m", api_key=secret, client=client)
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await drain(provider, request())
     assert secret not in str(excinfo.value)
-    assert "<redacted" in str(excinfo.value)
+    assert "$OPENAI_API_KEY" in str(excinfo.value)
 
 
 def test_repr_redacts_the_api_key() -> None:

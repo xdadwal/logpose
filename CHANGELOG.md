@@ -16,6 +16,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Centralized provider retries** — `Agent(retry_policy=RetryPolicy(...))`
+  owns retry behavior across providers. The default makes three total attempts
+  for retryable pre-delta failures, with bounded exponential backoff, jitter, and
+  `Retry-After` support. Failures after streamed output are marked partial and
+  never replayed.
+- `ProviderError` now carries optional request ID, provider error code,
+  retry-after delay, partial-stream state, and attempt count. Anthropic SDK
+  retries are disabled so logpose remains the sole retry owner.
+- Complete provider-turn deadlines are now enforced by `Agent`: 15 minutes for
+  cloud and generic providers, and 30 minutes for Docker Model Runner. Pass
+  `provider_turn_timeout=` to override the default or `None` to disable it.
+- `Agent` now limits tool execution to eight concurrent handlers shared across
+  its runs, queues additional calls, and applies a 300-second execution timeout
+  after capacity is acquired. Timed-out calls return error results; late
+  synchronous results are discarded.
+- **Safe tool errors** — tool handler failures now return only the tool name,
+  exception type, and a correlation ID by default. Use the explicit
+  `tool_error_mode="message"` / `"traceback"` options or a custom
+  `tool_error_formatter` when the model is allowed to receive more detail.
+- **Actionable authentication failures** — HTTP 401 responses now raise
+  `AuthError` rather than entering the provider retry path. Messages direct
+  API-key users to the relevant setting and experimental subscription users to
+  sign in again with their CLI.
+- **Optional Anthropic SDK** — the base install now supports OpenAI, Codex,
+  Docker Model Runner, and OpenAI-compatible providers without the Anthropic
+  SDK. Install `logpose[anthropic]` to use the Anthropic API or experimental
+  Claude Code integration.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

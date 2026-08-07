@@ -350,12 +350,19 @@ class AnthropicBaseProvider:
     SIBLING_HINT: ClassVar[str] = ""
     """One line appended to a credential failure, naming the provider to use instead."""
 
+    AUTH_FAILURE_HINT: ClassVar[str] = "Check this provider's credential configuration and retry."
+    """Actionable recovery instruction for an HTTP 401 response."""
+
+    turn_timeout = 900.0
+    """Recommended complete-turn deadline in seconds for cloud inference."""
+
     def __init__(
         self,
         *,
         model_default: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: str | dict[str, Any] | None = "adaptive",
+        timeout: float | None = 600.0,
         client: AsyncAnthropic | None = None,
     ) -> None:
         """Configure the provider.
@@ -373,19 +380,25 @@ class AnthropicBaseProvider:
                 summarized display, which is required for thinking deltas to
                 carry any text. ``"disabled"`` sends ``{"type": "disabled"}``;
                 ``None`` omits the parameter; a dict is sent verbatim.
+            timeout: SDK transport timeout in seconds. ``None`` leaves the SDK
+                default in place; the agent still enforces its complete-turn
+                deadline separately.
             client: A pre-built ``AsyncAnthropic``. When given, no credential
                 resolution happens and the caller owns the client's lifetime.
 
         Raises:
-            LogposeError: If ``thinking`` or ``max_tokens`` is invalid.
+            LogposeError: If ``thinking``, ``max_tokens``, or ``timeout`` is invalid.
         """
         if max_tokens <= 0:
             raise LogposeError(f"max_tokens must be positive, got {max_tokens!r}.")
+        if timeout is not None and timeout <= 0:
+            raise LogposeError(f"timeout must be positive or None, got {timeout!r}.")
 
         self.model_default = model_default
         self.max_tokens = max_tokens
 
         self._thinking = normalize_thinking(thinking)
+        self._timeout = timeout
         self._client: Any = client
         self._owns_client = client is None
         self._credentials: CredentialProvider | None = None
@@ -444,6 +457,8 @@ class AnthropicBaseProvider:
         }
         if self.SDK_HEADERS:
             kwargs["default_headers"] = dict(self.SDK_HEADERS)
+        if self._timeout is not None:
+            kwargs["timeout"] = self._timeout
         # logpose centralizes retry policy above providers. Leaving the SDK's
         # default retry loop enabled would make attempt counts, backoff, and
         # streaming guarantees differ from the HTTPX-backed providers.
@@ -637,8 +652,8 @@ class AnthropicBaseProvider:
             with contextlib.suppress(AttributeError):
                 exc.message = self._scrub(message)  # type: ignore[attr-defined]
 
-    def _provider_error(self, exc: BaseException) -> ProviderError:
-        """Wrap an SDK exception as a :class:`~logpose.errors.ProviderError`.
+    def _provider_error(self, exc: BaseException) -> ProviderError | AuthError:
+        """Wrap an SDK exception as a safe provider or authentication error.
 
         Also scrubs ``exc`` itself, so the chained cause cannot leak a
         credential through a traceback.
@@ -646,8 +661,12 @@ class AnthropicBaseProvider:
         self._scrub_in_place(exc)
         if isinstance(exc, anthropic.APIStatusError):
             status: int | None = exc.status_code
+            if status == 401:
+                # Never mirror a response body on authentication failure. It can
+                # contain the submitted token, and retrying it cannot recover.
+                return AuthError(f"{self.name} authentication failed. {self.AUTH_FAILURE_HINT}")
             message = self._scrub(str(exc))
-            hint = self.SIBLING_HINT if status in (401, 403) else ""
+            hint = self.SIBLING_HINT if status == 403 else ""
             response = getattr(exc, "response", None)
             raw_headers = getattr(response, "headers", None)
             metadata = _provider_metadata_from_headers(raw_headers)

@@ -245,9 +245,7 @@ def _anthropic_factory(**kwargs: Any) -> Provider:
     Returns:
         A configured Anthropic provider.
     """
-    from logpose.providers.anthropic import AnthropicProvider
-
-    return AnthropicProvider(**kwargs)
+    return _optional_provider("logpose.providers.anthropic", "AnthropicProvider", **kwargs)
 
 
 def _claude_code_factory(**kwargs: Any) -> Provider:
@@ -259,9 +257,28 @@ def _claude_code_factory(**kwargs: Any) -> Provider:
     Returns:
         A configured Claude Code provider.
     """
-    from logpose.providers.claude_code import ClaudeCodeProvider
+    return _optional_provider("logpose.providers.claude_code", "ClaudeCodeProvider", **kwargs)
 
-    return ClaudeCodeProvider(**kwargs)
+
+def _optional_provider(module_path: str, class_name: str, **kwargs: Any) -> Provider:
+    """Construct an Anthropic-backed provider or name the missing extra.
+
+    The package intentionally keeps the vendor SDK optional so applications using
+    other providers do not install it. Catch only a missing top-level SDK: an
+    unrelated import error inside the provider should remain visible to aid
+    diagnosis.
+    """
+    try:
+        module = importlib.import_module(module_path)
+    except ModuleNotFoundError as exc:
+        if exc.name == "anthropic":
+            raise LogposeError(
+                "The Anthropic providers require the optional dependency. "
+                "Install it with `pip install \"logpose[anthropic]\"`."
+            ) from None
+        raise
+    provider_class = getattr(module, class_name)
+    return provider_class(**kwargs)
 
 
 def _codex_factory(**kwargs: Any) -> Provider:
