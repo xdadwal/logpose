@@ -96,6 +96,7 @@ from logpose.providers import (
     register,
     resolve,
 )
+from logpose.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 from logpose.sync import SyncAgent, close_sync, run_sync, stream_sync
 from logpose.tools import ToolDef, discover_tools, tool
 
@@ -164,4 +165,7 @@ __all__ = [
     "ProviderStatus",
     "CredentialKind",
     "WireApi",
+    # resilience
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
 ]

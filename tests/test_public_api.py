@@ -88,6 +88,9 @@ EXPECTED_API = {
     "ProviderStatus",
     "CredentialKind",
     "WireApi",
+    # resilience
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
 }
 
 # name in logpose -> module that defines it
@@ -141,6 +144,8 @@ OWNERS = {
     "ProviderStatus": "logpose.providers.catalog",
     "CredentialKind": "logpose.providers.catalog",
     "WireApi": "logpose.providers.catalog",
+    "RetryPolicy": "logpose.retry",
+    "DEFAULT_RETRY_POLICY": "logpose.retry",
 }
 
 

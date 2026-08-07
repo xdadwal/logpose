@@ -41,7 +41,8 @@ from logpose.messages import (
     ToolUseBlock,
     Usage,
 )
-from logpose.providers.base import CompletionDone, Provider
+from logpose.providers.base import CompletionDone, Provider, ProviderTextDelta
+from logpose.retry import RetryPolicy
 from logpose.tools import ToolDef, tool
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
 
@@ -1339,6 +1340,89 @@ async def test_provider_errors_propagate() -> None:
     provider = FakeProvider([ScriptedTurn.failure(ProviderError("upstream is down"))])
     with pytest.raises(ProviderError, match="upstream is down"):
         await Agent(provider).run("go")
+
+
+async def test_retryable_pre_delta_provider_failure_is_retried() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    result = await agent.run("go")
+
+    assert result.text == "recovered"
+    assert provider.call_count == 2
+
+
+async def test_retry_after_is_honored_for_a_pre_delta_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("logpose.agent.asyncio.sleep", record_delay)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True, retry_after=2)),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0.5, jitter=0))
+
+    await agent.run("go")
+
+    assert delays == [2]
+
+
+async def test_post_delta_provider_failure_is_not_retried() -> None:
+    class PartialProvider:
+        name = "partial"
+        model_default = "partial-1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, req: Any) -> Any:
+            self.calls += 1
+            yield ProviderTextDelta(text="half")
+            raise ProviderError("connection lost", retryable=True)
+
+    provider = PartialProvider()
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    events: list[Any] = []
+    with pytest.raises(ProviderError) as excinfo:
+        async for event in agent.stream("go"):
+            events.append(event)
+
+    assert [event.text for event in events if isinstance(event, TextDelta)] == ["half"]
+    assert provider.calls == 1
+    assert excinfo.value.partial is True
+    assert excinfo.value.attempts == 1
+
+
+async def test_retryable_failure_reports_exhausted_attempt_count() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+        ]
+    )
+    agent = Agent(
+        provider,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay=0, jitter=0),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await agent.run("go")
+
+    assert provider.call_count == 2
+    assert excinfo.value.attempts == 2
 
 
 async def test_a_stream_without_completion_done_is_a_provider_error() -> None:

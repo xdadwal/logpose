@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Centralized provider retries** — `Agent(retry_policy=RetryPolicy(...))`
+  owns retry behavior across providers. The default makes three total attempts
+  for retryable pre-delta failures, with bounded exponential backoff, jitter, and
+  `Retry-After` support. Failures after streamed output are marked partial and
+  never replayed.
+- `ProviderError` now carries optional request ID, provider error code,
+  retry-after delay, partial-stream state, and attempt count. Anthropic SDK
+  retries are disabled so logpose remains the sole retry owner.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

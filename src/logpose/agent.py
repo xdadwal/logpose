@@ -94,10 +94,12 @@ from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
     Provider,
+    ProviderEvent,
     ProviderTextDelta,
     ProviderThinkingDelta,
     ToolSpec,
 )
+from logpose.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 from logpose.tools import ToolDef
 
 __all__ = [
@@ -109,6 +111,8 @@ __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
     "EMPTY_TOOL_RESULT",
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
 ]
 
 DEFAULT_MAX_ITERATIONS = 25
@@ -282,6 +286,7 @@ class Agent:
         tools: Sequence[ToolDef] = (),
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
         **provider_kwargs: Any,
@@ -302,6 +307,9 @@ class Agent:
                 :data:`DEFAULT_MAX_TOKENS` otherwise — so
                 ``Agent(AnthropicProvider(max_tokens=2048))`` is honoured rather
                 than silently overridden.
+            retry_policy: Provider retry timing. Retryable failures are replayed
+                only before a text or reasoning delta reaches the caller;
+                ``RetryPolicy(max_attempts=1)`` disables retries.
             extra: Provider-specific request parameters, merged into every wire
                 request (:attr:`CompletionRequest.extra`). This is the escape
                 hatch for options logpose does not model — ``tool_choice``,
@@ -321,12 +329,17 @@ class Agent:
                 does not implement the protocol, if two tools share a name, if a
                 tool is not a :class:`~logpose.tools.ToolDef`, if
                 ``on_tool_call`` is not callable, or if ``max_iterations`` /
-                ``max_tokens`` are not positive.
+            ``max_tokens`` are not positive, or if ``retry_policy`` is not a
+            :class:`~logpose.retry.RetryPolicy`.
         """
         if max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
         if max_tokens is not None and max_tokens < 1:
             raise LogposeError(f"max_tokens must be at least 1, got {max_tokens}.")
+        if not isinstance(retry_policy, RetryPolicy):
+            raise LogposeError(
+                f"retry_policy must be a RetryPolicy, got {type(retry_policy).__name__}."
+            )
         if on_tool_call is not None and not callable(on_tool_call):
             raise LogposeError(
                 f"on_tool_call must be callable, got {type(on_tool_call).__name__}."
@@ -355,6 +368,7 @@ class Agent:
         self.tools: tuple[ToolDef, ...] = tuple(tools)
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
+        self.retry_policy = retry_policy
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
 
@@ -520,28 +534,17 @@ class Agent:
             iterations += 1
 
             done: CompletionDone | None = None
-            provider_stream = self.provider.stream(self._request(history))
+            turn_stream = self._provider_turn(self._request(history))
             try:
-                async for event in provider_stream:
-                    if done is not None:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded "
-                            f"{type(event).__name__} after CompletionDone; a provider stream "
-                            "must end with exactly one CompletionDone."
-                        )
+                async for event in turn_stream:
                     if isinstance(event, ProviderTextDelta):
                         yield TextDelta(text=event.text)
                     elif isinstance(event, ProviderThinkingDelta):
                         yield ThinkingDelta(text=event.text)
-                    elif isinstance(event, CompletionDone):
-                        done = event
                     else:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded an unsupported event "
-                            f"of type {type(event).__name__}."
-                        )
+                        done = event
             finally:
-                await _aclose(provider_stream)
+                await _aclose(turn_stream)
 
             if done is None:
                 raise ProviderError(
@@ -603,6 +606,78 @@ class Agent:
                 stop_reason=last.stop_reason,
                 iterations=iterations,
             )
+        )
+
+    async def _provider_turn(self, request: CompletionRequest) -> AsyncIterator[ProviderEvent]:
+        """Stream one provider turn with safe, pre-delta retries.
+
+        A retry can replay a request only while nothing has reached the caller.
+        Once a text or reasoning delta was yielded, replaying would duplicate
+        visible output, so the failure is marked partial and propagated.
+
+        Args:
+            request: Fully built immutable-by-convention request for this turn.
+
+        Yields:
+            Provider deltas followed by exactly one completion event.
+
+        Raises:
+            ProviderError: If the provider fails permanently, violates its
+                streaming contract, exhausts retry attempts, or fails after an
+                emitted delta.
+        """
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
+            done: CompletionDone | None = None
+            emitted = False
+            provider_stream = self.provider.stream(request)
+            try:
+                async for event in provider_stream:
+                    if done is not None:
+                        raise ProviderError(
+                            f"Provider {self.provider_name!r} yielded "
+                            f"{type(event).__name__} after CompletionDone; a provider stream "
+                            "must end with exactly one CompletionDone.",
+                        )
+                    if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
+                        emitted = True
+                        yield event
+                    elif isinstance(event, CompletionDone):
+                        done = event
+                    else:
+                        raise ProviderError(
+                            f"Provider {self.provider_name!r} yielded an unsupported event "
+                            f"of type {type(event).__name__}."
+                        )
+            except ProviderError as exc:
+                exc.attempts = attempt
+                if emitted:
+                    exc.partial = True
+                if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    raise
+                await asyncio.sleep(self.retry_policy.delay(attempt, retry_after=exc.retry_after))
+                continue
+            finally:
+                await _aclose(provider_stream)
+
+            if done is None:
+                raise ProviderError(
+                    f"Provider {self.provider_name!r} ended its stream without a "
+                    "CompletionDone event."
+                )
+            yield done
+            return
+
+        raise AssertionError(  # pragma: no cover
+            "Retry loop exhausted without returning or raising."
+        )
+
+    def _should_retry(self, error: ProviderError, *, emitted: bool, attempt: int) -> bool:
+        """Decide whether a failed provider turn can be replayed safely."""
+        return (
+            error.retryable
+            and not error.partial
+            and not emitted
+            and attempt < self.retry_policy.max_attempts
         )
 
     def _request(self, history: Sequence[Message]) -> CompletionRequest:

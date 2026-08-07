@@ -253,6 +253,27 @@ async for event in agent.stream("Compare the weather in Pune and Goa."):
 `RunResult` contains the final text, complete message history, aggregated usage,
 final stop reason, and iteration count.
 
+### Provider retries
+
+logpose retries temporary provider failures before the first text or reasoning
+delta reaches your application. The default policy makes three total attempts,
+uses bounded exponential backoff with jitter, and honors a provider's
+`Retry-After` response when available.
+
+```python
+from logpose import Agent, RetryPolicy
+
+agent = Agent(
+    "anthropic",
+    retry_policy=RetryPolicy(max_attempts=3),
+)
+```
+
+Set `max_attempts=1` to disable retries. Once a provider has emitted a delta,
+logpose does not replay the turn because doing so could duplicate streamed output.
+The resulting `ProviderError` is marked `partial=True` and carries its attempt
+count, request ID, retry delay, and provider error code when available.
+
 ## Defining tools
 
 The `@tool` decorator keeps the function callable in normal Python while adding
