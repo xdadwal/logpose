@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Complete provider-turn deadlines are now enforced by `Agent`: 15 minutes for
   cloud and generic providers, and 30 minutes for Docker Model Runner. Pass
   `provider_turn_timeout=` to override the default or `None` to disable it.
+- `Agent` now limits tool execution to eight concurrent handlers shared across
+  its runs, queues additional calls, and applies a 300-second execution timeout
+  after capacity is acquired. Timed-out calls return error results; late
+  synchronous results are discarded.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

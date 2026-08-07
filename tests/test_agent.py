@@ -446,6 +446,72 @@ async def test_tools_actually_run_concurrently() -> None:
     assert elapsed < 0.09  # 2 x 50ms run serially would take at least 100ms
 
 
+async def test_tool_capacity_is_shared_by_concurrent_runs() -> None:
+    tracker = Tracker()
+    sleeper = sleeping_tool("sleeper", tracker, delay=0.03)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("sleeper", id="t1")),
+            ScriptedTurn.tool_use(tool_call("sleeper", id="t2")),
+            ScriptedTurn.text("done"),
+            ScriptedTurn.text("done"),
+        ]
+    )
+    agent = Agent(provider, tools=[sleeper], max_concurrent_tools=1)
+
+    await asyncio.gather(agent.run("first"), agent.run("second"))
+
+    assert tracker.peak == 1
+    assert tracker.finished == ["sleeper", "sleeper"]
+
+
+async def test_tool_timeout_becomes_an_error_result() -> None:
+    tracker = Tracker()
+    slow = sleeping_tool("slow", tracker, delay=0.05)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("slow", id="t1")),
+            ScriptedTurn.text("adapted"),
+        ]
+    )
+    agent = Agent(provider, tools=[slow], tool_timeout=0.01)
+
+    result = await agent.run("go")
+
+    tool_result = result.messages[2].content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.is_error is True
+    assert "exceeded its 0.01-second execution limit" in tool_result.content
+    assert tracker.cancelled == ["slow"]
+
+
+async def test_sync_tool_result_is_discarded_after_timeout() -> None:
+    state: list[str] = []
+
+    @tool
+    def late() -> str:
+        """Finish after the agent's deadline."""
+        state.append("started")
+        time.sleep(0.05)
+        state.append("finished")
+        return "too late"
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("late", id="t1")),
+            ScriptedTurn.text("adapted"),
+        ]
+    )
+    result = await Agent(provider, tools=[late], tool_timeout=0.01).run("go")
+
+    tool_result = result.messages[2].content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.is_error is True
+    assert "too late" not in tool_result.content
+    await asyncio.sleep(0.06)
+    assert state == ["started", "finished"]
+
+
 async def test_events_are_emitted_in_loop_order() -> None:
     provider = FakeProvider(
         [

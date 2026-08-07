@@ -362,6 +362,27 @@ The gate sees calls in wire order before any tool in that turn starts. Return
 failure. Gates may be synchronous or asynchronous. An exception from a gate ends
 the run.
 
+### Tool capacity and timeouts
+
+An agent runs up to eight tool handlers at once across all of its concurrent
+runs. Additional calls wait for capacity and still return results in the model's
+original request order. Each tool has a 300-second execution deadline after it
+acquires a slot:
+
+```python
+agent = Agent(
+    "anthropic",
+    tools=[get_weather],
+    max_concurrent_tools=8,
+    tool_timeout=300,
+)
+```
+
+Set `tool_timeout=None` for tools that intentionally run without a deadline.
+When a call times out, logpose returns an error result to the model and continues
+the run. Asynchronous tools are cancelled; a synchronous tool may continue in
+its worker thread, but any late result is discarded and never sent to the model.
+
 ## Multi-turn conversations
 
 Pass a `Conversation` to retain history across calls:

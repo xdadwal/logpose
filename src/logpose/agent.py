@@ -111,6 +111,8 @@ __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_PROVIDER_TURN_TIMEOUT",
+    "DEFAULT_MAX_CONCURRENT_TOOLS",
+    "DEFAULT_TOOL_TIMEOUT",
     "EMPTY_TOOL_RESULT",
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",
@@ -129,6 +131,12 @@ silently overridden.
 
 DEFAULT_PROVIDER_TURN_TIMEOUT = 900.0
 """Fallback deadline, in seconds, for one complete cloud provider turn."""
+
+DEFAULT_MAX_CONCURRENT_TOOLS = 8
+"""Maximum tool handlers one agent executes at once across concurrent runs."""
+
+DEFAULT_TOOL_TIMEOUT = 300.0
+"""Default execution deadline, in seconds, for one tool after queueing."""
 
 EMPTY_TOOL_RESULT = "(no output)"
 """Stand-in for a tool result that is empty or only whitespace.
@@ -292,6 +300,8 @@ class Agent:
         max_tokens: int | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         provider_turn_timeout: float | None | Literal["default"] = "default",
+        max_concurrent_tools: int = DEFAULT_MAX_CONCURRENT_TOOLS,
+        tool_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
         **provider_kwargs: Any,
@@ -318,6 +328,10 @@ class Agent:
             provider_turn_timeout: Complete-turn deadline in seconds. The
                 default uses the provider's recommendation; ``None`` disables
                 the deadline.
+            max_concurrent_tools: Tool handlers this agent may execute at once,
+                across all of its concurrent runs. Extra calls wait for capacity.
+            tool_timeout: Execution deadline in seconds after a call acquires
+                capacity. ``None`` disables the tool deadline.
             extra: Provider-specific request parameters, merged into every wire
                 request (:attr:`CompletionRequest.extra`). This is the escape
                 hatch for options logpose does not model — ``tool_choice``,
@@ -339,7 +353,8 @@ class Agent:
                 ``on_tool_call`` is not callable, or if ``max_iterations`` /
             ``max_tokens`` are not positive, or if ``retry_policy`` is not a
             :class:`~logpose.retry.RetryPolicy`, or if
-            ``provider_turn_timeout`` is invalid.
+            ``provider_turn_timeout``, ``max_concurrent_tools``, or
+            ``tool_timeout`` is invalid.
         """
         if max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
@@ -356,6 +371,21 @@ class Agent:
             raise LogposeError(
                 "provider_turn_timeout must be a positive number, None, or 'default'; "
                 f"got {provider_turn_timeout!r}."
+            )
+        if (
+            isinstance(max_concurrent_tools, bool)
+            or not isinstance(max_concurrent_tools, int)
+            or max_concurrent_tools < 1
+        ):
+            raise LogposeError(
+                "max_concurrent_tools must be at least 1, "
+                f"got {max_concurrent_tools!r}."
+            )
+        if tool_timeout is not None and (
+            not isinstance(tool_timeout, (int, float)) or tool_timeout <= 0
+        ):
+            raise LogposeError(
+                f"tool_timeout must be a positive number or None, got {tool_timeout!r}."
             )
         if on_tool_call is not None and not callable(on_tool_call):
             raise LogposeError(
@@ -387,6 +417,11 @@ class Agent:
         self.max_tokens = max_tokens
         self.retry_policy = retry_policy
         self.provider_turn_timeout = provider_turn_timeout
+        self.max_concurrent_tools = max_concurrent_tools
+        self.tool_timeout = tool_timeout
+        # Created once per agent so capacity is shared by concurrent runs. Like
+        # the provider's existing locks, it binds to the event loop on first use.
+        self._tool_slots = asyncio.Semaphore(max_concurrent_tools)
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
 
@@ -880,7 +915,22 @@ class Agent:
                 is_error=True,
             )
         try:
-            content = await tool_def.invoke(call.input)
+            async with self._tool_slots:
+                if self.tool_timeout is None:
+                    content = await tool_def.invoke(call.input)
+                else:
+                    content = await asyncio.wait_for(
+                        tool_def.invoke(call.input),
+                        timeout=self.tool_timeout,
+                    )
+        except asyncio.TimeoutError:
+            return ToolResultBlock(
+                tool_use_id=call.id,
+                content=(
+                    f"Tool {call.name!r} exceeded its {self.tool_timeout:g}-second execution limit."
+                ),
+                is_error=True,
+            )
         except ToolExecutionError as exc:
             return ToolResultBlock(
                 tool_use_id=call.id,
