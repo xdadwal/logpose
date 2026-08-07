@@ -36,7 +36,7 @@ jobs:
       # The suite is hermetic: every provider is exercised through a mock
       # transport or a scripted FakeProvider, so CI needs no credentials.
       - name: Run tests
-        run: uv run --python ${{ matrix.python-version }} pytest -q
+        run: uv run --all-groups --all-extras --python ${{ matrix.python-version }} pytest -q
 
   lint:
     name: lint and types
