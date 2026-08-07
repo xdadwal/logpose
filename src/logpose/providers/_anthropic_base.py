@@ -66,6 +66,7 @@ from logpose.messages import (
 )
 from logpose.providers._redact import redact
 from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -353,7 +354,7 @@ class AnthropicBaseProvider:
     AUTH_FAILURE_HINT: ClassVar[str] = "Check this provider's credential configuration and retry."
     """Actionable recovery instruction for an HTTP 401 response."""
 
-    turn_timeout = 900.0
+    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
     """Recommended complete-turn deadline in seconds for cloud inference."""
 
     def __init__(

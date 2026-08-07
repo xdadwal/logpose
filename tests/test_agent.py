@@ -42,7 +42,13 @@ from logpose.messages import (
     ToolUseBlock,
     Usage,
 )
-from logpose.providers.base import CompletionDone, Provider, ProviderTextDelta
+from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
+    DEFAULT_LOCAL_TURN_TIMEOUT,
+    CompletionDone,
+    Provider,
+    ProviderTextDelta,
+)
 from logpose.retry import RetryPolicy
 from logpose.tools import ToolDef, tool
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
@@ -1506,6 +1512,17 @@ def test_a_plain_function_is_rejected_with_a_hint() -> None:
 def test_repr_describes_the_configuration() -> None:
     agent = Agent(FakeProvider(), model="m", tools=[add])
     assert repr(agent) == "Agent(provider='fake', model='m', tools=1, max_iterations=25)"
+
+
+def test_built_in_provider_deadlines_use_shared_defaults() -> None:
+    from logpose.providers._anthropic_base import AnthropicBaseProvider
+    from logpose.providers._responses import ResponsesProvider
+    from logpose.providers.openai_compat import DockerModelsProvider, OpenAICompatProvider
+
+    assert AnthropicBaseProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert ResponsesProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert OpenAICompatProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert DockerModelsProvider.turn_timeout == DEFAULT_LOCAL_TURN_TIMEOUT
 
 
 async def test_provider_errors_propagate() -> None:

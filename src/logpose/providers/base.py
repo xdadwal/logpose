@@ -18,6 +18,8 @@ from typing import Any, Protocol, Union, runtime_checkable
 from logpose.messages import Message, StopReason, Usage
 
 __all__ = [
+    "DEFAULT_CLOUD_TURN_TIMEOUT",
+    "DEFAULT_LOCAL_TURN_TIMEOUT",
     "ToolSpec",
     "CompletionRequest",
     "ProviderTextDelta",
@@ -26,6 +28,12 @@ __all__ = [
     "ProviderEvent",
     "Provider",
 ]
+
+DEFAULT_CLOUD_TURN_TIMEOUT = 900.0
+"""Recommended complete-turn deadline, in seconds, for cloud providers."""
+
+DEFAULT_LOCAL_TURN_TIMEOUT = 1800.0
+"""Recommended complete-turn deadline, in seconds, for local providers."""
 
 
 @dataclass(frozen=True)

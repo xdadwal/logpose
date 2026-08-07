@@ -58,6 +58,8 @@ from logpose.messages import (
 from logpose.providers._redact import redact, scrub_exception_in_place
 from logpose.providers._toolargs import UNPARSED_ARGUMENTS_KEY, parse_tool_arguments
 from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
+    DEFAULT_LOCAL_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -307,7 +309,7 @@ class OpenAICompatProvider:
     """
 
     name = "openai-compat"
-    turn_timeout = 900.0
+    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
     """Recommended complete-turn deadline in seconds for generic servers."""
 
     def __init__(
@@ -725,7 +727,7 @@ class DockerModelsProvider(OpenAICompatProvider):
     """
 
     name = "docker"
-    turn_timeout = 1800.0
+    turn_timeout = DEFAULT_LOCAL_TURN_TIMEOUT
     """Recommended complete-turn deadline in seconds for local inference."""
 
     def __init__(
