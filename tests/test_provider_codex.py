@@ -255,12 +255,10 @@ def test_construction_never_raises_auth_error_and_reads_no_file(
 
 
 async def test_the_auth_token_never_appears_in_an_error_body() -> None:
-    from logpose.errors import ProviderError
-
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await run_turn(Recorder(status=401, text=f"bad token {OAUTH_TOKEN}"))
     assert OAUTH_TOKEN not in str(excinfo.value)
-    assert "<redacted" in str(excinfo.value)
+    assert "codex login" in str(excinfo.value)
 
 
 async def test_the_repr_redacts_every_credential() -> None:

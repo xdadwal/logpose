@@ -67,6 +67,7 @@ class ClaudeCodeProvider(AnthropicBaseProvider):
     UNUSED_AUTH_ATTR = "api_key"
     SDK_HEADERS = {"anthropic-beta": OAUTH_BETA_HEADER}
     SIBLING_HINT = ' Use Agent("anthropic") for the API-key path.'
+    AUTH_FAILURE_HINT = "Run `claude login` again, then retry."
 
     def __init__(
         self,

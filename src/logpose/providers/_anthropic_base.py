@@ -350,6 +350,9 @@ class AnthropicBaseProvider:
     SIBLING_HINT: ClassVar[str] = ""
     """One line appended to a credential failure, naming the provider to use instead."""
 
+    AUTH_FAILURE_HINT: ClassVar[str] = "Check this provider's credential configuration and retry."
+    """Actionable recovery instruction for an HTTP 401 response."""
+
     turn_timeout = 900.0
     """Recommended complete-turn deadline in seconds for cloud inference."""
 
@@ -649,8 +652,8 @@ class AnthropicBaseProvider:
             with contextlib.suppress(AttributeError):
                 exc.message = self._scrub(message)  # type: ignore[attr-defined]
 
-    def _provider_error(self, exc: BaseException) -> ProviderError:
-        """Wrap an SDK exception as a :class:`~logpose.errors.ProviderError`.
+    def _provider_error(self, exc: BaseException) -> ProviderError | AuthError:
+        """Wrap an SDK exception as a safe provider or authentication error.
 
         Also scrubs ``exc`` itself, so the chained cause cannot leak a
         credential through a traceback.
@@ -658,8 +661,12 @@ class AnthropicBaseProvider:
         self._scrub_in_place(exc)
         if isinstance(exc, anthropic.APIStatusError):
             status: int | None = exc.status_code
+            if status == 401:
+                # Never mirror a response body on authentication failure. It can
+                # contain the submitted token, and retrying it cannot recover.
+                return AuthError(f"{self.name} authentication failed. {self.AUTH_FAILURE_HINT}")
             message = self._scrub(str(exc))
-            hint = self.SIBLING_HINT if status in (401, 403) else ""
+            hint = self.SIBLING_HINT if status == 403 else ""
             response = getattr(exc, "response", None)
             raw_headers = getattr(response, "headers", None)
             metadata = _provider_metadata_from_headers(raw_headers)

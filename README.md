@@ -494,7 +494,7 @@ All library-defined errors inherit from `LogposeError`.
 
 | Error | Meaning |
 | --- | --- |
-| `AuthError` | A usable credential could not be resolved or refreshed. |
+| `AuthError` | A credential could not be resolved, refreshed, or was rejected; its message names the recovery step. |
 | `ProviderError` | The upstream provider failed; includes status and retryability when known. |
 | `MaxIterationsError` | The run reached its iteration limit; includes partial messages. |
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
@@ -504,6 +504,11 @@ Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or
 `tool_error_formatter` only when exposing additional diagnostic detail is
 appropriate for that model-facing context.
+
+An HTTP authentication rejection is never retried automatically. For API-key
+providers, `AuthError` tells you which key setting to check. For the experimental
+subscription integrations, sign in again with `claude login` or `codex login` as
+the error directs, then start a new run.
 
 ## Extending logpose
 

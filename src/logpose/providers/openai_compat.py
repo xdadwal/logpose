@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from logpose.errors import (
+    AuthError,
     LogposeError,
     ProviderError,
     _provider_error_code_from_body,
@@ -469,8 +470,16 @@ class OpenAICompatProvider:
         status: int,
         body: str,
         headers: Mapping[str, str] | None = None,
-    ) -> ProviderError:
-        """Build a :class:`~logpose.errors.ProviderError` from an HTTP failure."""
+    ) -> ProviderError | AuthError:
+        """Build a safe error from an HTTP failure."""
+        if status == 401:
+            # This backend may be local and unauthenticated, so the guidance is
+            # intentionally conditional. Never include the response body: a
+            # compatible server can reflect the bearer token in it.
+            return AuthError(
+                f"{self.name} authentication failed. Check api_key=... or the "
+                "$OPENAI_API_KEY environment variable if this server requires authentication."
+            )
         return ProviderError(
             f"{self.name} request failed with status {status}: {self._scrub(body[:2000])}",
             status_code=status,

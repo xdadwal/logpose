@@ -16,7 +16,7 @@ import pytest
 from anthropic._models import FinalRequestOptions
 
 from logpose.auth import claude_code
-from logpose.errors import AuthError, ProviderError
+from logpose.errors import AuthError
 from logpose.providers import resolve
 from logpose.providers.claude_code import (
     CLAUDE_CODE_IDENTITY,
@@ -324,12 +324,12 @@ async def test_the_subscription_token_never_appears_in_an_error(
     client = FakeClient(error=error, auth_token=OAUTH_TOKEN)
     provider = make_provider(client)
 
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await drain(provider, simple_request())
 
     message = str(excinfo.value)
     assert OAUTH_TOKEN not in message
-    assert "<redacted" in message
+    assert "claude login" in message
     # The chained cause is rendered in every traceback, so it must be scrubbed too.
     assert OAUTH_TOKEN not in str(excinfo.value.__cause__)
 
@@ -343,6 +343,6 @@ async def test_a_401_names_the_sibling_provider(no_stored_credential: None) -> N
     error = anthropic.AuthenticationError("unauthorized", response=response, body=None)
     provider = make_provider(FakeClient(error=error, auth_token=OAUTH_TOKEN))
 
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await drain(provider, simple_request())
-    assert 'Agent("anthropic")' in str(excinfo.value)
+    assert "claude login" in str(excinfo.value)
