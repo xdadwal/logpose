@@ -80,6 +80,7 @@ from logpose.messages import (
 from logpose.providers._redact import redact, scrub_exception_in_place
 from logpose.providers._toolargs import parse_tool_arguments
 from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -496,6 +497,12 @@ class ResponsesProvider:
     SIBLING_HINT: ClassVar[str] = ""
     """One line appended to a credential failure, naming the provider to use instead."""
 
+    AUTH_FAILURE_HINT: ClassVar[str] = "Check this provider's credential configuration and retry."
+    """Actionable recovery instruction for an HTTP 401 response."""
+
+    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
+    """Recommended complete-turn deadline in seconds for cloud inference."""
+
     def __init__(
         self,
         *,
@@ -782,8 +789,8 @@ class ResponsesProvider:
         status: int,
         body: str,
         headers: Mapping[str, str] | None = None,
-    ) -> ProviderError:
-        """Build a :class:`~logpose.errors.ProviderError` from an HTTP failure.
+    ) -> ProviderError | AuthError:
+        """Build a safe error from an HTTP failure.
 
         Args:
             status: The HTTP status code.
@@ -792,7 +799,11 @@ class ResponsesProvider:
         Returns:
             The error to raise.
         """
-        hint = self.SIBLING_HINT if status in (401, 403) else ""
+        if status == 401:
+            # A rejected credential is actionable but never retryable. Do not
+            # echo the provider body: gateways sometimes reflect bearer tokens.
+            return AuthError(f"{self.name} authentication failed. {self.AUTH_FAILURE_HINT}")
+        hint = self.SIBLING_HINT if status == 403 else ""
         return ProviderError(
             f"{self.name} request failed with status {status}: "
             f"{self._scrub(body[:2000])}{hint}",

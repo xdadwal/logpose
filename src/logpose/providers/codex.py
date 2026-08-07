@@ -91,6 +91,7 @@ class CodexProvider(ResponsesProvider):
     MODEL_ENV = "CODEX_MODEL"
     BASE_URL_ENV = "CODEX_BASE_URL"
     SIBLING_HINT = ' Use Agent("openai") for the API-key path.'
+    AUTH_FAILURE_HINT = "Run `codex login` again, then retry."
 
     DEFAULT_MODEL = "gpt-5.5"
     """Model used when neither the caller nor ``$CODEX_MODEL`` names one.

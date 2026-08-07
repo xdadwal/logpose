@@ -73,9 +73,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Literal, Union
+from uuid import uuid4
 
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
@@ -94,10 +96,12 @@ from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
     Provider,
+    ProviderEvent,
     ProviderTextDelta,
     ProviderThinkingDelta,
     ToolSpec,
 )
+from logpose.retry import DEFAULT_RETRY_POLICY, RetryPolicy
 from logpose.tools import ToolDef
 
 __all__ = [
@@ -106,9 +110,17 @@ __all__ = [
     "ToolGate",
     "ToolGateOutcome",
     "ToolGateResult",
+    "ToolErrorContext",
+    "ToolErrorFormatter",
+    "ToolErrorMode",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
+    "DEFAULT_PROVIDER_TURN_TIMEOUT",
+    "DEFAULT_MAX_CONCURRENT_TOOLS",
+    "DEFAULT_TOOL_TIMEOUT",
     "EMPTY_TOOL_RESULT",
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
 ]
 
 DEFAULT_MAX_ITERATIONS = 25
@@ -121,6 +133,15 @@ An explicit ``Agent(max_tokens=...)`` wins; failing that the provider's own
 ``max_tokens`` is honoured, so configuring a provider to cap output cost is not
 silently overridden.
 """
+
+DEFAULT_PROVIDER_TURN_TIMEOUT = 900.0
+"""Fallback deadline, in seconds, for one complete cloud provider turn."""
+
+DEFAULT_MAX_CONCURRENT_TOOLS = 8
+"""Maximum tool handlers one agent executes at once across concurrent runs."""
+
+DEFAULT_TOOL_TIMEOUT = 300.0
+"""Default execution deadline, in seconds, for one tool after queueing."""
 
 EMPTY_TOOL_RESULT = "(no output)"
 """Stand-in for a tool result that is empty or only whitespace.
@@ -179,6 +200,39 @@ in :func:`asyncio.to_thread`.
 
 An exception raised by a gate propagates out of the run rather than being turned
 into a tool result: a permission layer that breaks must not fail open.
+"""
+
+
+ToolErrorMode = Literal["safe", "message", "traceback"]
+"""How a failed tool is rendered to the model.
+
+``"safe"`` exposes only the tool name, exception type, and an error ID;
+``"message"`` also exposes the exception message; ``"traceback"`` exposes a
+formatted traceback. The latter two modes are opt-in because tool failures can
+contain confidential application data.
+"""
+
+
+@dataclass(frozen=True)
+class ToolErrorContext:
+    """Raw context passed only to an explicitly configured error formatter.
+
+    Attributes:
+        error_id: Unique identifier shared with the model-facing error result.
+        tool_name: Name of the tool that failed.
+        exception: Original handler or invocation exception.
+    """
+
+    error_id: str
+    tool_name: str
+    exception: BaseException
+
+
+ToolErrorFormatter = Callable[[ToolErrorContext], str]
+"""An opt-in function that renders a failed tool result for the model.
+
+The formatter receives raw exception data and is responsible for any redaction.
+If it raises or returns a non-string, logpose falls back to its safe message.
 """
 
 
@@ -282,6 +336,12 @@ class Agent:
         tools: Sequence[ToolDef] = (),
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
+        retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
+        provider_turn_timeout: float | None | Literal["default"] = "default",
+        max_concurrent_tools: int = DEFAULT_MAX_CONCURRENT_TOOLS,
+        tool_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
+        tool_error_mode: ToolErrorMode = "safe",
+        tool_error_formatter: ToolErrorFormatter | None = None,
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
         **provider_kwargs: Any,
@@ -302,6 +362,23 @@ class Agent:
                 :data:`DEFAULT_MAX_TOKENS` otherwise — so
                 ``Agent(AnthropicProvider(max_tokens=2048))`` is honoured rather
                 than silently overridden.
+            retry_policy: Provider retry timing. Retryable failures are replayed
+                only before a text or reasoning delta reaches the caller;
+                ``RetryPolicy(max_attempts=1)`` disables retries.
+            provider_turn_timeout: Complete-turn deadline in seconds. The
+                default uses the provider's recommendation; ``None`` disables
+                the deadline.
+            max_concurrent_tools: Tool handlers this agent may execute at once,
+                across all of its concurrent runs. Extra calls wait for capacity.
+            tool_timeout: Execution deadline in seconds after a call acquires
+                capacity. ``None`` disables the tool deadline.
+            tool_error_mode: Model-facing detail for tool failures. ``"safe"``
+                (the default) omits exception messages; ``"message"`` and
+                ``"traceback"`` expose progressively more diagnostic detail.
+            tool_error_formatter: Optional formatter for failed tool results.
+                It receives raw exception data and must redact anything
+                confidential. It overrides ``tool_error_mode`` when it returns
+                a string.
             extra: Provider-specific request parameters, merged into every wire
                 request (:attr:`CompletionRequest.extra`). This is the escape
                 hatch for options logpose does not model — ``tool_choice``,
@@ -321,12 +398,52 @@ class Agent:
                 does not implement the protocol, if two tools share a name, if a
                 tool is not a :class:`~logpose.tools.ToolDef`, if
                 ``on_tool_call`` is not callable, or if ``max_iterations`` /
-                ``max_tokens`` are not positive.
+            ``max_tokens`` are not positive, or if ``retry_policy`` is not a
+            :class:`~logpose.retry.RetryPolicy`, or if
+            ``provider_turn_timeout``, ``max_concurrent_tools``, or
+            ``tool_timeout`` is invalid, or if a tool-error option is invalid.
         """
         if max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
         if max_tokens is not None and max_tokens < 1:
             raise LogposeError(f"max_tokens must be at least 1, got {max_tokens}.")
+        if not isinstance(retry_policy, RetryPolicy):
+            raise LogposeError(
+                f"retry_policy must be a RetryPolicy, got {type(retry_policy).__name__}."
+            )
+        if provider_turn_timeout != "default" and (
+            provider_turn_timeout is not None
+            and (not isinstance(provider_turn_timeout, (int, float)) or provider_turn_timeout <= 0)
+        ):
+            raise LogposeError(
+                "provider_turn_timeout must be a positive number, None, or 'default'; "
+                f"got {provider_turn_timeout!r}."
+            )
+        if (
+            isinstance(max_concurrent_tools, bool)
+            or not isinstance(max_concurrent_tools, int)
+            or max_concurrent_tools < 1
+        ):
+            raise LogposeError(
+                "max_concurrent_tools must be at least 1, "
+                f"got {max_concurrent_tools!r}."
+            )
+        if tool_timeout is not None and (
+            not isinstance(tool_timeout, (int, float)) or tool_timeout <= 0
+        ):
+            raise LogposeError(
+                f"tool_timeout must be a positive number or None, got {tool_timeout!r}."
+            )
+        if tool_error_mode not in ("safe", "message", "traceback"):
+            raise LogposeError(
+                "tool_error_mode must be 'safe', 'message', or 'traceback', "
+                f"got {tool_error_mode!r}."
+            )
+        if tool_error_formatter is not None and not callable(tool_error_formatter):
+            raise LogposeError(
+                "tool_error_formatter must be callable, "
+                f"got {type(tool_error_formatter).__name__}."
+            )
         if on_tool_call is not None and not callable(on_tool_call):
             raise LogposeError(
                 f"on_tool_call must be callable, got {type(on_tool_call).__name__}."
@@ -355,6 +472,15 @@ class Agent:
         self.tools: tuple[ToolDef, ...] = tuple(tools)
         self.max_iterations = max_iterations
         self.max_tokens = max_tokens
+        self.retry_policy = retry_policy
+        self.provider_turn_timeout = provider_turn_timeout
+        self.max_concurrent_tools = max_concurrent_tools
+        self.tool_timeout = tool_timeout
+        self.tool_error_mode = tool_error_mode
+        self.tool_error_formatter = tool_error_formatter
+        # Created once per agent so capacity is shared by concurrent runs. Like
+        # the provider's existing locks, it binds to the event loop on first use.
+        self._tool_slots = asyncio.Semaphore(max_concurrent_tools)
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
 
@@ -520,28 +646,17 @@ class Agent:
             iterations += 1
 
             done: CompletionDone | None = None
-            provider_stream = self.provider.stream(self._request(history))
+            turn_stream = self._provider_turn(self._request(history))
             try:
-                async for event in provider_stream:
-                    if done is not None:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded "
-                            f"{type(event).__name__} after CompletionDone; a provider stream "
-                            "must end with exactly one CompletionDone."
-                        )
+                async for event in turn_stream:
                     if isinstance(event, ProviderTextDelta):
                         yield TextDelta(text=event.text)
                     elif isinstance(event, ProviderThinkingDelta):
                         yield ThinkingDelta(text=event.text)
-                    elif isinstance(event, CompletionDone):
-                        done = event
                     else:
-                        raise ProviderError(
-                            f"Provider {self.provider_name!r} yielded an unsupported event "
-                            f"of type {type(event).__name__}."
-                        )
+                        done = event
             finally:
-                await _aclose(provider_stream)
+                await _aclose(turn_stream)
 
             if done is None:
                 raise ProviderError(
@@ -604,6 +719,101 @@ class Agent:
                 iterations=iterations,
             )
         )
+
+    async def _provider_turn(self, request: CompletionRequest) -> AsyncIterator[ProviderEvent]:
+        """Stream one provider turn with safe, pre-delta retries.
+
+        A retry can replay a request only while nothing has reached the caller.
+        Once a text or reasoning delta was yielded, replaying would duplicate
+        visible output, so the failure is marked partial and propagated.
+
+        Args:
+            request: Fully built immutable-by-convention request for this turn.
+
+        Yields:
+            Provider deltas followed by exactly one completion event.
+
+        Raises:
+            ProviderError: If the provider fails permanently, violates its
+                streaming contract, exhausts retry attempts, or fails after an
+                emitted delta.
+        """
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
+            done: CompletionDone | None = None
+            emitted = False
+            provider_stream = self.provider.stream(request)
+            try:
+                async with _deadline(self._turn_timeout()):
+                    async for event in provider_stream:
+                        if done is not None:
+                            raise ProviderError(
+                                f"Provider {self.provider_name!r} yielded "
+                                f"{type(event).__name__} after CompletionDone; a provider stream "
+                                "must end with exactly one CompletionDone.",
+                            )
+                        if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
+                            emitted = True
+                            yield event
+                        elif isinstance(event, CompletionDone):
+                            done = event
+                        else:
+                            raise ProviderError(
+                                f"Provider {self.provider_name!r} yielded an unsupported event "
+                                f"of type {type(event).__name__}."
+                            )
+            except TimeoutError:
+                exc = ProviderError(
+                    f"Provider {self.provider_name!r} exceeded its complete-turn deadline.",
+                    retryable=True,
+                    error_code="turn_timeout",
+                )
+                exc.attempts = attempt
+                if emitted:
+                    exc.partial = True
+                if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    raise exc from None
+                await asyncio.sleep(self.retry_policy.delay(attempt))
+                continue
+            except ProviderError as exc:
+                exc.attempts = attempt
+                if emitted:
+                    exc.partial = True
+                if not self._should_retry(exc, emitted=emitted, attempt=attempt):
+                    raise
+                await asyncio.sleep(self.retry_policy.delay(attempt, retry_after=exc.retry_after))
+                continue
+            finally:
+                await _aclose(provider_stream)
+
+            if done is None:
+                raise ProviderError(
+                    f"Provider {self.provider_name!r} ended its stream without a "
+                    "CompletionDone event."
+                )
+            yield done
+            return
+
+        raise AssertionError(  # pragma: no cover
+            "Retry loop exhausted without returning or raising."
+        )
+
+    def _should_retry(self, error: ProviderError, *, emitted: bool, attempt: int) -> bool:
+        """Decide whether a failed provider turn can be replayed safely."""
+        return (
+            error.retryable
+            and not error.partial
+            and not emitted
+            and attempt < self.retry_policy.max_attempts
+        )
+
+    def _turn_timeout(self) -> float | None:
+        """Resolve the complete-turn deadline for the selected provider."""
+        if self.provider_turn_timeout != "default":
+            return self.provider_turn_timeout
+        candidate = getattr(self.provider, "turn_timeout", DEFAULT_PROVIDER_TURN_TIMEOUT)
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            return float(candidate)
+        return DEFAULT_PROVIDER_TURN_TIMEOUT
 
     def _request(self, history: Sequence[Message]) -> CompletionRequest:
         """Build the request for the next turn.
@@ -764,24 +974,64 @@ class Agent:
                 is_error=True,
             )
         try:
-            content = await tool_def.invoke(call.input)
+            async with self._tool_slots:
+                if self.tool_timeout is None:
+                    content = await tool_def.invoke(call.input)
+                else:
+                    content = await asyncio.wait_for(
+                        tool_def.invoke(call.input),
+                        timeout=self.tool_timeout,
+                    )
+        except asyncio.TimeoutError:
+            return ToolResultBlock(
+                tool_use_id=call.id,
+                content=(
+                    f"Tool {call.name!r} exceeded its {self.tool_timeout:g}-second execution limit."
+                ),
+                is_error=True,
+            )
         except ToolExecutionError as exc:
-            return ToolResultBlock(
-                tool_use_id=call.id,
-                content=str(exc) or f"Tool {call.name!r} failed.",
-                is_error=True,
-            )
+            return self._tool_error_result(call, exc)
         except Exception as exc:  # noqa: BLE001 - a tool must never crash the loop
-            return ToolResultBlock(
-                tool_use_id=call.id,
-                content=f"Tool {call.name!r} failed: {type(exc).__name__}: {exc}",
-                is_error=True,
-            )
+            return self._tool_error_result(call, exc)
         return ToolResultBlock(
             tool_use_id=call.id,
             content=content if content.strip() else EMPTY_TOOL_RESULT,
             is_error=False,
         )
+
+    def _tool_error_result(self, call: ToolUseBlock, exc: BaseException) -> ToolResultBlock:
+        """Render a tool failure without leaking handler data by default."""
+        error_id = f"toolerr_{uuid4().hex}"
+        original = exc.__cause__ if isinstance(exc, ToolExecutionError) and exc.__cause__ else exc
+        context = ToolErrorContext(error_id=error_id, tool_name=call.name, exception=original)
+
+        if self.tool_error_formatter is not None:
+            try:
+                content = self.tool_error_formatter(context)
+            except Exception:  # noqa: BLE001 - reporting must not break the run
+                content = ""
+            if isinstance(content, str) and content.strip():
+                return ToolResultBlock(tool_use_id=call.id, content=content, is_error=True)
+
+        if isinstance(exc, ToolExecutionError) and exc.safe_to_expose:
+            content = f"{str(exc) or f'Tool {call.name!r} could not run.'} Error ID: {error_id}."
+        elif self.tool_error_mode == "message":
+            content = (
+                f"Tool {call.name!r} failed with {type(original).__name__}: {original}. "
+                f"Error ID: {error_id}."
+            )
+        elif self.tool_error_mode == "traceback":
+            content = (
+                f"Tool {call.name!r} failed. Error ID: {error_id}.\n"
+                f"{''.join(traceback.format_exception(exc))}"
+            )
+        else:
+            content = (
+                f"Tool {call.name!r} failed with {type(original).__name__}. "
+                f"Error ID: {error_id}."
+            )
+        return ToolResultBlock(tool_use_id=call.id, content=content, is_error=True)
 
     def _unknown_tool_message(self, name: str) -> str:
         """Explain to the model that it called a tool that does not exist.
@@ -843,3 +1093,36 @@ async def _aclose(iterator: AsyncIterator[Any]) -> None:
         return
     with contextlib.suppress(RuntimeError):
         await closer()
+
+
+@contextlib.asynccontextmanager
+async def _deadline(seconds: float | None) -> AsyncIterator[None]:
+    """Cancel the current task at a complete-operation deadline.
+
+    ``asyncio.timeout`` would provide this directly, but logpose supports Python
+    3.10. The context distinguishes its own scheduled cancellation from a
+    caller's cancellation and turns only the former into ``TimeoutError``.
+    """
+    if seconds is None:
+        yield
+        return
+    task = asyncio.current_task()
+    if task is None:  # pragma: no cover - async code always has a task
+        yield
+        return
+    expired = False
+
+    def expire() -> None:
+        nonlocal expired
+        expired = True
+        task.cancel()
+
+    handle = asyncio.get_running_loop().call_later(seconds, expire)
+    try:
+        yield
+    except asyncio.CancelledError:
+        if expired:
+            raise TimeoutError from None
+        raise
+    finally:
+        handle.cancel()

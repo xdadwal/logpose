@@ -67,6 +67,7 @@ class OpenAIProvider(ResponsesProvider):
     MODEL_ENV = "OPENAI_RESPONSES_MODEL"
     BASE_URL_ENV = "OPENAI_RESPONSES_BASE_URL"
     SIBLING_HINT = ' Use Agent("codex") for the ChatGPT subscription path.'
+    AUTH_FAILURE_HINT = "Check api_key=... or the $OPENAI_API_KEY environment variable."
 
     DEFAULT_MODEL = "gpt-5.1"
     """Model used when neither the caller nor ``$OPENAI_RESPONSES_MODEL`` names one.

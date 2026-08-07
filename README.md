@@ -57,11 +57,19 @@ or:
 python -m pip install "git+https://github.com/xdadwal/logpose.git"
 ```
 
+The base install supports OpenAI, Codex, Docker Model Runner, and
+OpenAI-compatible providers. To use the Anthropic API or the experimental Claude
+Code integration, add the Anthropic extra:
+
+```bash
+python -m pip install "logpose[anthropic] @ git+https://github.com/xdadwal/logpose.git"
+```
+
 > The `logpose` name on PyPI currently belongs to an unrelated project. Until a
 > distribution name is announced here, use the Git URL above.
 
-Runtime dependencies are `anthropic`, `pydantic`, and `httpx`. Docker Model
-Runner and OpenAI-compatible servers require no additional Python packages.
+Base runtime dependencies are `pydantic` and `httpx`. Docker Model Runner and
+OpenAI-compatible servers require no additional Python packages.
 
 ## Quickstart
 
@@ -253,6 +261,45 @@ async for event in agent.stream("Compare the weather in Pune and Goa."):
 `RunResult` contains the final text, complete message history, aggregated usage,
 final stop reason, and iteration count.
 
+### Provider retries
+
+logpose retries temporary provider failures before the first text or reasoning
+delta reaches your application. The default policy makes three total attempts,
+uses bounded exponential backoff with jitter, and honors a provider's
+`Retry-After` response when available.
+
+```python
+from logpose import Agent, RetryPolicy
+
+agent = Agent(
+    "anthropic",
+    retry_policy=RetryPolicy(max_attempts=3),
+)
+```
+
+Set `max_attempts=1` to disable retries. Once a provider has emitted a delta,
+logpose does not replay the turn because doing so could duplicate streamed output.
+The resulting `ProviderError` is marked `partial=True` and carries its attempt
+count, request ID, retry delay, and provider error code when available.
+
+### Provider deadlines
+
+Each provider turn has a complete-turn deadline in addition to its transport
+timeouts: 15 minutes for cloud and generic providers, and 30 minutes for Docker
+Model Runner. A timeout before any delta can use the retry policy; a timeout
+after output is partial and is not replayed.
+
+Override the selected provider's recommendation, or disable the complete-turn
+deadline explicitly:
+
+```python
+agent = Agent("anthropic", provider_turn_timeout=600)
+agent = Agent("docker", provider_turn_timeout=None)
+```
+
+HTTPX-backed providers also accept `timeout=` for connection, pool, write, and
+idle-read settings. Anthropic providers accept a transport timeout in seconds.
+
 ## Defining tools
 
 The `@tool` decorator keeps the function callable in normal Python while adding
@@ -322,6 +369,56 @@ The gate sees calls in wire order before any tool in that turn starts. Return
 `ToolGateResult(..., is_error=False)` to redirect the model without reporting a
 failure. Gates may be synchronous or asynchronous. An exception from a gate ends
 the run.
+
+### Tool capacity and timeouts
+
+An agent runs up to eight tool handlers at once across all of its concurrent
+runs. Additional calls wait for capacity and still return results in the model's
+original request order. Each tool has a 300-second execution deadline after it
+acquires a slot:
+
+```python
+agent = Agent(
+    "anthropic",
+    tools=[get_weather],
+    max_concurrent_tools=8,
+    tool_timeout=300,
+)
+```
+
+Set `tool_timeout=None` for tools that intentionally run without a deadline.
+When a call times out, logpose returns an error result to the model and continues
+the run. Asynchronous tools are cancelled; a synchronous tool may continue in
+its worker thread, but any late result is discarded and never sent to the model.
+
+### Tool error detail
+
+Tool errors are safe by default: logpose returns the tool name, exception type,
+and a generated error ID, without returning an exception message or traceback to
+the model. Argument-validation feedback remains actionable but does not echo
+the rejected values.
+
+Use `tool_error_mode="message"` or `tool_error_mode="traceback"` only when the
+model is allowed to see that diagnostic detail:
+
+```python
+agent = Agent("anthropic", tools=[get_weather], tool_error_mode="message")
+```
+
+For application-specific redaction, supply a formatter. It receives raw failure
+context, so the formatter is responsible for keeping secrets out of its result.
+If it fails, logpose uses the safe default instead.
+
+```python
+from logpose import Agent, ToolErrorContext
+
+
+def tool_error(context: ToolErrorContext) -> str:
+    return f"{context.tool_name} failed; reference {context.error_id}."
+
+
+agent = Agent("anthropic", tools=[get_weather], tool_error_formatter=tool_error)
+```
 
 ## Multi-turn conversations
 
@@ -405,14 +502,21 @@ All library-defined errors inherit from `LogposeError`.
 
 | Error | Meaning |
 | --- | --- |
-| `AuthError` | A usable credential could not be resolved or refreshed. |
+| `AuthError` | A credential could not be resolved, refreshed, or was rejected; its message names the recovery step. |
 | `ProviderError` | The upstream provider failed; includes status and retryability when known. |
 | `MaxIterationsError` | The run reached its iteration limit; includes partial messages. |
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
 | `ToolExecutionError` | The tool execution machinery failed. |
 
-Ordinary exceptions raised inside a tool are returned to the model as error tool
-results rather than raised from the run.
+Ordinary exceptions raised inside a tool are returned to the model as safe error
+results rather than raised from the run. Configure `tool_error_mode` or
+`tool_error_formatter` only when exposing additional diagnostic detail is
+appropriate for that model-facing context.
+
+An HTTP authentication rejection is never retried automatically. For API-key
+providers, `AuthError` tells you which key setting to check. For the experimental
+subscription integrations, sign in again with `claude login` or `codex login` as
+the error directs, then start a new run.
 
 ## Extending logpose
 
@@ -462,6 +566,10 @@ Planned areas of expansion include:
 
 Roadmap items are directional and may evolve with community feedback. Feature
 requests and focused proposals are welcome in GitHub issues.
+
+The approved runtime-hardening milestones, defaults, acceptance criteria, and PR
+sequence are documented in the
+[robustness and release-readiness plan](docs/robustness-plan.md).
 
 ## Contributing
 

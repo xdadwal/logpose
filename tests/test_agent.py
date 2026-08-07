@@ -20,9 +20,10 @@ from logpose.agent import (
     EMPTY_TOOL_RESULT,
     Agent,
     Conversation,
+    ToolErrorContext,
     ToolGateResult,
 )
-from logpose.errors import LogposeError, MaxIterationsError, ProviderError
+from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
     RunEnd,
@@ -41,7 +42,15 @@ from logpose.messages import (
     ToolUseBlock,
     Usage,
 )
-from logpose.providers.base import CompletionDone, Provider
+from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
+    DEFAULT_LOCAL_TURN_TIMEOUT,
+    LOCAL_TURN_TIMEOUT_MULTIPLIER,
+    CompletionDone,
+    Provider,
+    ProviderTextDelta,
+)
+from logpose.retry import RetryPolicy
 from logpose.tools import ToolDef, tool
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
 
@@ -445,6 +454,72 @@ async def test_tools_actually_run_concurrently() -> None:
     assert elapsed < 0.09  # 2 x 50ms run serially would take at least 100ms
 
 
+async def test_tool_capacity_is_shared_by_concurrent_runs() -> None:
+    tracker = Tracker()
+    sleeper = sleeping_tool("sleeper", tracker, delay=0.03)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("sleeper", id="t1")),
+            ScriptedTurn.tool_use(tool_call("sleeper", id="t2")),
+            ScriptedTurn.text("done"),
+            ScriptedTurn.text("done"),
+        ]
+    )
+    agent = Agent(provider, tools=[sleeper], max_concurrent_tools=1)
+
+    await asyncio.gather(agent.run("first"), agent.run("second"))
+
+    assert tracker.peak == 1
+    assert tracker.finished == ["sleeper", "sleeper"]
+
+
+async def test_tool_timeout_becomes_an_error_result() -> None:
+    tracker = Tracker()
+    slow = sleeping_tool("slow", tracker, delay=0.05)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("slow", id="t1")),
+            ScriptedTurn.text("adapted"),
+        ]
+    )
+    agent = Agent(provider, tools=[slow], tool_timeout=0.01)
+
+    result = await agent.run("go")
+
+    tool_result = result.messages[2].content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.is_error is True
+    assert "exceeded its 0.01-second execution limit" in tool_result.content
+    assert tracker.cancelled == ["slow"]
+
+
+async def test_sync_tool_result_is_discarded_after_timeout() -> None:
+    state: list[str] = []
+
+    @tool
+    def late() -> str:
+        """Finish after the agent's deadline."""
+        state.append("started")
+        time.sleep(0.05)
+        state.append("finished")
+        return "too late"
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("late", id="t1")),
+            ScriptedTurn.text("adapted"),
+        ]
+    )
+    result = await Agent(provider, tools=[late], tool_timeout=0.01).run("go")
+
+    tool_result = result.messages[2].content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.is_error is True
+    assert "too late" not in tool_result.content
+    await asyncio.sleep(0.06)
+    assert state == ["started", "finished"]
+
+
 async def test_events_are_emitted_in_loop_order() -> None:
     provider = FakeProvider(
         [
@@ -502,13 +577,16 @@ async def test_failing_tool_becomes_an_error_result_and_the_run_continues() -> N
     error_events = [event for event in events if isinstance(event, ToolResult)]
     assert len(error_events) == 1
     assert error_events[0].is_error is True
-    assert "kaboom" in error_events[0].content
+    assert "kaboom" not in error_events[0].content
+    assert "RuntimeError" in error_events[0].content
+    assert "Error ID: toolerr_" in error_events[0].content
 
     block = result.messages[2].content[0]
     assert isinstance(block, ToolResultBlock)
     assert block.is_error is True
     assert block.tool_use_id == "t1"
     assert "RuntimeError" in block.content
+    assert "kaboom" not in block.content
     assert result.text == "I could not do that, sorry."
     assert result.stop_reason == "end_turn"
     assert result.iterations == 2
@@ -527,6 +605,97 @@ async def test_invalid_tool_arguments_become_an_error_result() -> None:
     assert block.is_error is True
     assert "a:" in block.content
     assert result.text == "recovered"
+
+
+async def test_validation_feedback_does_not_echo_the_rejected_value() -> None:
+    secret = "credential-that-must-not-reach-the-model"
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("add", {"a": secret, "b": 1}, id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[add]).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "Invalid arguments for tool 'add'" in block.content
+    assert secret not in block.content
+
+
+async def test_tool_error_message_mode_exposes_the_exception_message() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[boom], tool_error_mode="message").run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "RuntimeError: kaboom" in block.content
+    assert "Error ID: toolerr_" in block.content
+
+
+async def test_tool_error_traceback_mode_exposes_the_full_traceback() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+
+    result = await Agent(provider, tools=[boom], tool_error_mode="traceback").run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "Traceback (most recent call last)" in block.content
+    assert "RuntimeError: kaboom" in block.content
+
+
+async def test_custom_tool_error_formatter_receives_raw_failure_context() -> None:
+    seen: list[ToolErrorContext] = []
+
+    def format_error(context: ToolErrorContext) -> str:
+        seen.append(context)
+        return f"retry using error reference {context.error_id}"
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    result = await Agent(provider, tools=[boom], tool_error_formatter=format_error).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert block.content == f"retry using error reference {seen[0].error_id}"
+    assert seen[0].tool_name == "boom"
+    assert isinstance(seen[0].exception, RuntimeError)
+    assert str(seen[0].exception) == "kaboom"
+
+
+async def test_broken_tool_error_formatter_falls_back_to_the_safe_message() -> None:
+    def broken(_: ToolErrorContext) -> str:
+        raise RuntimeError("formatter secret")
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("boom", id="t1")),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    result = await Agent(provider, tools=[boom], tool_error_formatter=broken).run("go")
+
+    block = result.messages[2].content[0]
+    assert isinstance(block, ToolResultBlock)
+    assert "RuntimeError" in block.content
+    assert "formatter secret" not in block.content
+    assert "kaboom" not in block.content
 
 
 async def test_unknown_tool_name_reports_the_available_tools() -> None:
@@ -1289,6 +1458,17 @@ def test_on_tool_call_must_be_callable() -> None:
         Agent(FakeProvider(), on_tool_call="nope")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("mode", ["", "verbose", 3])
+def test_tool_error_mode_must_be_supported(mode: object) -> None:
+    with pytest.raises(LogposeError, match="tool_error_mode must be"):
+        Agent(FakeProvider(), tool_error_mode=mode)  # type: ignore[arg-type]
+
+
+def test_tool_error_formatter_must_be_callable() -> None:
+    with pytest.raises(LogposeError, match="tool_error_formatter must be callable"):
+        Agent(FakeProvider(), tool_error_formatter="nope")  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # construction and provider-contract enforcement
 # ---------------------------------------------------------------------------
@@ -1335,10 +1515,173 @@ def test_repr_describes_the_configuration() -> None:
     assert repr(agent) == "Agent(provider='fake', model='m', tools=1, max_iterations=25)"
 
 
+def test_built_in_provider_deadlines_use_shared_defaults() -> None:
+    from logpose.providers._anthropic_base import AnthropicBaseProvider
+    from logpose.providers._responses import ResponsesProvider
+    from logpose.providers.openai_compat import DockerModelsProvider, OpenAICompatProvider
+
+    assert AnthropicBaseProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert ResponsesProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert OpenAICompatProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
+    assert DockerModelsProvider.turn_timeout == DEFAULT_LOCAL_TURN_TIMEOUT
+    assert DEFAULT_LOCAL_TURN_TIMEOUT == DEFAULT_CLOUD_TURN_TIMEOUT * LOCAL_TURN_TIMEOUT_MULTIPLIER
+
+
 async def test_provider_errors_propagate() -> None:
     provider = FakeProvider([ScriptedTurn.failure(ProviderError("upstream is down"))])
     with pytest.raises(ProviderError, match="upstream is down"):
         await Agent(provider).run("go")
+
+
+async def test_auth_errors_are_never_retried() -> None:
+    provider = FakeProvider([ScriptedTurn.failure(AuthError("Sign in again."))])
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    with pytest.raises(AuthError, match="Sign in again"):
+        await agent.run("go")
+
+    assert provider.call_count == 1
+
+
+async def test_retryable_pre_delta_provider_failure_is_retried() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    result = await agent.run("go")
+
+    assert result.text == "recovered"
+    assert provider.call_count == 2
+
+
+async def test_retry_after_is_honored_for_a_pre_delta_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delays: list[float] = []
+
+    async def record_delay(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr("logpose.agent.asyncio.sleep", record_delay)
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True, retry_after=2)),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0.5, jitter=0))
+
+    await agent.run("go")
+
+    assert delays == [2]
+
+
+async def test_post_delta_provider_failure_is_not_retried() -> None:
+    class PartialProvider:
+        name = "partial"
+        model_default = "partial-1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, req: Any) -> Any:
+            self.calls += 1
+            yield ProviderTextDelta(text="half")
+            raise ProviderError("connection lost", retryable=True)
+
+    provider = PartialProvider()
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    events: list[Any] = []
+    with pytest.raises(ProviderError) as excinfo:
+        async for event in agent.stream("go"):
+            events.append(event)
+
+    assert [event.text for event in events if isinstance(event, TextDelta)] == ["half"]
+    assert provider.calls == 1
+    assert excinfo.value.partial is True
+    assert excinfo.value.attempts == 1
+
+
+async def test_retryable_failure_reports_exhausted_attempt_count() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+            ScriptedTurn.failure(ProviderError("temporary", retryable=True)),
+        ]
+    )
+    agent = Agent(
+        provider,
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay=0, jitter=0),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await agent.run("go")
+
+    assert provider.call_count == 2
+    assert excinfo.value.attempts == 2
+
+
+async def test_pre_delta_provider_turn_timeout_is_retried() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.text("late", delay=0.05),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(
+        provider,
+        provider_turn_timeout=0.01,
+        retry_policy=RetryPolicy(initial_delay=0, jitter=0),
+    )
+
+    result = await agent.run("go")
+
+    assert result.text == "recovered"
+    assert provider.call_count == 2
+
+
+async def test_post_delta_provider_turn_timeout_is_partial_and_not_retried() -> None:
+    class SlowAfterDelta:
+        name = "slow"
+        model_default = "slow-1"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, req: Any) -> Any:
+            self.calls += 1
+            yield ProviderTextDelta(text="half")
+            await asyncio.sleep(0.05)
+            yield CompletionDone(
+                message=Message.assistant_text("half"),
+                stop_reason="end_turn",
+                usage=Usage(),
+            )
+
+    provider = SlowAfterDelta()
+    agent = Agent(
+        provider,
+        provider_turn_timeout=0.01,
+        retry_policy=RetryPolicy(initial_delay=0, jitter=0),
+    )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await agent.run("go")
+
+    assert provider.calls == 1
+    assert excinfo.value.error_code == "turn_timeout"
+    assert excinfo.value.partial is True
+
+
+async def test_none_disables_the_provider_turn_deadline() -> None:
+    provider = FakeProvider([ScriptedTurn.text("slow but complete", delay=0.02)])
+    result = await Agent(provider, provider_turn_timeout=None).run("go")
+    assert result.text == "slow but complete"
 
 
 async def test_a_stream_without_completion_done_is_a_provider_error() -> None:

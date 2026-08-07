@@ -30,6 +30,9 @@ EXPECTED_API = {
     # the loop
     "Agent",
     "Conversation",
+    "ToolErrorContext",
+    "ToolErrorFormatter",
+    "ToolErrorMode",
     "ToolGate",
     "ToolGateOutcome",
     "ToolGateResult",
@@ -88,12 +91,18 @@ EXPECTED_API = {
     "ProviderStatus",
     "CredentialKind",
     "WireApi",
+    # resilience
+    "RetryPolicy",
+    "DEFAULT_RETRY_POLICY",
 }
 
 # name in logpose -> module that defines it
 OWNERS = {
     "Agent": "logpose.agent",
     "Conversation": "logpose.agent",
+    "ToolErrorContext": "logpose.agent",
+    "ToolErrorFormatter": "logpose.agent",
+    "ToolErrorMode": "logpose.agent",
     "ToolGate": "logpose.agent",
     "ToolGateOutcome": "logpose.agent",
     "ToolGateResult": "logpose.agent",
@@ -141,6 +150,8 @@ OWNERS = {
     "ProviderStatus": "logpose.providers.catalog",
     "CredentialKind": "logpose.providers.catalog",
     "WireApi": "logpose.providers.catalog",
+    "RetryPolicy": "logpose.retry",
+    "DEFAULT_RETRY_POLICY": "logpose.retry",
 }
 
 

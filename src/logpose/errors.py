@@ -209,9 +209,21 @@ class ToolSchemaError(LogposeError):
 
 
 class ToolExecutionError(LogposeError):
-    """Raised when a tool handler fails in a way the loop cannot report to the model.
+    """Raised when a tool cannot be invoked or its handler raises.
 
-    Note: ordinary handler exceptions are converted into an error
-    ``ToolResultBlock`` so the model can adapt. This error is for failures of the
-    execution machinery itself (for example, an unknown tool name).
+    ``safe_to_expose`` distinguishes validation feedback that is useful to send
+    back to a model from an arbitrary handler exception, whose message may
+    contain application data or credentials. The agent always renders the
+    latter safely by default.
     """
+
+    def __init__(self, message: str, *, safe_to_expose: bool = False) -> None:
+        """Initialize the error.
+
+        Args:
+            message: Internal failure description.
+            safe_to_expose: Whether ``message`` contains argument-validation
+                feedback that can safely be returned to the model.
+        """
+        super().__init__(message)
+        self.safe_to_expose = safe_to_expose

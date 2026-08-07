@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 
 from logpose.errors import (
+    AuthError,
     LogposeError,
     ProviderError,
     _provider_error_code_from_body,
@@ -57,6 +58,8 @@ from logpose.messages import (
 from logpose.providers._redact import redact, scrub_exception_in_place
 from logpose.providers._toolargs import UNPARSED_ARGUMENTS_KEY, parse_tool_arguments
 from logpose.providers.base import (
+    DEFAULT_CLOUD_TURN_TIMEOUT,
+    DEFAULT_LOCAL_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -306,6 +309,8 @@ class OpenAICompatProvider:
     """
 
     name = "openai-compat"
+    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
+    """Recommended complete-turn deadline in seconds for generic servers."""
 
     def __init__(
         self,
@@ -467,8 +472,16 @@ class OpenAICompatProvider:
         status: int,
         body: str,
         headers: Mapping[str, str] | None = None,
-    ) -> ProviderError:
-        """Build a :class:`~logpose.errors.ProviderError` from an HTTP failure."""
+    ) -> ProviderError | AuthError:
+        """Build a safe error from an HTTP failure."""
+        if status == 401:
+            # This backend may be local and unauthenticated, so the guidance is
+            # intentionally conditional. Never include the response body: a
+            # compatible server can reflect the bearer token in it.
+            return AuthError(
+                f"{self.name} authentication failed. Check api_key=... or the "
+                "$OPENAI_API_KEY environment variable if this server requires authentication."
+            )
         return ProviderError(
             f"{self.name} request failed with status {status}: {self._scrub(body[:2000])}",
             status_code=status,
@@ -714,6 +727,8 @@ class DockerModelsProvider(OpenAICompatProvider):
     """
 
     name = "docker"
+    turn_timeout = DEFAULT_LOCAL_TURN_TIMEOUT
+    """Recommended complete-turn deadline in seconds for local inference."""
 
     def __init__(
         self,
