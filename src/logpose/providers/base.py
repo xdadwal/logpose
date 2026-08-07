@@ -20,6 +20,7 @@ from logpose.messages import Message, StopReason, Usage
 __all__ = [
     "DEFAULT_CLOUD_TURN_TIMEOUT",
     "DEFAULT_LOCAL_TURN_TIMEOUT",
+    "LOCAL_TURN_TIMEOUT_MULTIPLIER",
     "ToolSpec",
     "CompletionRequest",
     "ProviderTextDelta",
@@ -32,7 +33,10 @@ __all__ = [
 DEFAULT_CLOUD_TURN_TIMEOUT = 900.0
 """Recommended complete-turn deadline, in seconds, for cloud providers."""
 
-DEFAULT_LOCAL_TURN_TIMEOUT = 1800.0
+LOCAL_TURN_TIMEOUT_MULTIPLIER = 2.0
+"""How much longer a local provider turn may run than a cloud provider turn."""
+
+DEFAULT_LOCAL_TURN_TIMEOUT = DEFAULT_CLOUD_TURN_TIMEOUT * LOCAL_TURN_TIMEOUT_MULTIPLIER
 """Recommended complete-turn deadline, in seconds, for local providers."""
 
 
