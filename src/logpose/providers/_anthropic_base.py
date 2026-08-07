@@ -51,7 +51,7 @@ import anthropic
 from anthropic import AsyncAnthropic
 
 from logpose.auth.claude_code import Credential, CredentialProvider
-from logpose.errors import AuthError, LogposeError, ProviderError
+from logpose.errors import AuthError, LogposeError, ProviderError, _provider_metadata_from_headers
 from logpose.messages import (
     ContentBlock,
     Message,
@@ -444,7 +444,10 @@ class AnthropicBaseProvider:
         }
         if self.SDK_HEADERS:
             kwargs["default_headers"] = dict(self.SDK_HEADERS)
-        client = AsyncAnthropic(**kwargs)
+        # logpose centralizes retry policy above providers. Leaving the SDK's
+        # default retry loop enabled would make attempt counts, backoff, and
+        # streaming guarantees differ from the HTTPX-backed providers.
+        client = AsyncAnthropic(max_retries=0, **kwargs)
         self._apply_credential(client, credential)
         return client
 
@@ -645,10 +648,17 @@ class AnthropicBaseProvider:
             status: int | None = exc.status_code
             message = self._scrub(str(exc))
             hint = self.SIBLING_HINT if status in (401, 403) else ""
+            response = getattr(exc, "response", None)
+            raw_headers = getattr(response, "headers", None)
+            metadata = _provider_metadata_from_headers(raw_headers)
+            request_id = getattr(exc, "request_id", None)
+            if isinstance(request_id, str) and request_id:
+                metadata["request_id"] = request_id
             return ProviderError(
                 f"Anthropic request failed with status {status}: {message}{hint}",
                 status_code=status,
                 retryable=_status_is_retryable(status),
+                **metadata,
             )
         if isinstance(exc, anthropic.APIConnectionError):
             return ProviderError(

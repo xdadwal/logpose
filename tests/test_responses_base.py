@@ -591,6 +591,27 @@ async def test_a_client_error_is_not_retryable() -> None:
     assert "bad request" in str(excinfo.value)
 
 
+async def test_http_failure_carries_normalized_retry_metadata() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            json={"error": {"code": "rate_limit_exceeded", "message": "slow down"}},
+            headers={"x-request-id": "req_123", "retry-after": "3"},
+        )
+
+    with pytest.raises(ProviderError) as excinfo:
+        await run_turn(handler)
+
+    error = excinfo.value
+    assert error.status_code == 429
+    assert error.retryable is True
+    assert error.error_code == "rate_limit_exceeded"
+    assert error.request_id == "req_123"
+    assert error.retry_after == 3.0
+    assert error.partial is False
+    assert error.attempts == 1
+
+
 @pytest.mark.parametrize("status", [408, 409, 429, 500, 503])
 async def test_server_and_rate_limit_errors_are_retryable(status: int) -> None:
     with pytest.raises(ProviderError) as excinfo:
@@ -626,6 +647,7 @@ async def test_a_response_failed_event_becomes_a_provider_error() -> None:
     assert "no good" in str(excinfo.value)
     assert "invalid_prompt" in str(excinfo.value)
     assert excinfo.value.retryable is False
+    assert excinfo.value.error_code == "invalid_prompt"
 
 
 async def test_a_bare_error_event_becomes_a_provider_error() -> None:
