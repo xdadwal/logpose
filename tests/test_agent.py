@@ -23,7 +23,7 @@ from logpose.agent import (
     ToolErrorContext,
     ToolGateResult,
 )
-from logpose.errors import LogposeError, MaxIterationsError, ProviderError
+from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
     RunEnd,
@@ -1512,6 +1512,16 @@ async def test_provider_errors_propagate() -> None:
     provider = FakeProvider([ScriptedTurn.failure(ProviderError("upstream is down"))])
     with pytest.raises(ProviderError, match="upstream is down"):
         await Agent(provider).run("go")
+
+
+async def test_auth_errors_are_never_retried() -> None:
+    provider = FakeProvider([ScriptedTurn.failure(AuthError("Sign in again."))])
+    agent = Agent(provider, retry_policy=RetryPolicy(initial_delay=0, jitter=0))
+
+    with pytest.raises(AuthError, match="Sign in again"):
+        await agent.run("go")
+
+    assert provider.call_count == 1
 
 
 async def test_retryable_pre_delta_provider_failure_is_retried() -> None:

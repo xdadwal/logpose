@@ -695,7 +695,6 @@ def status_error(status_code: int, message: str = "boom") -> anthropic.APIStatus
     ("status_code", "retryable"),
     [
         (400, False),
-        (401, False),
         (403, False),
         (404, False),
         (408, True),
@@ -714,6 +713,15 @@ async def test_status_errors_map_to_provider_error(status_code: int, retryable: 
     assert excinfo.value.status_code == status_code
     assert excinfo.value.retryable is retryable
     assert isinstance(excinfo.value.__cause__, anthropic.APIStatusError)
+
+
+async def test_a_401_becomes_an_actionable_auth_error() -> None:
+    provider = make_provider(FakeClient(error=status_error(401)))
+
+    with pytest.raises(AuthError) as excinfo:
+        await drain(provider, simple_request())
+
+    assert "$ANTHROPIC_API_KEY" in str(excinfo.value)
 
 
 async def test_connection_error_is_retryable() -> None:
@@ -795,12 +803,12 @@ async def test_an_injected_client_is_scrubbed_too(
     client = FakeClient(error=status_error(401, f"{echoed} {value}"), **kwargs)
     provider = AnthropicProvider(client=client)  # type: ignore[arg-type]
 
-    with pytest.raises(ProviderError) as excinfo:
+    with pytest.raises(AuthError) as excinfo:
         await drain(provider, simple_request())
 
     formatted = "".join(traceback.format_exception(excinfo.value))
-    assert value not in f"{excinfo.value.message} {excinfo.value!r} {formatted}"
-    assert "<redacted" in excinfo.value.message
+    assert value not in f"{excinfo.value!r} {formatted}"
+    assert "$ANTHROPIC_API_KEY" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------

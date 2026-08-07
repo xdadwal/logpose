@@ -31,12 +31,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --all-extras
 
       # The suite is hermetic: every provider is exercised through a mock
       # transport or a scripted FakeProvider, so CI needs no credentials.
       - name: Run tests
-        run: uv run --python ${{ matrix.python-version }} pytest -q
+        run: uv run --all-groups --all-extras --python ${{ matrix.python-version }} pytest -q
 
   lint:
     name: lint and types
@@ -50,7 +50,7 @@ jobs:
           enable-cache: true
 
       - name: Install dependencies
-        run: uv sync --all-groups
+        run: uv sync --all-groups --all-extras
 
       - name: Ruff
         run: uv run ruff check
@@ -83,4 +83,21 @@ jobs:
           assert 'anthropic' not in sys.modules, 'anthropic must not be imported eagerly'
           assert 'httpx' not in sys.modules, 'httpx must not be imported eagerly'
           print('logpose', logpose.__version__, 'imports clean')
+          "
+
+      - name: Check base install provider boundaries
+        run: |
+          /tmp/check/bin/python -c "
+          import logpose
+          from logpose.errors import LogposeError
+          logpose.resolve('openai', api_key='not-a-real-key')
+          logpose.resolve('codex', auth_token='not-a-real-token', account_id='account')
+          logpose.resolve('docker')
+          try:
+              logpose.resolve('anthropic', api_key='not-a-real-key')
+          except LogposeError as exc:
+              assert 'logpose[anthropic]' in str(exc)
+          else:
+              raise AssertionError('Anthropic resolved without its optional extra')
+          print('base provider boundaries clean')
           "

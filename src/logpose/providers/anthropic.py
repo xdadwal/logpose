@@ -57,6 +57,7 @@ class AnthropicProvider(AnthropicBaseProvider):
     AUTH_ATTR = "api_key"
     UNUSED_AUTH_ATTR = "auth_token"
     SIBLING_HINT = ' Use Agent("claude-code") for the subscription path.'
+    AUTH_FAILURE_HINT = "Check api_key=... or the $ANTHROPIC_API_KEY environment variable."
 
     def __init__(self, *, api_key: str | None = None, **kwargs: Any) -> None:
         """Configure the provider.
