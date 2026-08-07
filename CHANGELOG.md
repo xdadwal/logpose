@@ -39,6 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AuthError` rather than entering the provider retry path. Messages direct
   API-key users to the relevant setting and experimental subscription users to
   sign in again with their CLI.
+- **Optional Anthropic SDK** — the base install now supports OpenAI, Codex,
+  Docker Model Runner, and OpenAI-compatible providers without the Anthropic
+  SDK. Install `logpose[anthropic]` to use the Anthropic API or experimental
+  Claude Code integration.
 - **Codex provider** (`codex`) — `Agent("codex")`, driving OpenAI's Responses API
   against the Codex subscription endpoint (`chatgpt.com/backend-api/codex`) on a
   credential from `codex login`. Built on `httpx`, so it adds no dependency.

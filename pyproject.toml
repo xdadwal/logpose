@@ -28,13 +28,15 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # 0.49 is the first release whose `messages.stream()` accepts `thinking`,
-    # which the Anthropic provider sends on every request by default. Older
-    # versions resolve fine and then TypeError on the first call.
-    "anthropic>=0.49",
     "pydantic>=2",
     "httpx",
 ]
+
+[project.optional-dependencies]
+# 0.49 is the first release whose `messages.stream()` accepts `thinking`, which
+# the Anthropic providers send on every request by default. Older versions
+# resolve fine and then TypeError on the first call.
+anthropic = ["anthropic>=0.49"]
 
 [project.urls]
 Homepage = "https://github.com/xdadwal/logpose"
