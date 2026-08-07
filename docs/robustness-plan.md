@@ -520,13 +520,13 @@ Before the broader alpha announcement:
 
 | PR | Work item | Status | Link |
 | --- | --- | --- | --- |
-| 1 | Normalize provider failures | Not started | — |
-| 2 | Central retry policy | Not started | — |
-| 3 | Provider deadlines | Not started | — |
-| 4 | Tool capacity and timeout | Not started | — |
-| 5 | Safe tool errors | Not started | — |
-| 6 | Authentication hardening | Not started | — |
-| 7 | Optional Anthropic dependency | Not started | — |
+| 1 | Normalize provider failures | Completed | [#6](https://github.com/xdadwal/logpose/pull/6) |
+| 2 | Central retry policy | Completed | [#7](https://github.com/xdadwal/logpose/pull/7) |
+| 3 | Provider deadlines | Completed | [#8](https://github.com/xdadwal/logpose/pull/8) |
+| 4 | Tool capacity and timeout | Completed | [#9](https://github.com/xdadwal/logpose/pull/9) |
+| 5 | Safe tool errors | Completed | [#10](https://github.com/xdadwal/logpose/pull/10) |
+| 6 | Authentication hardening | Completed | [#11](https://github.com/xdadwal/logpose/pull/11) |
+| 7 | Optional Anthropic dependency | Completed | [#12](https://github.com/xdadwal/logpose/pull/12) |
 | 8 | Runtime events and context | Not started | — |
 | 9 | Standard logging | Not started | — |
 | 10 | Per-Agent observers | Not started | — |
