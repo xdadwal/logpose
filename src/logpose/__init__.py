@@ -100,6 +100,7 @@ from logpose.providers import (
     resolve,
 )
 from logpose.retry import DEFAULT_RETRY_POLICY, RetryPolicy
+from logpose.runtime import RuntimeContext, RuntimeEvent, RuntimeObserver, current_runtime_context
 from logpose.sync import SyncAgent, close_sync, run_sync, stream_sync
 from logpose.tools import ToolDef, discover_tools, tool
 
@@ -116,6 +117,10 @@ __all__ = [
     "ToolGate",
     "ToolGateOutcome",
     "ToolGateResult",
+    "RuntimeContext",
+    "RuntimeEvent",
+    "RuntimeObserver",
+    "current_runtime_context",
     # tools
     "tool",
     "ToolDef",

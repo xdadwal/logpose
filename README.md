@@ -420,6 +420,43 @@ def tool_error(context: ToolErrorContext) -> str:
 agent = Agent("anthropic", tools=[get_weather], tool_error_formatter=tool_error)
 ```
 
+## Runtime observability
+
+Every agent run publishes metadata-only lifecycle records to the standard
+`logpose.runtime` logger. logpose adds no handlers, formatters, destinations, or
+global logging configuration; configure that logger through your application's
+normal logging setup.
+
+For metrics, tracing, or audit integration, pass synchronous `observers=`. They
+receive immutable `RuntimeEvent` values in registration order. Observer and
+logging-handler failures are isolated from the agent run. Runtime records contain
+identifiers, provider/model metadata, timings, status, usage, and tool result
+sizes—but never prompts, model output, tool arguments/results, exception
+messages, headers, or credentials.
+
+```python
+from logpose import Agent, RuntimeEvent, current_runtime_context
+
+
+def metrics(event: RuntimeEvent) -> None:
+    if event.name == "run.completed":
+        metrics_client.count("agent.run", provider=event.provider)
+
+
+@tool
+def lookup_customer(customer_id: str) -> str:
+    context = current_runtime_context()
+    app_logger.info("customer lookup", extra={"run_id": context.run_id})
+    return "..."
+
+
+agent = Agent("anthropic", tools=[lookup_customer], observers=[metrics])
+```
+
+`current_runtime_context()` returns `None` outside runtime execution. Within a
+provider, tool, observer, or logging handler, it supplies opaque run, turn,
+attempt, request, and tool identifiers.
+
 ## Multi-turn conversations
 
 Pass a `Conversation` to retain history across calls:
