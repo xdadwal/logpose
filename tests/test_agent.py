@@ -44,6 +44,7 @@ from logpose.messages import (
 from logpose.providers.base import (
     DEFAULT_CLOUD_TURN_TIMEOUT,
     DEFAULT_LOCAL_TURN_TIMEOUT,
+    LOCAL_TURN_TIMEOUT_MULTIPLIER,
     CompletionDone,
     Provider,
     ProviderTextDelta,
@@ -1351,6 +1352,7 @@ def test_built_in_provider_deadlines_use_shared_defaults() -> None:
     assert ResponsesProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
     assert OpenAICompatProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
     assert DockerModelsProvider.turn_timeout == DEFAULT_LOCAL_TURN_TIMEOUT
+    assert DEFAULT_LOCAL_TURN_TIMEOUT == DEFAULT_CLOUD_TURN_TIMEOUT * LOCAL_TURN_TIMEOUT_MULTIPLIER
 
 
 async def test_provider_errors_propagate() -> None:
