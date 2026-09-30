@@ -205,6 +205,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex model discovery now declares client version `0.159.0`. The previous
+  `0.142.5` declaration restricted the subscription catalog to GPT-5.5 even
+  for an account with newer models. Explicit `client_version=` overrides remain
+  supported; the default inference model is unchanged.
 - **Every subscription (OAuth) request failed with `429 rate_limit_error`.** Not
   a quota problem: Anthropic began rejecting subscription requests whose system
   prompt does not open with the Claude Code identity line, and the rejection is

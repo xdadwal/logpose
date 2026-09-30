@@ -51,7 +51,7 @@ would make the request bytes depend on local state, which is both unreproducible
 and fatal to prompt caching.
 """
 
-CODEX_CLIENT_VERSION = "0.142.5"
+CODEX_CLIENT_VERSION = "0.159.0"
 """``client_version`` declared when listing models (undocumented; may change).
 
 ``GET /models`` on the Codex backend requires this query parameter and **gates its
@@ -59,6 +59,9 @@ answer on it** — a lower version is served a different, sometimes larger, set.
 is not a formality: it decides which models you are told about. Pinned to a constant
 rather than read from the CLI's own cache so the request is reproducible, and
 overridable per provider with ``client_version=``.
+
+Verified against the subscription catalog on 2026-09-30: ``0.142.5`` omitted
+the GPT-6 and GPT-5.6 families that ``0.159.0`` returned for the same account.
 """
 
 _FALLBACK_INSTRUCTIONS = "You are a helpful assistant."

@@ -512,6 +512,11 @@ models = await resolve("anthropic").list_models()
 - `provider_status()` checks local configuration without making a network request.
 - `provider.list_models()` asks the selected backend for its current model list.
 
+The experimental Codex model catalog is client-version-gated. Its discovery
+request declares `0.159.0` by default; pass `resolve("codex", client_version="...")`
+to override it. Updating this declaration changes discovery, not the default
+inference model or your account's model access.
+
 The experimental subscription providers have `officially_supported=False` in
 their catalog metadata so applications can label them appropriately.
 
