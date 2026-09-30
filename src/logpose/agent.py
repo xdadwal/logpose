@@ -333,7 +333,7 @@ class Agent:
         model: Model override, or ``None`` to use the provider's default.
         system: System prompt sent with every turn.
         tools: The tools advertised to the model.
-        max_iterations: Provider round trips allowed per run.
+        max_iterations: Provider round trips allowed per run, or ``None`` for no cap.
         max_tokens: Output-token ceiling override, or ``None`` to use the
             provider's own default.
         extra: Provider-specific request parameters merged into every turn.
@@ -347,7 +347,7 @@ class Agent:
         model: str | None = None,
         system: str | None = None,
         tools: Sequence[ToolDef] = (),
-        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
         provider_turn_timeout: float | None | Literal["default"] = "default",
@@ -370,7 +370,9 @@ class Agent:
             system: System prompt sent with every turn.
             tools: Tools the model may call, built with :func:`logpose.tools.tool`.
             max_iterations: Maximum provider round trips per run. Exceeding it
-                raises :class:`~logpose.errors.MaxIterationsError`.
+                raises :class:`~logpose.errors.MaxIterationsError`. ``None``
+                disables the step cap; callers should retain a run deadline
+                or cancellation mechanism for unattended work.
             max_tokens: Output-token ceiling for each turn. Defaults to the
                 provider's own ``max_tokens`` when it has one, and to
                 :data:`DEFAULT_MAX_TOKENS` otherwise — so
@@ -421,7 +423,7 @@ class Agent:
             ``provider_turn_timeout``, ``max_concurrent_tools``, or
             ``tool_timeout`` is invalid, or if a tool-error option is invalid.
         """
-        if max_iterations < 1:
+        if max_iterations is not None and max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
         if max_tokens is not None and max_tokens < 1:
             raise LogposeError(f"max_tokens must be at least 1, got {max_tokens}.")
@@ -720,7 +722,7 @@ class Agent:
             last: CompletionDone | None = None
 
             while True:
-                if iterations >= self.max_iterations:
+                if self.max_iterations is not None and iterations >= self.max_iterations:
                     raise MaxIterationsError(
                         f"Gave up after {iterations} provider iterations without a final answer "
                         f"(max_iterations={self.max_iterations}).",

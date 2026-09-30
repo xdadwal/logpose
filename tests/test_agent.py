@@ -916,6 +916,39 @@ async def test_max_iterations_of_one_still_allows_a_single_turn() -> None:
     assert result.iterations == 1
 
 
+async def test_unlimited_iterations_can_finish_beyond_the_default_cap() -> None:
+    provider = FakeProvider([
+        *[ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1})) for _ in range(30)],
+        ScriptedTurn.text("done"),
+    ])
+    result = await Agent(provider, tools=[add], max_iterations=None).run("go")
+    assert result.iterations == 31
+    assert result.text == "done"
+    assert provider.call_count == 31
+
+
+async def test_unlimited_iterations_still_honor_external_cancellation() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}))],
+        repeat_last=True,
+    )
+    agent = Agent(provider, tools=[add], max_iterations=None)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(agent.run("keep going"), timeout=0.05)
+    assert provider.call_count > 0
+
+
+async def test_default_iterations_remain_finite() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}))],
+        repeat_last=True,
+    )
+    with pytest.raises(MaxIterationsError) as excinfo:
+        await Agent(provider, tools=[add]).run("keep going")
+    assert excinfo.value.max_iterations == 25
+    assert provider.call_count == 25
+
+
 async def test_max_iterations_partial_history_lands_in_the_conversation() -> None:
     provider = FakeProvider(
         [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}, id="t1"))],
