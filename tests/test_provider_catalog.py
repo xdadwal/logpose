@@ -408,6 +408,37 @@ async def test_the_client_version_can_be_overridden() -> None:
     assert handler.requests[-1].url.params["client_version"] == "9.9.9"
 
 
+@pytest.mark.parametrize("client_version", [None, "0.142.5"])
+async def test_codex_discovery_defaults_to_the_current_version_gated_catalog(
+    client_version: str | None,
+) -> None:
+    """An outdated declaration hides current models even with the same credential."""
+    from logpose.providers.codex import CodexProvider
+
+    def catalog(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/models"
+        models = ["gpt-5.5"]
+        if request.url.params.get("client_version") == "0.159.0":
+            models = ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.5"]
+        return httpx.Response(200, content=models_body(slugs=models))
+
+    kwargs = {} if client_version is None else {"client_version": client_version}
+    async with mock_client(catalog) as client:
+        provider = CodexProvider(
+            client=client,
+            base_url="http://x.test/v1",
+            auth_token="tok",
+            account_id="acc_1",
+            **kwargs,
+        )
+        expected = (
+            ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.5"]
+            if client_version is None else ["gpt-5.5"]
+        )
+        assert await provider.list_models() == expected
+
+
 @pytest.mark.parametrize(
     "payload",
     [b"{}", b"[]", b"null", b'{"data": "nope"}', b'{"models": []}', b'{"data": [{"no_id": 1}]}'],
