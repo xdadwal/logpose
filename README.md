@@ -282,6 +282,14 @@ logpose does not replay the turn because doing so could duplicate streamed outpu
 The resulting `ProviderError` is marked `partial=True` and carries its attempt
 count, request ID, retry delay, and provider error code when available.
 
+### Run steps
+
+Agents stop after 25 provider round trips by default. Set `max_iterations=` to
+another positive cap, or pass `max_iterations=None` for no step cap. Unlimited
+steps do not disable provider/tool deadlines or cancellation. For unattended
+work, keep an application-owned whole-run deadline; a provider-turn timeout is
+not a deadline for the entire run.
+
 ### Provider deadlines
 
 Each provider turn has a complete-turn deadline in addition to its transport

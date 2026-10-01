@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Agent(max_iterations=None)` explicitly disables the provider-step cap while
+  preserving cancellation and provider/tool deadlines. The default remains 25
+  steps; unattended callers should retain an application-owned run deadline.
 - **Centralized provider retries** — `Agent(retry_policy=RetryPolicy(...))`
   owns retry behavior across providers. The default makes three total attempts
   for retryable pre-delta failures, with bounded exponential backoff, jitter, and
