@@ -32,7 +32,7 @@ from logpose.providers import register, resolve
 from tests.jwt_helpers import make_jwt
 from tests.responses_helpers import API_KEY, Recorder, completed, message_item, mock_client, sse
 
-BUILT_INS = {"anthropic", "claude-code", "codex", "docker", "openai", "openai-compat"}
+BUILT_INS = {"anthropic", "claude-code", "codex", "docker", "openai", "openai-compat", "zai"}
 
 
 @pytest.fixture(autouse=True)

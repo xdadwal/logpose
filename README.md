@@ -133,6 +133,7 @@ Each provider name selects an explicit backend and credential type.
 | `openai` | OpenAI Responses API | `OPENAI_API_KEY` or `api_key=` |
 | `docker` | Models hosted locally by Docker Model Runner | None |
 | `openai-compat` | A configured Chat Completions-compatible server | Optional, server-dependent |
+| `zai` | Z.ai GLM Coding Plan with preserved reasoning | `ZAI_KEY` or `api_key=` |
 | `claude-code` | Claude Code subscription session | Local CLI login or OAuth token; experimental |
 | `codex` | Codex subscription session | Local CLI login; experimental |
 
@@ -199,6 +200,21 @@ agent = Agent(
 The same values can be set with `OPENAI_BASE_URL`, `OPENAI_MODEL`, and
 `OPENAI_API_KEY`. The `docker` provider intentionally does not read
 `OPENAI_API_KEY`.
+
+### Z.ai Coding Plan
+
+```python
+agent = Agent("zai", model="glm-5.3-flash", tools=[get_weather],
+              extra={"reasoning_effort": "low"})
+```
+
+Set `ZAI_KEY` in the environment. This backend uses the Coding Plan endpoint
+`https://api.z.ai/api/coding/paas/v4`, defaults to `glm-5.3-flash` with low effort,
+and does not inherit `OPENAI_API_KEY`, `OPENAI_BASE_URL`, or `OPENAI_MODEL`.
+Supported effort levels are `low`, `high`, and `max`; thinking must stay enabled.
+Original `reasoning_content` is replayed unchanged across tool calls, with preserved
+thinking enabled. Generic Chat Completions keeps its existing reasoning-dropping
+behavior unless explicitly constructed with `preserve_reasoning=True`.
 
 ### Experimental: Claude Code subscription
 

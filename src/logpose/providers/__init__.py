@@ -169,11 +169,23 @@ def _probe(info: ProviderInfo) -> ProviderStatus:
         return ProviderStatus(
             name=info.name,
             ready=False,
-            detail=(
-                f"No endpoint configured. Pass base_url=... or set ${info.base_url_env}."
-            ),
+            detail=(f"No endpoint configured. Pass base_url=... or set ${info.base_url_env}."),
         )
     if info.credential_module is None:
+        if info.credential_kind == "api_key":
+            ready = bool(info.env_vars and os.environ.get(info.env_vars[0], "").strip())
+            return ProviderStatus(
+                name=info.name,
+                ready=ready,
+                credential="api_key" if ready else "none",
+                detail=""
+                if ready
+                else (
+                    f"Set ${info.env_vars[0]}."
+                    if info.env_vars
+                    else "No credential source configured."
+                ),
+            )
         return ProviderStatus(name=info.name, ready=True, credential="none")
 
     module = importlib.import_module(info.credential_module)
@@ -274,7 +286,7 @@ def _optional_provider(module_path: str, class_name: str, **kwargs: Any) -> Prov
         if exc.name == "anthropic":
             raise LogposeError(
                 "The Anthropic providers require the optional dependency. "
-                "Install it with `pip install \"logpose[anthropic]\"`."
+                'Install it with `pip install "logpose[anthropic]"`.'
             ) from None
         raise
     provider_class = getattr(module, class_name)
@@ -335,6 +347,13 @@ def _openai_compat_factory(**kwargs: Any) -> Provider:
     from logpose.providers.openai_compat import OpenAICompatProvider
 
     return OpenAICompatProvider(**kwargs)
+
+
+def _zai_factory(**kwargs: Any) -> Provider:
+    """Build the Z.ai Coding Plan provider without importing a vendor SDK."""
+    from logpose.providers.zai import ZaiCodingProvider
+
+    return ZaiCodingProvider(**kwargs)
 
 
 # Metadata lives here, not on the provider classes, so provider_catalog() never
@@ -418,3 +437,17 @@ register("docker", _docker_factory, info=_DOCKER_INFO)
 register("openai", _openai_factory, info=_OPENAI_INFO)
 register("docker-models", _docker_factory, info=_DOCKER_INFO)
 register("openai-compat", _openai_compat_factory, info=_OPENAI_COMPAT_INFO)
+register(
+    "zai",
+    _zai_factory,
+    info=ProviderInfo(
+        name="zai",
+        summary="Z.ai GLM Coding Plan with preserved thinking and tool calls.",
+        api="chat-completions",
+        credential="api_key",
+        credential_kind="api_key",
+        default_model="glm-5.3-flash",
+        env_vars=("ZAI_KEY",),
+        reasoning_replay=True,
+    ),
+)

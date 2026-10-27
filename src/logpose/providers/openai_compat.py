@@ -189,12 +189,15 @@ class _ThinkTagSplitter:
 # ---------------------------------------------------------------------------
 
 
-def _messages_to_wire(messages: list[Message], system: str | None) -> list[dict[str, Any]]:
+def _messages_to_wire(
+    messages: list[Message], system: str | None, *, preserve_reasoning: bool = False
+) -> list[dict[str, Any]]:
     """Translate logpose messages into Chat Completions messages.
 
     Args:
         messages: Conversation history in logpose's neutral model.
         system: Optional system prompt, emitted as the leading message.
+        preserve_reasoning: Replay unmodified thinking for servers requiring it.
 
     Returns:
         Chat Completions message dicts. One logpose message may become several:
@@ -220,12 +223,14 @@ def _messages_to_wire(messages: list[Message], system: str | None) -> list[dict[
             )
 
         if message.role == "assistant":
-            # Thinking is intentionally dropped: unlike Anthropic there is no
-            # signature to preserve, and echoing `reasoning_content` back is
-            # rejected by several OpenAI-compatible servers.
-            if not text and not tool_uses:
+            # Generic servers may reject reasoning_content. Replay is opt-in
+            # for providers whose tool protocol requires the original reasoning.
+            reasoning = "".join(b.thinking for b in message.content if isinstance(b, ThinkingBlock))
+            if not text and not tool_uses and not (preserve_reasoning and reasoning):
                 continue
             entry: dict[str, Any] = {"role": "assistant", "content": text}
+            if preserve_reasoning:
+                entry["reasoning_content"] = reasoning
             if tool_uses:
                 entry["tool_calls"] = [
                     {
@@ -325,6 +330,7 @@ class OpenAICompatProvider:
         client: httpx.AsyncClient | None = None,
         extra_body: dict[str, Any] | None = None,
         api_key_env: str | None = "OPENAI_API_KEY",
+        preserve_reasoning: bool = False,
     ) -> None:
         """Configure the backend.
 
@@ -349,6 +355,8 @@ class OpenAICompatProvider:
                 given. ``None`` disables the fallback entirely, which is what a
                 local backend wants: a stray ``$OPENAI_API_KEY`` should never be
                 shipped to a server on localhost.
+            preserve_reasoning: Replay thinking blocks as reasoning_content.
+                Enable only for a server that explicitly supports this field.
 
         Raises:
             LogposeError: If no ``base_url`` is available.
@@ -369,6 +377,7 @@ class OpenAICompatProvider:
         self.model_default = model or os.environ.get("OPENAI_MODEL") or ""
         self.max_tokens = max_tokens
         self.parse_think_tags = parse_think_tags
+        self.preserve_reasoning = preserve_reasoning
         self._api_key = api_key or env_key or None
         self._default_headers = dict(default_headers or {})
         self._extra_body = dict(extra_body or {})
@@ -511,7 +520,9 @@ class OpenAICompatProvider:
         """Assemble the Chat Completions request body."""
         body: dict[str, Any] = {
             "model": model,
-            "messages": _messages_to_wire(req.messages, req.system),
+            "messages": _messages_to_wire(
+                req.messages, req.system, preserve_reasoning=self.preserve_reasoning
+            ),
             "max_tokens": req.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
