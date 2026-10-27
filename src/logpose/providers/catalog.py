@@ -42,10 +42,10 @@ backend whose server may or may not want a key.
 WireApi = Literal["messages", "responses", "chat-completions"]
 """Which wire protocol a provider speaks.
 
-Worth surfacing because it is not cosmetic: ``chat-completions`` has no field able
-to carry a reasoning model's chain of thought across a tool call, so multi-step tool
-use on a reasoning model loses it every turn. ``responses`` and ``messages`` both
-preserve it.
+Worth surfacing because reasoning preservation differs across protocols and
+providers. Generic Chat Completions drops reasoning; specific extensions such as
+Z.ai can opt into replay. Consult ProviderInfo.preserves_reasoning rather than
+inferring this capability from the protocol alone.
 """
 
 
@@ -80,6 +80,7 @@ class ProviderInfo:
             also requires the credential to name a ChatGPT account.
         base_url_env: Environment variable that must be set (or ``base_url=``
             passed) before the backend can be reached at all.
+        reasoning_replay: Chat Completions extension that preserves reasoning.
     """
 
     name: str
@@ -95,6 +96,7 @@ class ProviderInfo:
     credential_kind: Literal["api_key", "oauth"] | None = None
     credential_verify: str | None = None
     base_url_env: str | None = None
+    reasoning_replay: bool = False
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -106,9 +108,9 @@ class ProviderInfo:
         """Whether a reasoning model's chain of thought survives a tool call.
 
         Returns:
-            ``False`` for Chat Completions, which has no field to carry it.
+            Whether this backend replays reasoning in its supported wire format.
         """
-        return self.api != "chat-completions"
+        return self.api != "chat-completions" or self.reasoning_replay
 
 
 @dataclass(frozen=True)
