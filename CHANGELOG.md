@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional sync/async request context policies operating on detached inputs,
+  preserving canonical history and failing explicitly before inference.
+
 - Optional async tool persistence callback with detached intent/outcome data and
   explicit failures that stop execution rather than asking the model to retry.
 

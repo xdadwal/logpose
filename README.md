@@ -451,6 +451,19 @@ Every agent run publishes metadata-only lifecycle records to the standard
 global logging configuration; configure that logger through your application's
 normal logging setup.
 
+For application-owned context selection, pass a sync or async `context_policy=`
+callback. Each provider iteration receives a detached `ContextInput` and expects
+`PreparedContext(messages=..., system=..., diagnostics=...)`. The prepared view is
+sent to the model; canonical `Conversation` and `RunResult.messages` retain the
+original history. Tool schemas, model, output limit and extra options stay unchanged.
+The application owns budgets, retrieval, summaries, instruction retention and valid
+tool-call/result groups, including provider-specific opaque blocks. Preparation
+failures raise `ContextPreparationError` before that iteration's inference; there
+is no fallback that silently drops history. Cancellation propagates normally.
+Synchronous policies must avoid blocking I/O; async policies own their I/O deadlines.
+`Agent.last_context_diagnostics` holds the most recently prepared metadata and is
+not automatically logged. With no policy, full-history behavior is unchanged.
+
 For durable application journals, pass an async `tool_observer=` callback. It
 receives `ToolObservation` values containing detached approved call data and
 normalized outcomes. Callback failures raise `ToolObservationError` and stop the

@@ -73,6 +73,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import inspect
 import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
@@ -81,6 +83,7 @@ from time import monotonic
 from typing import Any, Literal, Union
 from uuid import uuid4
 
+from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
     Event,
@@ -360,6 +363,7 @@ class Agent:
         on_tool_call: ToolGate | None = None,
         observers: Sequence[RuntimeObserver] = (),
         tool_observer: ToolObserver | None = None,
+        context_policy: ContextPolicy | None = None,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -414,6 +418,9 @@ class Agent:
                 detached approved tool intent and normalized outcome. Failures stop
                 the run with ToolObservationError rather than becoming tool results.
                 Contains application content; never attach it to telemetry logging.
+            context_policy: Optional sync/async request preparation policy. Runs before
+                every provider iteration on detached data; never rewrites history.
+                Applications own selection and summaries. Failure stops the run.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("anthropic", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -509,6 +516,8 @@ class Agent:
         self.on_tool_call = on_tool_call
         self.observers: tuple[RuntimeObserver, ...] = tuple(observers)
         self.tool_observer = tool_observer
+        self.context_policy = context_policy
+        self.last_context_diagnostics: dict[str, int | str | bool] = {}
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -739,7 +748,8 @@ class Agent:
                     request_id=self._runtime_id("request"),
                 )
                 done: CompletionDone | None = None
-                turn_stream = self._provider_turn(self._request(history), turn_context)
+                request = await self._prepare_request(history)
+                turn_stream = self._provider_turn(request, turn_context)
                 try:
                     async for event in turn_stream:
                         if isinstance(event, ProviderTextDelta):
@@ -1011,6 +1021,49 @@ class Agent:
         if isinstance(candidate, (int, float)) and candidate > 0:
             return float(candidate)
         return DEFAULT_PROVIDER_TURN_TIMEOUT
+
+    async def _prepare_request(self, history: Sequence[Message]) -> CompletionRequest:
+        """Await selection before inference; isolate policy mutation from canonical data."""
+        request = self._request(history)
+        self.last_context_diagnostics = {}
+        if self.context_policy is None:
+            return request
+        try:
+            selected = self.context_policy(
+                ContextInput(
+                    tuple(message.model_copy(deep=True) for message in request.messages),
+                    request.system,
+                    tuple(copy.deepcopy(request.tools)),
+                    request.model,
+                    request.max_tokens,
+                )
+            )
+            prepared = await selected if inspect.isawaitable(selected) else selected
+            if not isinstance(prepared, PreparedContext):
+                raise TypeError("Policy must return PreparedContext")
+            if not isinstance(prepared.messages, tuple) or not all(
+                isinstance(m, Message) for m in prepared.messages
+            ):
+                raise TypeError("Prepared messages must be a tuple of Message objects")
+            if prepared.system is not None and not isinstance(prepared.system, str):
+                raise TypeError("Prepared system must be text or None")
+            if not all(
+                isinstance(k, str) and type(v) in (int, str, bool)
+                for k, v in prepared.diagnostics.items()
+            ):
+                raise TypeError("Diagnostics must contain metadata scalars")
+            self.last_context_diagnostics = dict(prepared.diagnostics)
+            return replace(
+                request,
+                messages=[m.model_copy(deep=True) for m in prepared.messages],
+                system=prepared.system,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ContextPreparationError(
+                "Context preparation failed before provider inference"
+            ) from exc
 
     def _request(self, history: Sequence[Message]) -> CompletionRequest:
         """Build the request for the next turn.
