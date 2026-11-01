@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Optional async tool persistence callback with detached intent/outcome data and
+  explicit failures that stop execution rather than asking the model to retry.
+
 - Z.ai Coding Plan provider (`zai`) with separate `ZAI_KEY` credentials, GLM-5.3-Flash
   default, low/high/max reasoning effort, and preserved tool-call reasoning.
 - Opt-in reasoning replay for compatible Chat Completions servers, without changing
