@@ -451,6 +451,16 @@ Every agent run publishes metadata-only lifecycle records to the standard
 global logging configuration; configure that logger through your application's
 normal logging setup.
 
+For durable application journals, pass an async `tool_observer=` callback. It
+receives `ToolObservation` values containing detached approved call data and
+normalized outcomes. Callback failures raise `ToolObservationError` and stop the
+run. Intent failures prevent that handler from executing; outcome failures mean
+the effect may already have occurred. Reconcile application records before retrying.
+Intents can precede waiting for a tool slot, and cancellation can leave an intent
+without an outcome. This callback does not provide exactly-once execution or
+automatic replay. It contains application content and must not be logged as telemetry.
+Applications own storage, timeouts, and recovery; the callback is disabled by default.
+
 For metrics, tracing, or audit integration, pass synchronous `observers=`. They
 receive immutable `RuntimeEvent` values in registration order. Observer and
 logging-handler failures are isolated from the agent run. Runtime records contain

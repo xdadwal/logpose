@@ -92,6 +92,7 @@ from logpose.events import (
     ToolResult,
     TurnEnd,
 )
+from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import Message, ToolResultBlock, ToolUseBlock, Usage
 from logpose.providers import resolve
 from logpose.providers.base import (
@@ -358,6 +359,7 @@ class Agent:
         extra: dict[str, Any] | None = None,
         on_tool_call: ToolGate | None = None,
         observers: Sequence[RuntimeObserver] = (),
+        tool_observer: ToolObserver | None = None,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -408,6 +410,10 @@ class Agent:
                 :class:`~logpose.runtime.RuntimeEvent` lifecycle records. They
                 run in registration order; a callback failure is isolated and
                 never affects the agent run.
+            tool_observer: Optional async application persistence callback. Receives
+                detached approved tool intent and normalized outcome. Failures stop
+                the run with ToolObservationError rather than becoming tool results.
+                Contains application content; never attach it to telemetry logging.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("anthropic", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -445,8 +451,7 @@ class Agent:
             or max_concurrent_tools < 1
         ):
             raise LogposeError(
-                "max_concurrent_tools must be at least 1, "
-                f"got {max_concurrent_tools!r}."
+                f"max_concurrent_tools must be at least 1, got {max_concurrent_tools!r}."
             )
         if tool_timeout is not None and (
             not isinstance(tool_timeout, (int, float)) or tool_timeout <= 0
@@ -461,13 +466,10 @@ class Agent:
             )
         if tool_error_formatter is not None and not callable(tool_error_formatter):
             raise LogposeError(
-                "tool_error_formatter must be callable, "
-                f"got {type(tool_error_formatter).__name__}."
+                f"tool_error_formatter must be callable, got {type(tool_error_formatter).__name__}."
             )
         if on_tool_call is not None and not callable(on_tool_call):
-            raise LogposeError(
-                f"on_tool_call must be callable, got {type(on_tool_call).__name__}."
-            )
+            raise LogposeError(f"on_tool_call must be callable, got {type(on_tool_call).__name__}.")
         if not all(callable(observer) for observer in observers):
             raise LogposeError("observers must contain only callable callbacks.")
 
@@ -506,6 +508,7 @@ class Agent:
         self.extra: dict[str, Any] = dict(extra) if extra else {}
         self.on_tool_call = on_tool_call
         self.observers: tuple[RuntimeObserver, ...] = tuple(observers)
+        self.tool_observer = tool_observer
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -1099,6 +1102,18 @@ class Agent:
         ]
         try:
             ran: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
+        except ToolObservationError:
+            # Persistence failures must not abandon approved sibling effects.
+            # A cancelled to_thread await cannot stop its synchronous handler.
+            # Shield/drain the batch so every surviving invocation can journal
+            # its outcome before the original persistence error escapes.
+            settling = asyncio.gather(*tasks, return_exceptions=True)
+            while not settling.done():
+                try:
+                    await asyncio.shield(settling)
+                except asyncio.CancelledError:
+                    continue
+            raise
         finally:
             # If the consumer abandoned the stream (or a sibling blew up), no
             # tool task may outlive this call.
@@ -1161,6 +1176,32 @@ class Agent:
         return blocked
 
     async def _invoke(
+        self, call: ToolUseBlock, queued_at: float, turn_context: RuntimeContext
+    ) -> ToolResultBlock:
+        """Journal approved known tools without converting persistence failures into results."""
+        if self.tool_observer is None or call.name not in self._tools_by_name:
+            return await self._invoke_handler(call, queued_at, turn_context)
+        context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
+        try:
+            await self.tool_observer(ToolObservation("intent", context, call.model_copy(deep=True)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ToolObservationError("intent") from exc
+        result = await self._invoke_handler(call, queued_at, turn_context)
+        try:
+            await self.tool_observer(
+                ToolObservation(
+                    "outcome", context, call.model_copy(deep=True), result.model_copy(deep=True)
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ToolObservationError("outcome") from exc
+        return result
+
+    async def _invoke_handler(
         self, call: ToolUseBlock, queued_at: float, turn_context: RuntimeContext
     ) -> ToolResultBlock:
         """Execute one tool call and render the outcome for the model.
@@ -1289,8 +1330,7 @@ class Agent:
             )
         else:
             content = (
-                f"Tool {call.name!r} failed with {type(original).__name__}. "
-                f"Error ID: {error_id}."
+                f"Tool {call.name!r} failed with {type(original).__name__}. Error ID: {error_id}."
             )
         return ToolResultBlock(tool_use_id=call.id, content=content, is_error=True)
 

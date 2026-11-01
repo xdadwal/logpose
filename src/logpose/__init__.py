@@ -68,6 +68,7 @@ from logpose.events import (
     ToolResult,
     TurnEnd,
 )
+from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import (
     ContentBlock,
     Message,
@@ -120,6 +121,9 @@ __all__ = [
     "RuntimeContext",
     "RuntimeEvent",
     "RuntimeObserver",
+    "ToolObservation",
+    "ToolObservationError",
+    "ToolObserver",
     "current_runtime_context",
     # tools
     "tool",
