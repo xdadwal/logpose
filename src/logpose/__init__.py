@@ -50,6 +50,7 @@ from logpose.agent import (
     ToolGateOutcome,
     ToolGateResult,
 )
+from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     AuthError,
     LogposeError,
@@ -124,6 +125,10 @@ __all__ = [
     "ToolObservation",
     "ToolObservationError",
     "ToolObserver",
+    "ContextInput",
+    "ContextPolicy",
+    "ContextPreparationError",
+    "PreparedContext",
     "current_runtime_context",
     # tools
     "tool",
