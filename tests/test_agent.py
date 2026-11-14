@@ -23,6 +23,7 @@ from logpose.agent import (
     ToolErrorContext,
     ToolGateResult,
 )
+from logpose.cancellation import current_tool_deadline
 from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
@@ -518,6 +519,32 @@ async def test_sync_tool_result_is_discarded_after_timeout() -> None:
     assert "too late" not in tool_result.content
     await asyncio.sleep(0.06)
     assert state == ["started", "finished"]
+
+
+async def test_timeout_runs_registered_terminators() -> None:
+    killed: list[str] = []
+
+    @tool
+    def clingy() -> str:
+        """Block past the deadline while offering a terminator."""
+        handle = current_tool_deadline()
+        assert handle is not None
+        handle.register_terminator(lambda: killed.append("killed"))
+        time.sleep(0.05)
+        return "done"
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("clingy", id="t1")),
+            ScriptedTurn.text("adapted"),
+        ]
+    )
+    result = await Agent(provider, tools=[clingy], tool_timeout=0.01).run("go")
+
+    tool_result = result.messages[2].content[0]
+    assert isinstance(tool_result, ToolResultBlock)
+    assert tool_result.is_error is True
+    assert killed == ["killed"]
 
 
 async def test_events_are_emitted_in_loop_order() -> None:

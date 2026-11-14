@@ -98,6 +98,11 @@ from logpose.events import (
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import Message, ToolResultBlock, ToolUseBlock, Usage
 from logpose.providers import resolve
+from logpose.cancellation import (
+    ToolDeadlineHandle,
+    _clear_deadline_handle,
+    _install_deadline_handle,
+)
 from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
@@ -1269,6 +1274,11 @@ class Agent:
         """
         context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
         token = _set_runtime_context(context)
+        deadline = ToolDeadlineHandle() if self.tool_timeout is not None else None
+        if deadline is not None:
+            # Installed before invoke() so the to_thread copy of this context
+            # carries the handle into the handler thread.
+            _install_deadline_handle(deadline)
         try:
             tool_def = self._tools_by_name.get(call.name)
             if tool_def is None:
@@ -1295,6 +1305,8 @@ class Agent:
                             timeout=self.tool_timeout,
                         )
                 except asyncio.TimeoutError:
+                    if deadline is not None:
+                        deadline.terminate()
                     result = ToolResultBlock(
                         tool_use_id=call.id,
                         content=(
@@ -1348,6 +1360,8 @@ class Agent:
             raise
         finally:
             _reset_runtime_context(token)
+            if deadline is not None:
+                _clear_deadline_handle()
 
     def _tool_error_result(
         self,
