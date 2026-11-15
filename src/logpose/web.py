@@ -319,11 +319,13 @@ def _zai_rpc_message(response: requests.Response, request_id: int | None) -> obj
     response.encoding = "utf-8"  # SSE is UTF-8, including non-ASCII result snippets.
     data: list[str] = []
     received = 0
-    lines: list[str] = []
-    for raw_line in response.iter_lines(chunk_size=1, decode_unicode=True):
+    stream = response.iter_lines(chunk_size=1, decode_unicode=True)
+    while True:
+        try:
+            raw_line = next(stream)
+        except StopIteration:
+            break
         line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="replace")
-        lines.append(line)
-    for line in lines:
         received += len(line.encode("utf-8"))
         if received > 2_000_000:
             raise SearchFailure("MCP response exceeded the search size limit.")
@@ -433,7 +435,7 @@ def make_search_tool(
     backend: Callable[[str, int], list[str]],
     name: str = "web_search",
     description: str | None = None,
-    output_char_cap: int | None = None,
+    output_char_cap: int | Callable[[], int | None] | None = None,
     on_output: Callable[[str], None] | None = None,
 ) -> ToolDef:
     """Build a web-search ToolDef bound to a backend entry provider.
@@ -446,7 +448,8 @@ def make_search_tool(
             contain credentials and are never shown.
         name: Tool name (default ``web_search``).
         description: Override the model-facing summary.
-        output_char_cap: Longest result body returned to the model.
+        output_char_cap: Longest result body returned to the model; a callable
+            is resolved per call, so embedding apps can track live config.
         on_output: Observes the full formatted result body (e.g. artifact
             capture) before any truncation.
     """
@@ -475,8 +478,9 @@ def make_search_tool(
         full = f"Web results for {query!r}:\n\n{body}"
         if on_output is not None:
             on_output(full)
-        if output_char_cap is not None and len(body) > output_char_cap:
-            body = body[:output_char_cap] + "\n...[truncated]"
+        cap = output_char_cap() if callable(output_char_cap) else output_char_cap
+        if cap is not None and len(body) > cap:
+            body = body[:cap] + "\n...[truncated]"
             full = f"Web results for {query!r}:\n\n{body}"
         return full
 
