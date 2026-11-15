@@ -83,6 +83,11 @@ from time import monotonic
 from typing import Any, Literal, Union
 from uuid import uuid4
 
+from logpose.cancellation import (
+    ToolDeadlineHandle,
+    _clear_deadline_handle,
+    _install_deadline_handle,
+)
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
@@ -98,11 +103,6 @@ from logpose.events import (
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import Message, ToolResultBlock, ToolUseBlock, Usage
 from logpose.providers import resolve
-from logpose.cancellation import (
-    ToolDeadlineHandle,
-    _clear_deadline_handle,
-    _install_deadline_handle,
-)
 from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,

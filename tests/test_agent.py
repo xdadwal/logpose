@@ -24,7 +24,6 @@ from logpose.agent import (
     ToolGateResult,
 )
 from logpose.cancellation import current_tool_deadline
-from logpose.sync import run_sync
 from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
@@ -53,6 +52,7 @@ from logpose.providers.base import (
     ProviderTextDelta,
 )
 from logpose.retry import RetryPolicy
+from logpose.sync import run_sync
 from logpose.tools import ToolDef, tool
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
 
