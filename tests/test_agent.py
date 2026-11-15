@@ -24,6 +24,7 @@ from logpose.agent import (
     ToolGateResult,
 )
 from logpose.cancellation import current_tool_deadline
+from logpose.sync import run_sync
 from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
 from logpose.events import (
     Event,
@@ -545,6 +546,20 @@ async def test_timeout_runs_registered_terminators() -> None:
     assert isinstance(tool_result, ToolResultBlock)
     assert tool_result.is_error is True
     assert killed == ["killed"]
+
+
+async def test_agent_works_as_an_async_context_manager() -> None:
+    provider = FakeProvider([ScriptedTurn.text("done")])
+    async with Agent(provider) as agent:
+        result = await agent.run("go")
+    assert result.text == "done"
+
+
+def test_agent_works_as_a_sync_context_manager() -> None:
+    provider = FakeProvider([ScriptedTurn.text("done")])
+    with Agent(provider) as agent:
+        result = run_sync(agent, "go")
+    assert result.text == "done"
 
 
 async def test_events_are_emitted_in_loop_order() -> None:

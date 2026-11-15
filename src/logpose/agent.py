@@ -633,6 +633,39 @@ class Agent:
         if closer is not None:
             await closer()
 
+    def __enter__(self) -> Agent:
+        """Enter a sync context that releases the agent's resources on exit.
+
+        The alternate spelling for callers who hold an agent as a bare
+        instance and remember to call :func:`close_sync` themselves. Exit
+        closes the owned provider and stops the private loop thread; a later
+        sync call transparently starts a fresh loop, so exiting is not
+        destructive to reuse — but the intended shape is one scope per agent.
+        """
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        from logpose.sync import close_sync
+
+        close_sync(self)
+
+    async def __aenter__(self) -> Agent:
+        """Enter an async context that releases the agent's resources on exit."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+        # An agent may also hold a sync-facade loop thread; stop it too. The
+        # runner close never blocks on this loop — we are inside a loop here,
+        # and the runner's daemon thread winds down on its own.
+        from logpose.sync import _discard_runner
+
+        runner = _discard_runner(self)
+        if runner is not None:
+            # close() joins the runner's thread; do it off the event loop so
+            # a slow wind-down cannot stall this loop.
+            await asyncio.to_thread(runner.close)
+
     def __repr__(self) -> str:
         """Return a representation of the agent's configuration."""
         return (
