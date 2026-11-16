@@ -83,6 +83,11 @@ from time import monotonic
 from typing import Any, Literal, Union
 from uuid import uuid4
 
+from logpose.cancellation import (
+    ToolDeadlineHandle,
+    _clear_deadline_handle,
+    _install_deadline_handle,
+)
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
 from logpose.events import (
@@ -627,6 +632,39 @@ class Agent:
         closer = getattr(self.provider, "aclose", None)
         if closer is not None:
             await closer()
+
+    def __enter__(self) -> Agent:
+        """Enter a sync context that releases the agent's resources on exit.
+
+        The alternate spelling for callers who hold an agent as a bare
+        instance and remember to call :func:`close_sync` themselves. Exit
+        closes the owned provider and stops the private loop thread; a later
+        sync call transparently starts a fresh loop, so exiting is not
+        destructive to reuse — but the intended shape is one scope per agent.
+        """
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        from logpose.sync import close_sync
+
+        close_sync(self)
+
+    async def __aenter__(self) -> Agent:
+        """Enter an async context that releases the agent's resources on exit."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self.aclose()
+        # An agent may also hold a sync-facade loop thread; stop it too. The
+        # runner close never blocks on this loop — we are inside a loop here,
+        # and the runner's daemon thread winds down on its own.
+        from logpose.sync import _discard_runner
+
+        runner = _discard_runner(self)
+        if runner is not None:
+            # close() joins the runner's thread; do it off the event loop so
+            # a slow wind-down cannot stall this loop.
+            await asyncio.to_thread(runner.close)
 
     def __repr__(self) -> str:
         """Return a representation of the agent's configuration."""
@@ -1269,6 +1307,11 @@ class Agent:
         """
         context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
         token = _set_runtime_context(context)
+        deadline = ToolDeadlineHandle() if self.tool_timeout is not None else None
+        if deadline is not None:
+            # Installed before invoke() so the to_thread copy of this context
+            # carries the handle into the handler thread.
+            _install_deadline_handle(deadline)
         try:
             tool_def = self._tools_by_name.get(call.name)
             if tool_def is None:
@@ -1295,6 +1338,8 @@ class Agent:
                             timeout=self.tool_timeout,
                         )
                 except asyncio.TimeoutError:
+                    if deadline is not None:
+                        deadline.terminate()
                     result = ToolResultBlock(
                         tool_use_id=call.id,
                         content=(
@@ -1348,6 +1393,8 @@ class Agent:
             raise
         finally:
             _reset_runtime_context(token)
+            if deadline is not None:
+                _clear_deadline_handle()
 
     def _tool_error_result(
         self,

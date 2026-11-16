@@ -47,6 +47,8 @@ EXPECTED_API = {
     "ToolObservation",
     "ToolObservationError",
     "current_runtime_context",
+    "current_tool_deadline",
+    "ToolDeadlineHandle",
     # tools
     "tool",
     "ToolDef",
@@ -128,6 +130,8 @@ OWNERS = {
     "ToolObservation": "logpose.lifecycle",
     "ToolObservationError": "logpose.lifecycle",
     "current_runtime_context": "logpose.runtime",
+    "current_tool_deadline": "logpose.cancellation",
+    "ToolDeadlineHandle": "logpose.cancellation",
     "tool": "logpose.tools",
     "ToolDef": "logpose.tools",
     "discover_tools": "logpose.tools",

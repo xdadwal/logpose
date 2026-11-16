@@ -50,6 +50,7 @@ from logpose.agent import (
     ToolGateOutcome,
     ToolGateResult,
 )
+from logpose.cancellation import ToolDeadlineHandle, current_tool_deadline
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     AuthError,
@@ -130,6 +131,8 @@ __all__ = [
     "ContextPreparationError",
     "PreparedContext",
     "current_runtime_context",
+    "current_tool_deadline",
+    "ToolDeadlineHandle",
     # tools
     "tool",
     "ToolDef",
