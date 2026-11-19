@@ -14,9 +14,11 @@ import copy
 import json
 import re
 import types
-from typing import Any, TypeVar, Union, get_args, get_origin
+from typing import Annotated, Any, TypeVar, Union, get_args, get_origin
 
-from pydantic import BaseModel, TypeAdapter, ValidationError
+from pydantic import BaseModel, RootModel, TypeAdapter, ValidationError
+
+from logpose.errors import LogposeError
 
 __all__ = [
     "OutputParseFailure",
@@ -52,31 +54,97 @@ def _is_nullable_schema(schema: dict[str, Any]) -> bool:
     return any(isinstance(s, dict) and s.get("type") == "null" for s in schema.get("anyOf", []))
 
 
-def _strictify(schema: Any) -> None:
-    """Mutate ``schema`` in place so every object is strict."""
+_DATA_KEYS = frozenset({"enum", "const", "default", "examples"})
+_REF_PREFIX = "#/$defs/"
+
+
+def _normalize(node: Any, defs: dict[str, Any], inlining: tuple[str, ...] = ()) -> Any:
+    """Return ``node`` rewritten into shapes OpenAI strict mode accepts.
+
+    * A ``$ref`` with sibling keys is replaced by the referenced definition merged
+      with those siblings (strict mode rejects ``$ref`` siblings). On a recursive
+      cycle the siblings are dropped and the plain ``$ref`` is kept.
+    * ``oneOf`` becomes ``anyOf`` and ``discriminator`` is dropped (strict mode only
+      allows ``anyOf``). Parsing validates against the original model, so the
+      discriminator is still enforced on the way back.
+    """
+    if isinstance(node, list):
+        return [_normalize(item, defs, inlining) for item in node]
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if isinstance(ref, str) and len(node) > 1 and "$defs" not in node:
+        name = ref[len(_REF_PREFIX) :] if ref.startswith(_REF_PREFIX) else None
+        if name is None or name not in defs or name in inlining:
+            return {"$ref": ref}
+        siblings = {k: v for k, v in node.items() if k != "$ref"}
+        merged = {**copy.deepcopy(defs[name]), **siblings}
+        return _normalize(merged, defs, (*inlining, name))
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        if key == "discriminator":
+            continue
+        if key in _DATA_KEYS:
+            out[key] = value
+        elif key in ("properties", "$defs", "definitions") and isinstance(value, dict):
+            out[key] = {k: _normalize(v, defs, inlining) for k, v in value.items()}
+        else:
+            out[key] = _normalize(value, defs, inlining)
+    if "oneOf" in out and "anyOf" not in out:
+        out["anyOf"] = out.pop("oneOf")
+    return out
+
+
+def _open_map_error(path: str) -> LogposeError:
+    return LogposeError(
+        f"output_type field {path!r} is an open-ended mapping (e.g. dict[str, ...]), which "
+        "strict json_schema structured output cannot express; use a nested model with "
+        "named fields instead."
+    )
+
+
+def _strictify(schema: Any, path: str) -> None:
+    """Mutate ``schema`` in place so every object is strict.
+
+    Raises:
+        LogposeError: If an object allows arbitrary keys (an open ``dict``).
+    """
     if not isinstance(schema, dict):
         return
     props = schema.get("properties")
     if schema.get("type") == "object" or isinstance(props, dict):
-        props = props if isinstance(props, dict) else {}
-        schema["properties"] = props
+        extra = schema.get("additionalProperties")
+        if extra is True or isinstance(extra, dict) or not isinstance(props, dict):
+            raise _open_map_error(path)
         schema["additionalProperties"] = False
         schema["required"] = list(props)
         for name, prop in list(props.items()):
             if isinstance(prop, dict) and "default" in prop:
+                fixed = "const" in prop and prop["const"] == prop["default"]
                 prop = {k: v for k, v in prop.items() if k != "default"}
-                if not _is_nullable_schema(prop):
+                # A defaulted single-value Literal (e.g. a discriminator tag) stays
+                # required: its only value is the default, and the tag must be present.
+                if not fixed and not _is_nullable_schema(prop):
                     prop = {"anyOf": [prop, dict(_NULL)]}
                 props[name] = prop
-        for prop in props.values():
-            _strictify(prop)
+        for name, prop in props.items():
+            _strictify(prop, f"{path}.{name}" if path else name)
     for key in ("$defs", "definitions"):
-        for sub in schema.get(key, {}).values():
-            _strictify(sub)
-    for key in ("anyOf", "oneOf", "allOf", "prefixItems"):
+        for def_name, sub in schema.get(key, {}).items():
+            _strictify(sub, def_name)
+    for key in ("anyOf", "oneOf", "allOf"):
         for sub in schema.get(key, []):
-            _strictify(sub)
-    _strictify(schema.get("items"))
+            _strictify(sub, path)
+    for sub in schema.get("prefixItems", []):
+        _strictify(sub, f"{path}[]")
+    _strictify(schema.get("items"), f"{path}[]")
+
+
+def _not_object_error(model: type[BaseModel]) -> LogposeError:
+    return LogposeError(
+        f"output_type {model.__name__} must be an object model (a BaseModel with named "
+        "fields); strict json_schema structured output requires an object at the root."
+    )
 
 
 def strict_json_schema(model: type[BaseModel]) -> dict[str, Any]:
@@ -84,15 +152,35 @@ def strict_json_schema(model: type[BaseModel]) -> dict[str, Any]:
 
     Every object gets ``additionalProperties: false`` and lists all properties
     as required. Defaulted fields become nullable and lose their ``default``.
+    ``$ref`` with sibling keys is inlined, and ``oneOf`` becomes ``anyOf``.
 
     Args:
         model: The pydantic model describing the answer.
 
     Returns:
         A new schema dict; ``model``'s own schema is not mutated.
+
+    Raises:
+        LogposeError: If ``model`` is not an object model (e.g. a ``RootModel``)
+            or has an open-ended ``dict`` field, which strict mode cannot express.
+            The message names the offending field path.
     """
-    schema = copy.deepcopy(model.model_json_schema())
-    _strictify(schema)
+    if issubclass(model, RootModel):
+        raise _not_object_error(model)
+    raw = copy.deepcopy(model.model_json_schema())
+    defs = raw.get("$defs", {})
+    root_ref = raw.get("$ref")
+    if isinstance(root_ref, str) and root_ref.startswith(_REF_PREFIX):
+        # A self-referencing model's root is a $ref into $defs; hoist it.
+        target = defs.get(root_ref[len(_REF_PREFIX) :])
+        if isinstance(target, dict):
+            raw = {**copy.deepcopy(target), **{k: v for k, v in raw.items() if k != "$ref"}}
+    if raw.get("type") != "object":
+        raise _not_object_error(model)
+    schema = _normalize(raw, defs)
+    _strictify(schema, "")
+    if not isinstance(schema, dict):  # pragma: no cover - _normalize keeps dicts
+        raise _not_object_error(model)
     return schema
 
 
@@ -114,7 +202,14 @@ def response_format_for(model: type[BaseModel]) -> dict[str, Any]:
     }
 
 
+def _unwrap_annotated(annotation: Any) -> Any:
+    while get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    return annotation
+
+
 def _accepts_none(annotation: Any) -> bool:
+    annotation = _unwrap_annotated(annotation)
     if annotation is None or annotation is type(None) or annotation is Any:
         return True
     origin = get_origin(annotation)
@@ -125,6 +220,7 @@ def _accepts_none(annotation: Any) -> bool:
 
 def _strip_value(annotation: Any, value: Any) -> Any:
     """Strip disallowed nulls inside ``value`` according to ``annotation``."""
+    annotation = _unwrap_annotated(annotation)
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         return strip_disallowed_nulls(annotation, value)
     origin = get_origin(annotation)

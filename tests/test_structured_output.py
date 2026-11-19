@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, RootModel
 
 from logpose.agent import Agent, Conversation
 from logpose.errors import (
@@ -236,3 +236,28 @@ async def test_stream_run_end_carries_output() -> None:
     ends = [e for e in events if isinstance(e, RunEnd)]
     assert len(ends) == 1
     assert isinstance(ends[0].result.output, Answer)
+
+
+class WithMeta(BaseModel):
+    name: str
+    meta: dict[str, int]
+
+
+async def test_open_dict_output_type_rejected_before_any_request() -> None:
+    provider = FakeProvider([ScriptedTurn.text('{"name":"a","meta":{}}')])
+    with pytest.raises(LogposeError, match="meta"):
+        _agent(provider, output_type=WithMeta)
+    agent = _agent(provider)
+    with pytest.raises(LogposeError, match="meta"):
+        await agent.run("x", output_type=WithMeta)
+    with pytest.raises(LogposeError, match="meta"):
+        agent.stream("x", output_type=WithMeta)
+    assert provider.call_count == 0
+
+
+async def test_root_model_output_type_rejected_before_any_request() -> None:
+    provider = FakeProvider([ScriptedTurn.text("[]")])
+    agent = _agent(provider)
+    with pytest.raises(LogposeError, match="object model"):
+        await agent.run("x", output_type=RootModel[list[Answer]])
+    assert provider.call_count == 0

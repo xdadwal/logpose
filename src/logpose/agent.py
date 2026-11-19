@@ -113,7 +113,13 @@ from logpose.events import (
 )
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
-from logpose.output import OutputParseFailure, format_errors, parse_output, response_format_for
+from logpose.output import (
+    OutputParseFailure,
+    format_errors,
+    parse_output,
+    response_format_for,
+    strict_json_schema,
+)
 from logpose.providers import resolve
 from logpose.providers.base import (
     CompletionDone,
@@ -1738,7 +1744,11 @@ class Agent:
 
 
 def _check_output_type(output_type: object) -> None:
-    """Reject an ``output_type`` that is neither ``None`` nor a ``BaseModel`` subclass."""
+    """Reject an ``output_type`` strict structured output cannot serve.
+
+    Besides the type check, the strict schema is built once so models it cannot
+    express (open ``dict`` fields, non-object roots) fail before any request.
+    """
     if output_type is None:
         return
     if not (isinstance(output_type, type) and issubclass(output_type, BaseModel)):
@@ -1746,6 +1756,7 @@ def _check_output_type(output_type: object) -> None:
         raise LogposeError(
             f"output_type must be a pydantic BaseModel subclass or None, got {shown}."
         )
+    strict_json_schema(output_type)
 
 
 def _check_output_retries(output_retries: object) -> None:
