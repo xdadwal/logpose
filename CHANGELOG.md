@@ -7,16 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Agent(run_timeout=320)`: a wall-clock deadline for a whole run, including
+  provider retries and tool execution. Expiry raises the new
+  `RunTimeoutError` (with partial messages), emits `run.timed_out`, and is never
+  retried. `None` disables it.
+
 ### Changed
 
 - **Breaking:** `Agent(model=...)` is required; a blank model raises
   `LogposeError`. Model discovery happens only for an explicit `model="auto"`.
-- **Breaking:** `Agent` defaults to `max_tokens=32000`, sized for current
-  reasoning models; the provider's former 4096 default is gone. Lower it for
-  small-context local models.
-- **Breaking:** no provider deadlines by default. `Agent(provider_turn_timeout=)`
-  defaults to `None` (the `"default"` sentinel is rejected), and
-  `OpenAICompatProvider(timeout=None)` disables HTTP timeouts.
+- **Breaking:** web-app safe defaults for every value that could otherwise run
+  unbounded (each accepts `None` for unlimited): `provider_turn_timeout=120`,
+  HTTP timeouts connect 5 s / read 60 s / write 10 s / pool 5 s,
+  `max_tokens=8192` (the provider's former 4096 is gone), `max_iterations=10`,
+  `tool_timeout=30`, and `RetryPolicy(max_attempts=2, max_delay=4.0,
+  max_retry_after=10.0)`. The `"default"` sentinel for `provider_turn_timeout`
+  is rejected.
+- **Breaking:** toolkit limits sized to ~4k tokens per call: shell 30 s / 1 MB
+  capture / 16,000 chars to the model; `read_file` pages, `list_dir`, grep, and
+  `fetch_readable_text` 16,000 chars (fetch also 10 s and 1 MB); web search
+  8,000 chars and 10 s. `read_file` has no line cap and `list_dir` no entry cap
+  (`max_lines`/`max_entries` default to `None`); both page by characters.
 
 ### Removed
 

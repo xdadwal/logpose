@@ -168,10 +168,11 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 
 ### Output limit
 
-Each turn's output ceiling defaults to 32000 tokens, so current reasoning models
-have room to think and still answer. Small local models often have smaller
-context windows; lower it with `Agent(max_tokens=...)` or
-`OpenAICompatProvider(max_tokens=...)`.
+Each turn's output ceiling defaults to 8192 tokens: room for moderate reasoning
+plus an answer inside the 120-second turn deadline. For long, high-effort
+outputs raise `max_tokens` together with `provider_turn_timeout` and
+`run_timeout`. Small local models often need it lower; set it with
+`Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
 so by default reasoning is not sent back on later turns. For servers that accept
@@ -211,9 +212,10 @@ final stop reason, and iteration count.
 ### Provider retries
 
 logpose retries temporary provider failures before the first text or reasoning
-delta reaches your application. The default policy makes three total attempts,
-uses bounded exponential backoff with jitter, and honors a provider's
-`Retry-After` response when available.
+delta reaches your application. The default policy makes two total attempts
+(one retry), uses bounded exponential backoff with jitter (at most 4 s), and
+honors a provider's `Retry-After` of up to 10 s. A retry never waits past the
+run deadline.
 
 ```python
 from logpose import Agent, RetryPolicy
@@ -230,35 +232,49 @@ logpose does not replay the turn because doing so could duplicate streamed outpu
 The resulting `ProviderError` is marked `partial=True` and carries its attempt
 count, request ID, retry delay, and provider error code when available.
 
-### Run steps
+### Limits and deadlines
 
-Agents stop after 25 provider round trips by default. Set `max_iterations=` to
-another positive cap, or pass `max_iterations=None` for no step cap. Unlimited
-steps do not disable provider/tool deadlines or cancellation. For unattended
-work, keep an application-owned whole-run deadline; a provider-turn timeout is
-not a deadline for the entire run.
+logpose is tuned for web apps: a user waits on one request, so every value that
+could otherwise run unbounded has a safe default. Each accepts `None` for
+"unlimited", and any can be raised.
 
-### Provider deadlines
+| Setting | Default | Bounds |
+| --- | --- | --- |
+| `Agent(run_timeout=)` | 320 s | the whole run, wall clock, including time between streamed events |
+| `Agent(provider_turn_timeout=)` | 120 s | one model turn |
+| `OpenAICompatProvider(timeout=)` | connect 5 s, read 60 s, write 10 s, pool 5 s | HTTP; `read` is the longest silence between streamed chunks |
+| `Agent(max_iterations=)` | 10 | model round trips per run |
+| `Agent(max_tokens=)` | 8192 | output tokens per turn |
+| `Agent(tool_timeout=)` | 30 s | one tool call, after it gets a slot |
+| `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
-logpose sets no provider deadlines by default: no complete-turn deadline and no
-HTTP timeouts. Set them for your deployment:
+Tool output is budgeted to about 4k tokens per call: shell, `read_file` pages,
+`list_dir`, grep, and page fetches return at most 16,000 characters, and web
+search 8,000. `read_file` has no line cap and `list_dir` no entry cap; both page
+by characters with a continuation the model can follow.
 
 ```python
 import httpx
+from logpose import Agent, RunTimeoutError
 
 agent = Agent(
     "openai-compat",
     model="gpt-5.1",
-    provider_turn_timeout=600,
-    timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10),
+    run_timeout=600,
+    provider_turn_timeout=300,
+    max_tokens=32000,
+    timeout=httpx.Timeout(connect=5, read=120, write=10, pool=5),
 )
+
+try:
+    result = await agent.run("Write the full report.")
+except RunTimeoutError as exc:
+    partial_history = exc.messages
 ```
 
-A turn timeout before any delta can use the retry policy; a timeout after output
-is partial and is not replayed.
-
-Providers also accept `timeout=` for connection, pool, write, and idle-read
-settings.
+A run that exceeds `run_timeout` raises `RunTimeoutError` with the partial
+history; it is never retried. A turn timeout before any delta can use the retry
+policy; a timeout after output is partial and is not replayed.
 
 ## Defining tools
 
@@ -334,7 +350,7 @@ the run.
 
 An agent runs up to eight tool handlers at once across all of its concurrent
 runs. Additional calls wait for capacity and still return results in the model's
-original request order. Each tool has a 300-second execution deadline after it
+original request order. Each tool has a 30-second execution deadline after it
 acquires a slot:
 
 ```python
@@ -343,7 +359,7 @@ agent = Agent(
     model="gpt-5.1",
     tools=[get_weather],
     max_concurrent_tools=8,
-    tool_timeout=300,
+    tool_timeout=30,
 )
 ```
 
@@ -518,6 +534,7 @@ All library-defined errors inherit from `LogposeError`.
 | `AuthError` | A credential was missing or rejected; its message names the setting to check. |
 | `ProviderError` | The upstream provider failed; includes status and retryability when known. |
 | `MaxIterationsError` | The run reached its iteration limit; includes partial messages. |
+| `RunTimeoutError` | The run exceeded `run_timeout`; includes partial messages. |
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
 | `ToolExecutionError` | The tool execution machinery failed. |
 

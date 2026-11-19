@@ -47,9 +47,12 @@ async def main() -> None:
         "openai-compat",
         model="auto",
         base_url="http://localhost:12434/engines/v1",
-        # Small local models have small context windows; the 32000 default
-        # output ceiling would exceed them.
+        # Small local models have small context windows, so keep output short.
         max_tokens=4096,
+        # Local inference is slower than a hosted API; widen the web-app
+        # defaults (120 s per turn, 320 s per run) if your model needs it.
+        provider_turn_timeout=300,
+        run_timeout=600,
         tools=[get_weather],
         system="You are terse. Use the tools available to you. Answer in one sentence.",
         max_iterations=6,
