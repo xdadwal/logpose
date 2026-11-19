@@ -19,7 +19,7 @@ streams normalized :data:`~logpose.events.Event` values.
         return f"22C and sunny in {city}"
 
 
-    agent = Agent("docker", tools=[get_weather], system="Be concise.")
+    agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather], system="Be concise.")
     result = await agent.run("What's the weather in Pune?")
     print(result.text, result.usage)
 

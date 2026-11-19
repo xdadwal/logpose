@@ -108,7 +108,7 @@ def provider_catalog() -> tuple[ProviderInfo, ...]:
 
     Pure data: no credential is read, no module is imported, nothing touches the
     network. Safe to call as often as a UI needs. One entry per *backend* — an
-    alias such as ``docker-models`` appears in its owner's
+    alias registered alongside a backend appears in its owner's
     :attr:`~logpose.ProviderInfo.aliases` rather than as a second entry.
 
     Providers registered without ``info=`` are omitted, so a third-party backend is
@@ -160,7 +160,7 @@ def _probe(info: ProviderInfo) -> ProviderStatus:
     Returns:
         Its readiness.
     """
-    if info.base_url_env is not None and not os.environ.get(info.base_url_env):
+    if info.base_url_env is not None and not os.environ.get(info.base_url_env, "").strip():
         return ProviderStatus(
             name=info.name,
             ready=False,
@@ -250,12 +250,12 @@ def _openai_compat_factory(**kwargs: Any) -> Provider:
 # pinned against the class it describes by tests/test_provider_catalog.py.
 _OPENAI_COMPAT_INFO = ProviderInfo(
     name="openai-compat",
-    summary="Any server speaking the Chat Completions API — llama.cpp, vLLM, Ollama, Kimi.",
+    summary="Any server speaking the Chat Completions API — OpenAI, vLLM, Ollama, llama.cpp.",
     api="chat-completions",
     credential="optional",
     default_model=None,
-    env_vars=("OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"),
-    base_url_env="OPENAI_BASE_URL",
+    env_vars=("LOGPOSE_BASE_URL", "LOGPOSE_API_KEY"),
+    base_url_env="LOGPOSE_BASE_URL",
 )
 
 register("openai-compat", _openai_compat_factory, info=_OPENAI_COMPAT_INFO)

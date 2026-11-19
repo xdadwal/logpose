@@ -11,7 +11,7 @@ Two equivalent spellings, pick whichever reads better:
 
     from logpose import Agent, SyncAgent, run_sync
 
-    agent = Agent("docker", tools=[get_weather])
+    agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather])
 
     # 1. wrapper object — best when you make several calls
     with SyncAgent(agent) as sync_agent:
@@ -422,7 +422,7 @@ class SyncAgent:
 
     .. code-block:: python
 
-        with SyncAgent(Agent("docker", tools=[get_weather])) as agent:
+        with SyncAgent(Agent("openai-compat", model="gpt-5.1", tools=[get_weather])) as agent:
             print(agent.run("What's the weather in Pune?").text)
 
     Using it as a context manager closes the provider and stops the private loop
@@ -447,7 +447,7 @@ class SyncAgent:
         if not isinstance(agent, Agent):
             raise LogposeError(
                 f"SyncAgent wraps an Agent, got {type(agent).__name__}. "
-                "Build one first: SyncAgent(Agent('docker', tools=[...]))."
+                "Build one first: SyncAgent(Agent('openai-compat', model=..., tools=[...]))."
             )
         self.agent = agent
 

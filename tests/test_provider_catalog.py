@@ -26,15 +26,15 @@ from logpose import (
 )
 from logpose.errors import LogposeError, ProviderError
 from logpose.providers import register
-from logpose.providers.openai_compat import DockerModelsProvider, OpenAICompatProvider
+from logpose.providers.openai_compat import OpenAICompatProvider
 
-BUILT_INS = {"docker", "openai-compat"}
+BUILT_INS = {"openai-compat"}
 
 
 @pytest.fixture(autouse=True)
 def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hide every ambient credential so probes report what the test set up."""
-    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "KEYED_TEST_KEY"):
+    for name in ("LOGPOSE_BASE_URL", "LOGPOSE_API_KEY", "KEYED_TEST_KEY"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -53,17 +53,33 @@ def test_the_catalog_is_sorted_and_has_one_entry_per_backend() -> None:
     assert len(names) == len(set(names))
 
 
-def test_an_alias_does_not_get_its_own_entry() -> None:
-    """`docker-models` is a spelling of `docker`, not a separate backend."""
-    assert "docker-models" in known_providers()
-    assert "docker-models" not in {info.name for info in provider_catalog()}
-    docker = provider_info("docker")
-    assert docker.aliases == ("docker-models",)
-    assert docker.names == ("docker", "docker-models")
+@pytest.fixture
+def aliased_provider() -> Any:
+    """Register a third-party backend under a canonical name and an alias."""
+    from logpose.providers import _REGISTRY
+
+    info = ProviderInfo(
+        name="aliased-test",
+        summary="Test backend.",
+        api="chat-completions",
+        credential="none",
+        aliases=("aliased-alt",),
+    )
+    for name in info.names:
+        register(name, lambda **kwargs: object(), info=info)  # type: ignore[arg-type,return-value]
+    yield info
+    for name in info.names:
+        del _REGISTRY[name]
 
 
-def test_provider_info_resolves_an_alias_to_its_owner() -> None:
-    assert provider_info("docker-models") is provider_info("docker")
+def test_an_alias_does_not_get_its_own_entry(aliased_provider: ProviderInfo) -> None:
+    assert "aliased-alt" in known_providers()
+    assert "aliased-alt" not in {info.name for info in provider_catalog()}
+    assert provider_info("aliased-test").names == ("aliased-test", "aliased-alt")
+
+
+def test_provider_info_resolves_an_alias_to_its_owner(aliased_provider: ProviderInfo) -> None:
+    assert provider_info("aliased-alt") is provider_info("aliased-test")
 
 
 def test_reading_the_catalog_imports_no_provider_module() -> None:
@@ -116,16 +132,16 @@ def test_every_declared_name_is_actually_registered(name: str) -> None:
 
 def test_chat_completions_is_flagged_as_losing_reasoning() -> None:
     lossy = {i.name for i in provider_catalog() if not i.preserves_reasoning}
-    assert lossy == {"docker", "openai-compat"}
+    assert lossy == {"openai-compat"}
 
 
 def test_the_credential_env_var_comes_first() -> None:
     """env_vars is ordered so a UI can show the one that matters most."""
-    assert provider_info("openai-compat").env_vars[0] == "OPENAI_BASE_URL"
+    assert provider_info("openai-compat").env_vars == ("LOGPOSE_BASE_URL", "LOGPOSE_API_KEY")
 
 
 def test_backends_that_discover_a_model_declare_no_default() -> None:
-    for name in ("docker", "openai-compat"):
+    for name in ("openai-compat",):
         assert provider_info(name).default_model is None
 
 
@@ -139,11 +155,13 @@ async def test_status_covers_the_catalog_in_order() -> None:
     assert [s.name for s in statuses] == [i.name for i in provider_catalog()]
 
 
-async def test_a_backend_needing_no_credential_is_always_ready() -> None:
-    (docker,) = await provider_status(["docker"])
-    assert docker.ready is True
-    assert docker.credential == "none"
-    assert docker.detail == ""
+async def test_a_backend_needing_no_credential_is_always_ready(
+    aliased_provider: ProviderInfo,
+) -> None:
+    (status,) = await provider_status(["aliased-test"])
+    assert status.ready is True
+    assert status.credential == "none"
+    assert status.detail == ""
 
 
 @pytest.fixture
@@ -184,24 +202,30 @@ async def test_a_present_credential_is_ready_and_names_its_kind(
 async def test_a_backend_needing_an_endpoint_says_so() -> None:
     (compat,) = await provider_status(["openai-compat"])
     assert compat.ready is False
-    assert "OPENAI_BASE_URL" in compat.detail
+    assert "LOGPOSE_BASE_URL" in compat.detail
+
+
+async def test_a_blank_endpoint_env_counts_as_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOGPOSE_BASE_URL", "   ")
+    (compat,) = await provider_status(["openai-compat"])
+    assert compat.ready is False
 
 
 async def test_a_configured_endpoint_makes_the_generic_backend_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://local.test/v1")
+    monkeypatch.setenv("LOGPOSE_BASE_URL", "http://local.test/v1")
     (compat,) = await provider_status(["openai-compat"])
     assert compat.ready is True
 
 
-async def test_status_accepts_an_alias() -> None:
-    (docker,) = await provider_status(["docker-models"])
-    assert docker.name == "docker"
+async def test_status_accepts_an_alias(aliased_provider: ProviderInfo) -> None:
+    (status,) = await provider_status(["aliased-alt"])
+    assert status.name == "aliased-test"
 
 
-async def test_status_deduplicates_a_backend_named_twice() -> None:
-    statuses = await provider_status(["docker", "docker-models"])
+async def test_status_deduplicates_a_backend_named_twice(aliased_provider: ProviderInfo) -> None:
+    statuses = await provider_status(["aliased-test", "aliased-alt"])
     assert len(statuses) == 1
 
 
@@ -276,7 +300,6 @@ async def test_every_built_in_provider_exposes_list_models() -> None:
     """The consistency the catalog promises: one call works everywhere."""
     for name, provider_class in (
         ("openai-compat", OpenAICompatProvider),
-        ("docker", DockerModelsProvider),
     ):
         assert callable(getattr(provider_class, "list_models", None)), name
         assert provider_info(name).supports_model_discovery
@@ -300,9 +323,9 @@ def test_provider_info_is_constructible_by_a_third_party() -> None:
 
 async def test_an_end_to_end_picker_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     """What a consumer actually does: catalog, filter by readiness, list models."""
-    monkeypatch.setenv("OPENAI_BASE_URL", BASE)
+    monkeypatch.setenv("LOGPOSE_BASE_URL", BASE)
     ready = {s.name for s in await provider_status() if s.ready}
-    assert ready == {"docker", "openai-compat"}
+    assert ready == {"openai-compat"}
 
     provider = compat(data("m-1"))
     try:

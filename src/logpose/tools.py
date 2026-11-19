@@ -983,7 +983,7 @@ def discover_tools(
     ``@tool`` keeps no registry — it simply returns a :class:`ToolDef` — so
     discovery works by importing modules and scanning their namespaces::
 
-        agent = Agent("docker", tools=discover_tools("myapp.tools"))
+        agent = Agent("openai-compat", model="gpt-5.1", tools=discover_tools("myapp.tools"))
 
     The result is an ordinary list, so it composes with hand-written tools::
 

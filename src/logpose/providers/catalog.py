@@ -58,9 +58,9 @@ class ProviderInfo:
         summary: One line describing the backend, suitable for a UI label.
         api: The wire protocol — see :data:`WireApi`.
         credential: What it needs to authenticate — see :data:`CredentialKind`.
-        default_model: The model used when the caller names none, or ``None`` when
-            the backend discovers one on its first request (``docker``) or requires
-            an explicit choice (``openai-compat``).
+        default_model: The model a third-party backend uses when the caller names
+            none, or ``None``. Built-in backends declare none: the caller always
+            passes ``Agent(model=...)``.
         supports_model_discovery: Whether ``provider.list_models()`` asks the
             backend. Every built-in provider does; a third-party one may not.
         env_vars: Environment variables that configure the backend, credential
