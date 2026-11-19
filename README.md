@@ -488,6 +488,66 @@ A run without a conversation is independent. A conversation should remain on the
 backend that produced it because some providers include backend-specific reasoning
 state in the history.
 
+## Structured output
+
+Pass a pydantic model as `output_type` and the run returns a validated instance
+on `result.output`:
+
+```python
+from pydantic import BaseModel
+from logpose import Agent
+
+
+class LineItem(BaseModel):
+    description: str
+    amount: float
+
+
+class Invoice(BaseModel):
+    customer: str
+    items: list[LineItem]
+    total: float
+    notes: str | None = None
+
+
+agent = Agent("openai-compat", model="gpt-5.1")
+result = await agent.run("Invoice Acme for two widgets at 10 each.", output_type=Invoice)
+invoice: Invoice | None = result.output
+```
+
+`output_type` can be set per call or as an `Agent` default. Passing
+`output_type=None` on a call disables an agent default for that call. Runs
+without `output_type` are unchanged, apart from `result.output` being `None`.
+
+If the reply does not validate, logpose sends one correction turn describing the
+problem. `output_retries` sets that budget (default `1`; `0` fails immediately,
+which is useful in tests). A `null` for a field that has a default takes the
+default, while `X | None` fields keep `None`.
+
+| Error | Raised when |
+| --- | --- |
+| `OutputValidationError` | The reply is not valid for the model after the retry budget, including `reason="max_tokens"` when output was cut off. |
+| `OutputRefusalError` | The model refused. There is no correction turn. |
+| `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (HTTP 400/422). Not retried. |
+
+### Provider compatibility (as of 2026-11)
+
+logpose enforces structure only with a strict `json_schema` `response_format`. It
+does not fall back to `json_object` or prompt-only modes, so providers that lack
+strict `json_schema` support cannot be used with `output_type`.
+
+| Provider | Strict `json_schema` |
+| --- | --- |
+| OpenAI | ✅ |
+| vLLM | ✅ |
+| Ollama | ✅ |
+| llama.cpp | ✅ |
+| LM Studio | ✅ |
+| Sarvam | ✅ |
+| OpenRouter | ⚠️ depends on the model (use models listing `structured_outputs`) |
+| Z.ai GLM API | ❌ documents only `json_object` |
+| DeepSeek API | ❌ documents only `json_object` |
+
 ## Synchronous usage
 
 `SyncAgent` exposes the same loop to blocking applications:
@@ -500,7 +560,8 @@ with SyncAgent(Agent("openai-compat", model="gpt-5.1", tools=[get_weather])) as 
     print(result.text)
 ```
 
-For one-off calls, `run_sync()` and `stream_sync()` are also available. Do not use
+For one-off calls, `run_sync()` and `stream_sync()` are also available. All of them accept
+`output_type` and `output_retries`. Do not use
 the synchronous API from a thread already running an event loop; use `await` and
 `async for` there.
 
@@ -550,6 +611,9 @@ All library-defined errors inherit from `LogposeError`.
 | `RunTimeoutError` | The run exceeded `run_timeout`; includes partial messages. |
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
 | `ToolExecutionError` | The tool execution machinery failed. |
+| `OutputValidationError` | Structured output did not validate after the retry budget (or was cut off by `max_tokens`). |
+| `OutputRefusalError` | The model refused a structured-output request. |
+| `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (a `ProviderError`). |
 
 Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or
