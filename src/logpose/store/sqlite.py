@@ -67,10 +67,15 @@ def _message_row(session_id: str, seq: int, m: Message, now: int) -> tuple[str, 
 
 
 async def _rollback(db: aiosqlite.Connection) -> None:
-    """Leave the connection outside any transaction, without masking the caller's error."""
-    if db.in_transaction:
-        with contextlib.suppress(Exception):
-            await db.execute("ROLLBACK")
+    """Leave the connection outside any transaction, without masking the caller's error.
+
+    Always queues ``ROLLBACK`` rather than checking ``db.in_transaction``: after a
+    cancellation the worker thread may still be running ``BEGIN``/``COMMIT``, and
+    aiosqlite runs its queue in order, so the rollback lands after it. When no
+    transaction is active, the "no transaction is active" error is suppressed.
+    """
+    with contextlib.suppress(Exception):
+        await db.execute("ROLLBACK")
 
 
 async def _fetch_messages(db: aiosqlite.Connection, session_id: str) -> list[Message]:
@@ -142,8 +147,8 @@ class SQLiteStore:
             self._db = db
 
     async def _migrate(self, db: aiosqlite.Connection) -> None:
-        await db.execute("BEGIN IMMEDIATE")
         try:
+            await db.execute("BEGIN IMMEDIATE")
             await db.execute("CREATE TABLE IF NOT EXISTS logpose_schema (version INTEGER NOT NULL)")
             async with db.execute("SELECT version FROM logpose_schema") as cur:
                 row = await cur.fetchone()
@@ -181,8 +186,10 @@ class SQLiteStore:
         """
         async with self._lock:
             db = self._conn()
-            await db.execute("BEGIN IMMEDIATE")
             try:
+                # BEGIN is inside the try: if the caller is cancelled while it is
+                # queued, the worker still runs it, and the rollback must follow.
+                await db.execute("BEGIN IMMEDIATE")
                 result = await fn(db)
                 await db.execute("COMMIT")
             except BaseException:

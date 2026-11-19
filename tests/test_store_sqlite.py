@@ -526,3 +526,42 @@ async def test_concurrent_open_does_not_leak(
         assert calls == 1
     finally:
         await s.close()
+
+
+async def test_cancel_during_begin_leaves_connection_usable(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        db = s._db
+        assert db is not None
+        task = asyncio.create_task(s.append_messages("s1", [_msg("cancelled")], start_seq=0))
+        await asyncio.sleep(0)  # let the task queue BEGIN IMMEDIATE, then cancel it
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not db.in_transaction
+        await s.append_messages("s1", [_msg("kept")], start_seq=0)
+        assert not db.in_transaction
+        assert _texts(await s.load_messages("s1")) == ["kept"]
+
+
+async def test_session_exit_survives_renewal_cancelled_mid_begin(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p, lease_ttl=0.6) as s:
+        async with aiosqlite.connect(p, isolation_level=None) as other:
+
+            async def release_later() -> None:
+                await asyncio.sleep(0.6)
+                await other.execute("COMMIT")
+
+            async with s.session("s1") as h:
+                h.conversation.append(_msg("saved"))
+                # Another connection takes the write lock, so the renewal at 0.2 s
+                # blocks inside BEGIN IMMEDIATE (busy_timeout 5 s) when exit cancels it.
+                await other.execute("BEGIN IMMEDIATE")
+                releaser = asyncio.create_task(release_later())
+                await asyncio.sleep(0.35)
+            await releaser
+        assert s._db is not None
+        assert not s._db.in_transaction
+        assert _texts(await s.load_messages("s1")) == ["saved"]
+        async with s.session("s1") as h:
+            assert _texts(h.conversation.messages) == ["saved"]
