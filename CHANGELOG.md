@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Structured output: `agent.run(..., output_type=Model)` (also on `stream`, the sync
+  facade, and as an `Agent` default) returns a validated `RunResult[T].output`,
+  enforced only via strict `json_schema` `response_format`. `output_retries`
+  sets the correction-turn budget (default 1).
+- `OutputValidationError`, `OutputRefusalError` and
+  `StructuredOutputUnsupportedError` (a `ProviderError`).
+- `CompletionDone.refusal` carries a provider refusal.
 - `Agent(run_timeout=320)`: a wall-clock deadline for a whole run, including
   provider retries and tool execution. Expiry raises the new
   `RunTimeoutError` (with partial messages), emits `run.timed_out`, and is never

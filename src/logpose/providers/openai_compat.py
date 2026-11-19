@@ -41,6 +41,7 @@ from logpose.errors import (
     AuthError,
     LogposeError,
     ProviderError,
+    StructuredOutputUnsupportedError,
     _provider_error_code_from_body,
     _provider_metadata_from_headers,
 )
@@ -102,6 +103,27 @@ _FINISH_REASONS: dict[str, StopReason] = {
     "length": "max_tokens",
     "content_filter": "refusal",
 }
+
+_STRUCTURED_REJECTION_MARKERS = ("response_format", "json_schema", "strict", "structured")
+
+_PROVIDER_REASON_LIMIT = 500
+
+
+def _is_strict_json_schema_request(body: Mapping[str, Any]) -> bool:
+    """Return whether ``body`` asks for ``json_schema`` structured output."""
+    response_format = body.get("response_format")
+    return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+
+def _provider_error_message_from_body(body: str) -> str | None:
+    """Return ``error.message`` from a JSON error body, or ``None``."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return message.strip() or None if isinstance(message, str) else None
 
 _CONNECT_HINT = "Could not reach the model server at {base_url}. Check that it is running."
 
@@ -499,6 +521,32 @@ class OpenAICompatProvider:
             **_provider_metadata_from_headers(headers),
         )
 
+    def _structured_unsupported_error(
+        self, status: int, body: str, headers: Mapping[str, str]
+    ) -> StructuredOutputUnsupportedError:
+        """Build the error for a server rejecting a strict ``json_schema`` request.
+
+        Only the provider's parsed ``error.message`` is included (scrubbed and
+        truncated), never the raw body.
+        """
+        message = (
+            f"{self.base_url} does not support strict json_schema structured output for "
+            "this model (the server rejected the response_format). logpose requires it "
+            "for output_type; use a compatible server or model."
+        )
+        reason = _provider_error_message_from_body(body)
+        if reason:
+            reason = self._scrub(reason)
+            if len(reason) > _PROVIDER_REASON_LIMIT:
+                reason = reason[:_PROVIDER_REASON_LIMIT] + "…"
+            message += f" Provider said: {reason}"
+        return StructuredOutputUnsupportedError(
+            message,
+            status_code=status,
+            error_code=_provider_error_code_from_body(body),
+            **_provider_metadata_from_headers(headers),
+        )
+
     def _transport_error(self, exc: httpx.HTTPError) -> ProviderError:
         """Build a :class:`~logpose.errors.ProviderError` from a transport failure."""
         scrub_exception_in_place(exc, self._secrets())
@@ -529,6 +577,11 @@ class OpenAICompatProvider:
         }
         if req.tools:
             body["tools"] = [_tool_to_wire(spec) for spec in req.tools]
+        if "response_format" in self._extra_body and "response_format" in req.extra:
+            raise LogposeError(
+                "response_format is set both in the provider's extra_body and on the request. "
+                "Remove one; structured output owns response_format."
+            )
         body.update(self._extra_body)
         body.update(req.extra)
         return body
@@ -557,6 +610,7 @@ class OpenAICompatProvider:
         splitter = _ThinkTagSplitter() if self.parse_think_tags else None
         finish_reason: str | None = None
         usage = Usage()
+        refusal_parts: list[str] = []
 
         try:
             async with self._http().stream(
@@ -564,11 +618,16 @@ class OpenAICompatProvider:
             ) as response:
                 if response.status_code >= 400:
                     raw = await response.aread()
-                    raise self._status_error(
-                        response.status_code,
-                        raw.decode("utf-8", "replace"),
-                        response.headers,
-                    )
+                    text = raw.decode("utf-8", "replace")
+                    if (
+                        _is_strict_json_schema_request(body)
+                        and response.status_code in (400, 422)
+                        and any(m in text.lower() for m in _STRUCTURED_REJECTION_MARKERS)
+                    ):
+                        raise self._structured_unsupported_error(
+                            response.status_code, text, response.headers
+                        )
+                    raise self._status_error(response.status_code, text, response.headers)
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_line(line)
                     if chunk is None:
@@ -585,6 +644,10 @@ class OpenAICompatProvider:
                         delta = choice.get("delta")
                         if not isinstance(delta, dict):
                             continue
+
+                        refusal_delta = delta.get("refusal")
+                        if isinstance(refusal_delta, str) and refusal_delta:
+                            refusal_parts.append(refusal_delta)
 
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         if isinstance(reasoning, str) and reasoning:
@@ -637,6 +700,7 @@ class OpenAICompatProvider:
             message=Message(role="assistant", content=content_blocks),
             stop_reason=_map_finish_reason(finish_reason, bool(tool_frags)),
             usage=usage,
+            refusal="".join(refusal_parts) or None,
         )
 
 

@@ -102,6 +102,8 @@ class ScriptedTurn:
         emit_done: When ``False``, the stream ends without a
             :class:`~logpose.providers.base.CompletionDone`, violating the
             provider contract on purpose.
+        refusal: Refusal text carried by the terminal
+            :class:`~logpose.providers.base.CompletionDone`, if any.
     """
 
     message: Message = field(default_factory=lambda: Message(role="assistant", content=[]))
@@ -111,6 +113,7 @@ class ScriptedTurn:
     error: BaseException | None = None
     delay: float = 0.0
     emit_done: bool = True
+    refusal: str | None = None
 
     @classmethod
     def text(
@@ -123,6 +126,7 @@ class ScriptedTurn:
         stop_reason: StopReason = "end_turn",
         usage: Usage | None = None,
         delay: float = 0.0,
+        refusal: str | None = None,
     ) -> ScriptedTurn:
         """Script a plain text turn.
 
@@ -138,6 +142,7 @@ class ScriptedTurn:
             stop_reason: Why the model stopped.
             usage: Token usage for the turn.
             delay: Seconds to sleep before emitting anything.
+            refusal: Refusal text reported on the terminal completion.
 
         Returns:
             The scripted turn.
@@ -157,6 +162,7 @@ class ScriptedTurn:
             usage=usage or Usage(),
             deltas=tuple(deltas),
             delay=delay,
+            refusal=refusal,
         )
 
     @classmethod
@@ -227,6 +233,7 @@ class ScriptedTurn:
             message=self.message,
             stop_reason=self.stop_reason,
             usage=self.usage,
+            refusal=self.refusal,
         )
 
 

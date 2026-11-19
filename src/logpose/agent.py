@@ -74,14 +74,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import enum
 import inspect
 import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from time import monotonic
-from typing import Any, Literal, Union
+from typing import Any, Literal, TypeVar, Union, overload
 from uuid import uuid4
+
+from pydantic import BaseModel
 
 from logpose.cancellation import (
     ToolDeadlineHandle,
@@ -92,6 +95,8 @@ from logpose.context import ContextInput, ContextPolicy, ContextPreparationError
 from logpose.errors import (
     LogposeError,
     MaxIterationsError,
+    OutputRefusalError,
+    OutputValidationError,
     ProviderError,
     RunTimeoutError,
     ToolExecutionError,
@@ -107,7 +112,14 @@ from logpose.events import (
     TurnEnd,
 )
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
-from logpose.messages import Message, ToolResultBlock, ToolUseBlock, Usage
+from logpose.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
+from logpose.output import (
+    OutputParseFailure,
+    format_errors,
+    parse_output,
+    response_format_for,
+    strict_json_schema,
+)
 from logpose.providers import resolve
 from logpose.providers.base import (
     CompletionDone,
@@ -182,6 +194,24 @@ otherwise fail the *next* request rather than its own.
 """
 
 _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
+
+_M = TypeVar("_M", bound=BaseModel)
+
+
+class _Unset(enum.Enum):
+    """Sentinel type: a per-call keyword the caller did not pass."""
+
+    UNSET = enum.auto()
+
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_UNSET = _Unset.UNSET
+"""Means "use the agent default" for ``output_type`` / ``output_retries``."""
+
+_CORRECTION_PREFIX = "Your previous answer did not match the required JSON schema:\n"
+_CORRECTION_SUFFIX = "\nReply again with only the corrected JSON."
 
 
 @dataclass(frozen=True)
@@ -358,6 +388,8 @@ class Agent:
             provider's own default.
         extra: Provider-specific request parameters merged into every turn.
         on_tool_call: Optional gate consulted before each tool runs.
+        output_type: Default structured-output model for runs, or ``None``.
+        output_retries: Default number of correction turns for invalid answers.
     """
 
     def __init__(
@@ -381,6 +413,8 @@ class Agent:
         observers: Sequence[RuntimeObserver] = (),
         tool_observer: ToolObserver | None = None,
         context_policy: ContextPolicy | None = None,
+        output_type: type[BaseModel] | None = None,
+        output_retries: int = 1,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -445,6 +479,12 @@ class Agent:
             context_policy: Optional sync/async request preparation policy. Runs before
                 every provider iteration on detached data; never rewrites history.
                 Applications own selection and summaries. Failure stops the run.
+            output_type: Default pydantic model the final answer must satisfy.
+                When set, every turn requests strict ``json_schema`` output and
+                the run returns the validated object as ``RunResult.output``.
+                ``run``/``stream`` can override it per call.
+            output_retries: Default number of correction turns sent when the
+                final answer fails validation (default 1). ``0`` fails at once.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -458,8 +498,12 @@ class Agent:
             ``max_tokens`` are not positive, or if ``retry_policy`` is not a
             :class:`~logpose.retry.RetryPolicy`, or if
             ``provider_turn_timeout``, ``max_concurrent_tools``, or
-            ``tool_timeout`` is invalid, or if a tool-error option is invalid.
+            ``tool_timeout`` is invalid, or if a tool-error option is invalid,
+            or if ``output_type`` is not a ``BaseModel`` subclass or
+            ``output_retries`` is not an int >= 0.
         """
+        _check_output_type(output_type)
+        _check_output_retries(output_retries)
         if max_iterations is not None and max_iterations < 1:
             raise LogposeError(f"max_iterations must be at least 1, got {max_iterations}.")
         if max_tokens is not None and max_tokens < 1:
@@ -554,6 +598,8 @@ class Agent:
         self.tool_observer = tool_observer
         self.context_policy = context_policy
         self.last_context_diagnostics: dict[str, int | str | bool] = {}
+        self.output_type = output_type
+        self.output_retries = output_retries
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -572,12 +618,34 @@ class Agent:
 
     # -- public API ---------------------------------------------------------
 
+    @overload
     async def run(
         self,
         prompt: str | Message | None = None,
         *,
         conversation: Conversation | None = None,
-    ) -> RunResult:
+        output_type: type[_M],
+        output_retries: int | _Unset = _UNSET,
+    ) -> RunResult[_M]: ...
+
+    @overload
+    async def run(
+        self,
+        prompt: str | Message | None = None,
+        *,
+        conversation: Conversation | None = None,
+        output_type: None | _Unset = _UNSET,
+        output_retries: int | _Unset = _UNSET,
+    ) -> RunResult[Any]: ...
+
+    async def run(
+        self,
+        prompt: str | Message | None = None,
+        *,
+        conversation: Conversation | None = None,
+        output_type: type[BaseModel] | None | _Unset = _UNSET,
+        output_retries: int | _Unset = _UNSET,
+    ) -> RunResult[Any]:
         """Run the loop to completion and return its result.
 
         Implemented by draining :meth:`stream`, so both entry points share one
@@ -589,21 +657,36 @@ class Agent:
                 continues from ``conversation`` without adding a turn.
             conversation: History to read from and append to. Omit for a
                 single-shot run.
+            output_type: Pydantic model the final answer must satisfy; the
+                validated object is returned as ``RunResult.output``. Omit to
+                use the agent default; ``None`` disables it for this call.
+            output_retries: Correction turns allowed for an invalid final
+                answer. Omit to use the agent default.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
 
         Raises:
-            LogposeError: If there is nothing to send, or if
-                ``on_tool_call`` returns an unsupported type.
+            LogposeError: If there is nothing to send, if
+                ``on_tool_call`` returns an unsupported type, or if the output
+                options are invalid or conflict with ``extra["response_format"]``.
+            OutputValidationError: If the final answer never validates against
+                ``output_type``, or was cut off at ``max_tokens``.
+            OutputRefusalError: If the model refused to give a structured answer.
             MaxIterationsError: If the run exceeds ``max_iterations``. The
                 partial conversation is attached to the error.
             ProviderError: If the provider fails or violates its contract.
             Exception: Whatever ``on_tool_call`` raises, propagated unchanged
                 rather than converted into a tool result.
         """
-        result: RunResult | None = None
-        async for event in self.stream(prompt, conversation=conversation):
+        result: RunResult[Any] | None = None
+        events = self.stream(
+            prompt,
+            conversation=conversation,
+            output_type=output_type,
+            output_retries=output_retries,
+        )
+        async for event in events:
             if isinstance(event, RunEnd):
                 result = event.result
         if result is None:  # pragma: no cover - the loop always ends with RunEnd
@@ -615,6 +698,8 @@ class Agent:
         prompt: str | Message | None = None,
         *,
         conversation: Conversation | None = None,
+        output_type: type[BaseModel] | None | _Unset = _UNSET,
+        output_retries: int | _Unset = _UNSET,
     ) -> AsyncIterator[Event]:
         """Run the loop, yielding events as they happen.
 
@@ -634,22 +719,35 @@ class Agent:
                 continues from ``conversation`` without adding a turn.
             conversation: History to read from and append to. Omit for a
                 single-shot run.
+            output_type: As for :meth:`run`; ``RunEnd.result.output`` carries
+                the validated object.
+            output_retries: As for :meth:`run`.
 
         Returns:
             An async iterator of :data:`~logpose.events.Event` values.
 
         Raises:
-            LogposeError: If ``prompt`` is not a supported type, or if there is
-                nothing to send. Iterating can raise the same errors
-                :meth:`run` documents, including whatever ``on_tool_call``
-                raises.
+            LogposeError: If ``prompt`` is not a supported type, if there is
+                nothing to send, or if the output options are invalid or
+                conflict with ``extra["response_format"]``. Iterating can raise
+                the same errors :meth:`run` documents, including whatever
+                ``on_tool_call`` raises.
         """
+        resolved_type = self.output_type if output_type is _UNSET else output_type
+        resolved_retries = self.output_retries if output_retries is _UNSET else output_retries
+        _check_output_type(resolved_type)
+        _check_output_retries(resolved_retries)
+        if resolved_type is not None and "response_format" in self.extra:
+            raise LogposeError(
+                "Agent(extra=...) already sets 'response_format', which output_type also "
+                "sets; remove one of them."
+            )
         first = _as_message(prompt) if prompt is not None else None
         if first is None and not (conversation is not None and conversation.messages):
             raise LogposeError(
                 "Nothing to send: pass a prompt, or a conversation that already has messages."
             )
-        return self._loop(first, conversation)
+        return self._loop(first, conversation, resolved_type, resolved_retries)
 
     async def aclose(self) -> None:
         """Release provider resources owned by this agent.
@@ -770,12 +868,16 @@ class Agent:
         self,
         prompt: Message | None,
         conversation: Conversation | None,
+        output_type: type[BaseModel] | None = None,
+        output_retries: int = 0,
     ) -> AsyncIterator[Event]:
         """Drive provider turns and tool executions until the run ends.
 
         Args:
             prompt: The already-normalized opening turn, if any.
             conversation: History to append to; a private list is used when omitted.
+            output_type: Model the final answer must validate against, or ``None``.
+            output_retries: Correction turns allowed for an invalid final answer.
 
         Yields:
             :data:`~logpose.events.Event` values, ending with
@@ -786,8 +888,11 @@ class Agent:
             MaxIterationsError: If the run exceeds ``max_iterations``.
             RunTimeoutError: If the run exceeds ``run_timeout``.
             ProviderError: If the provider fails or violates its contract.
+            OutputValidationError: If the final answer never validates.
+            OutputRefusalError: If the model refused the structured answer.
         """
         model = self._model()
+        response_format = response_format_for(output_type) if output_type is not None else None
         run_context = RuntimeContext(
             run_id=self._runtime_id("run"), provider=self.provider_name, model=model
         )
@@ -802,6 +907,11 @@ class Agent:
 
             total_usage = Usage()
             last: CompletionDone | None = None
+            output: BaseModel | None = None
+            corrections = 0
+            # Indices of invalid answers and correction prompts this run added;
+            # dropped from history once a corrected answer validates.
+            discard: set[int] = set()
 
             while True:
                 if _remaining(run_deadline) == 0.0:
@@ -821,7 +931,7 @@ class Agent:
                 )
                 done: CompletionDone | None = None
                 async with _run_budget(run_deadline):
-                    request = await self._prepare_request(history)
+                    request = await self._prepare_request(history, response_format)
                 turn_stream = self._provider_turn(request, turn_context, run_deadline)
                 try:
                     async for event in turn_stream:
@@ -850,28 +960,27 @@ class Agent:
                 # consumer never wrote. `last` still carries the stop reason.
                 stored = bool(done.message.content)
                 if stored:
+                    answer_index = len(history)
                     history.append(done.message)
                 total_usage = total_usage + done.usage
                 last = done
                 yield TurnEnd(stop_reason=done.stop_reason, usage=done.usage)
 
-                if done.stop_reason == "pause_turn":
+                if done.stop_reason == "pause_turn" and stored:
                     # Not a termination: re-issue with the paused turn in history.
                     # Unless there was no paused turn to store — re-issuing an
                     # identical request would spin against the API until the
-                    # iteration cap, so end the run instead.
-                    if not stored:
-                        break
+                    # iteration cap, so that case falls through and ends the run.
                     continue
 
-                if done.stop_reason == "tool_use":
-                    calls = [
-                        block for block in done.message.content if isinstance(block, ToolUseBlock)
-                    ]
-                    if not calls:
-                        # The model asked for tools without naming any. Re-sending
-                        # would loop forever, so treat it as the end of the run.
-                        break
+                # The model asking for tools without naming any is the end of
+                # the run: re-sending would loop forever.
+                calls = (
+                    [block for block in done.message.content if isinstance(block, ToolUseBlock)]
+                    if done.stop_reason == "tool_use"
+                    else []
+                )
+                if calls:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
                     try:
@@ -905,6 +1014,41 @@ class Agent:
                     history.append(Message(role="user", content=list(results)))
                     continue
 
+                if output_type is not None:
+                    try:
+                        output = self._final_output(done, output_type, history)
+                    except OutputParseFailure as failure:
+                        if corrections >= output_retries:
+                            raise OutputValidationError(
+                                f"The final answer did not validate against "
+                                f"{output_type.__name__} after {corrections + 1} attempt(s): "
+                                f"{format_errors(failure.errors)}. If the answer ignored the "
+                                "schema, the server may not enforce strict json_schema; use a "
+                                "server and model that support structured output.",
+                                raw_text=done.message.text,
+                                errors=failure.errors,
+                                messages=list(history),
+                                output_type=output_type,
+                            ) from None
+                        corrections += 1
+                        if stored:
+                            discard.add(answer_index)
+                        discard.add(len(history))
+                        history.append(
+                            Message(
+                                role="user",
+                                content=[
+                                    TextBlock(
+                                        text=_CORRECTION_PREFIX
+                                        + format_errors(failure.errors)
+                                        + _CORRECTION_SUFFIX
+                                    )
+                                ],
+                            )
+                        )
+                        continue
+                    if discard:
+                        history[:] = [m for i, m in enumerate(history) if i not in discard]
                 break
 
             if last is None:  # pragma: no cover - a provider turn always completes
@@ -915,6 +1059,7 @@ class Agent:
                 usage=total_usage,
                 stop_reason=last.stop_reason,
                 iterations=iterations,
+                output=output,
             )
             self._emit_runtime(
                 "run.completed",
@@ -1150,9 +1295,15 @@ class Agent:
         """Return the complete-turn deadline, or ``None`` for no deadline."""
         return self.provider_turn_timeout
 
-    async def _prepare_request(self, history: Sequence[Message]) -> CompletionRequest:
+    async def _prepare_request(
+        self,
+        history: Sequence[Message],
+        response_format: dict[str, Any] | None = None,
+    ) -> CompletionRequest:
         """Await selection before inference; isolate policy mutation from canonical data."""
         request = self._request(history)
+        if response_format is not None:
+            request.extra["response_format"] = copy.deepcopy(response_format)
         self.last_context_diagnostics = {}
         if self.context_policy is None:
             return request
@@ -1192,6 +1343,44 @@ class Agent:
             raise ContextPreparationError(
                 "Context preparation failed before provider inference"
             ) from exc
+
+    @staticmethod
+    def _final_output(
+        done: CompletionDone, output_type: type[BaseModel], history: Sequence[Message]
+    ) -> BaseModel:
+        """Validate the final turn against ``output_type``.
+
+        Args:
+            done: The final provider completion.
+            output_type: The model the answer must satisfy.
+            history: The conversation so far, attached to raised errors.
+
+        Returns:
+            The validated output object.
+
+        Raises:
+            OutputRefusalError: If the model refused.
+            OutputValidationError: If the answer was cut off at ``max_tokens``.
+            OutputParseFailure: If the answer is not valid for ``output_type``;
+                the caller decides whether to send a correction turn.
+        """
+        if done.refusal or done.stop_reason == "refusal":
+            raise OutputRefusalError(
+                f"The model refused to produce a {output_type.__name__} answer.",
+                refusal=done.refusal or "",
+                messages=list(history),
+            )
+        if done.stop_reason == "max_tokens":
+            raise OutputValidationError(
+                f"The {output_type.__name__} answer was cut off at max_tokens before it was "
+                "complete; raise max_tokens for this agent.",
+                raw_text=done.message.text,
+                errors=[],
+                messages=list(history),
+                output_type=output_type,
+                reason="max_tokens",
+            )
+        return parse_output(output_type, done.message.text)
 
     def _request(self, history: Sequence[Message]) -> CompletionRequest:
         """Build the request for the next turn.
@@ -1552,6 +1741,32 @@ class Agent:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def _check_output_type(output_type: object) -> None:
+    """Reject an ``output_type`` strict structured output cannot serve.
+
+    Besides the type check, the strict schema is built once so models it cannot
+    express (open ``dict`` fields, non-object roots) fail before any request.
+    """
+    if output_type is None:
+        return
+    if not (isinstance(output_type, type) and issubclass(output_type, BaseModel)):
+        shown = (output_type if isinstance(output_type, type) else type(output_type)).__name__
+        raise LogposeError(
+            f"output_type must be a pydantic BaseModel subclass or None, got {shown}."
+        )
+    strict_json_schema(output_type)
+
+
+def _check_output_retries(output_retries: object) -> None:
+    """Reject an ``output_retries`` that is not an int >= 0."""
+    if (
+        isinstance(output_retries, bool)
+        or not isinstance(output_retries, int)
+        or output_retries < 0
+    ):
+        raise LogposeError(f"output_retries must be an int >= 0, got {output_retries!r}.")
 
 
 def _as_message(prompt: str | Message) -> Message:

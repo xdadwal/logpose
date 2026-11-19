@@ -57,7 +57,9 @@ import weakref
 from collections.abc import AsyncIterator, Coroutine, Iterator
 from typing import Any, TypeVar
 
-from logpose.agent import Agent, Conversation
+from pydantic import BaseModel
+
+from logpose.agent import _UNSET, Agent, Conversation, _Unset
 from logpose.errors import LogposeError
 from logpose.events import Event, RunResult
 from logpose.messages import Message
@@ -316,12 +318,27 @@ def _drive(runner: _LoopRunner, events: AsyncIterator[Event]) -> Iterator[Event]
 # ---------------------------------------------------------------------------
 
 
+def _output_kwargs(
+    output_type: type[BaseModel] | None | _Unset,
+    output_retries: int | _Unset,
+) -> dict[str, Any]:
+    """Collect only the structured-output keywords the caller actually passed."""
+    kwargs: dict[str, Any] = {}
+    if output_type is not _UNSET:
+        kwargs["output_type"] = output_type
+    if output_retries is not _UNSET:
+        kwargs["output_retries"] = output_retries
+    return kwargs
+
+
 def run_sync(
     agent: Agent,
     prompt: str | Message | None = None,
     *,
     conversation: Conversation | None = None,
-) -> RunResult:
+    output_type: type[BaseModel] | None | _Unset = _UNSET,
+    output_retries: int | _Unset = _UNSET,
+) -> RunResult[Any]:
     """Run ``agent`` to completion, blocking until it finishes.
 
     The synchronous twin of :meth:`~logpose.agent.Agent.run`.
@@ -333,6 +350,9 @@ def run_sync(
             from ``conversation`` without adding a turn.
         conversation: History to read from and append to. Omit for a single-shot
             run.
+        output_type: Per-call structured output model; omit to use the agent
+            default, ``None`` to disable it for this call.
+        output_retries: Per-call correction-turn budget; omit for the agent default.
 
     Returns:
         The completed :class:`~logpose.events.RunResult`.
@@ -345,7 +365,8 @@ def run_sync(
     """
     _reject_running_loop("run_sync()")
     runner = _runner_for(agent)
-    return runner.run(agent.run(prompt, conversation=conversation))
+    kwargs = _output_kwargs(output_type, output_retries)
+    return runner.run(agent.run(prompt, conversation=conversation, **kwargs))
 
 
 def stream_sync(
@@ -353,6 +374,8 @@ def stream_sync(
     prompt: str | Message | None = None,
     *,
     conversation: Conversation | None = None,
+    output_type: type[BaseModel] | None | _Unset = _UNSET,
+    output_retries: int | _Unset = _UNSET,
 ) -> Iterator[Event]:
     """Run ``agent``, yielding events as they happen.
 
@@ -372,6 +395,9 @@ def stream_sync(
             from ``conversation`` without adding a turn.
         conversation: History to read from and append to. Omit for a single-shot
             run.
+        output_type: Per-call structured output model; omit for the agent
+            default, ``None`` to disable.
+        output_retries: Per-call correction-turn budget; omit for the agent default.
 
     Returns:
         An iterator of :data:`~logpose.events.Event` values, ending with
@@ -386,7 +412,8 @@ def stream_sync(
     runner = _runner_for(agent)
     # Eager: Agent.stream validates its arguments at call time, and those errors
     # should surface here rather than at the first `next()`.
-    events = agent.stream(prompt, conversation=conversation)
+    kwargs = _output_kwargs(output_type, output_retries)
+    events = agent.stream(prompt, conversation=conversation, **kwargs)
     return _drive(runner, events)
 
 
@@ -456,13 +483,18 @@ class SyncAgent:
         prompt: str | Message | None = None,
         *,
         conversation: Conversation | None = None,
-    ) -> RunResult:
+        output_type: type[BaseModel] | None | _Unset = _UNSET,
+        output_retries: int | _Unset = _UNSET,
+    ) -> RunResult[Any]:
         """Run to completion, blocking until it finishes.
 
         Args:
             prompt: The user turn to send, or ``None`` to continue from
                 ``conversation``.
             conversation: History to read from and append to.
+            output_type: Per-call structured output model; omit for the agent
+                default, ``None`` to disable.
+            output_retries: Per-call correction-turn budget; omit for the default.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -473,13 +505,21 @@ class SyncAgent:
             MaxIterationsError: If the run exceeds the agent's iteration cap.
             ProviderError: If the provider fails or violates its contract.
         """
-        return run_sync(self.agent, prompt, conversation=conversation)
+        return run_sync(
+            self.agent,
+            prompt,
+            conversation=conversation,
+            output_type=output_type,
+            output_retries=output_retries,
+        )
 
     def stream(
         self,
         prompt: str | Message | None = None,
         *,
         conversation: Conversation | None = None,
+        output_type: type[BaseModel] | None | _Unset = _UNSET,
+        output_retries: int | _Unset = _UNSET,
     ) -> Iterator[Event]:
         """Run, yielding events as they happen.
 
@@ -487,6 +527,9 @@ class SyncAgent:
             prompt: The user turn to send, or ``None`` to continue from
                 ``conversation``.
             conversation: History to read from and append to.
+            output_type: Per-call structured output model; omit for the agent
+                default, ``None`` to disable.
+            output_retries: Per-call correction-turn budget; omit for the default.
 
         Returns:
             An iterator of :data:`~logpose.events.Event` values, ending with
@@ -496,7 +539,13 @@ class SyncAgent:
             LogposeError: If called from a thread with a running event loop, or
                 if the prompt is unusable.
         """
-        return stream_sync(self.agent, prompt, conversation=conversation)
+        return stream_sync(
+            self.agent,
+            prompt,
+            conversation=conversation,
+            output_type=output_type,
+            output_retries=output_retries,
+        )
 
     def close(self) -> None:
         """Close the provider and stop the private loop. Idempotent."""

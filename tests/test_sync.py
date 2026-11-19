@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from logpose import (
     Agent,
@@ -48,6 +49,31 @@ from logpose import (
 from logpose.providers.base import CompletionRequest, Provider, ProviderEvent
 from logpose.sync import _RUNNERS
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
+
+
+class Answer(BaseModel):
+    city: str
+    temp_c: float
+
+
+def test_run_sync_forwards_output_type() -> None:
+    provider = FakeProvider([ScriptedTurn.text('{"city": "Pune", "temp_c": 31.5}')])
+    agent = Agent(provider, model="test-model")
+    try:
+        result = run_sync(agent, "x", output_type=Answer)
+        assert result.output is not None
+        assert result.output.city == "Pune"
+    finally:
+        close_sync(agent)
+
+
+def test_sync_agent_default_output_type_applies_when_not_passed() -> None:
+    provider = FakeProvider([ScriptedTurn.text('{"city": "Pune", "temp_c": 1.0}')])
+    agent = Agent(provider, model="test-model", output_type=Answer)
+    with SyncAgent(agent) as sync_agent:
+        result = sync_agent.run("x")
+    assert isinstance(result.output, Answer)
+
 
 # ---------------------------------------------------------------------------
 # fixtures / helpers

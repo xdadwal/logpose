@@ -14,7 +14,7 @@ import json
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
     from logpose.messages import Message
@@ -27,6 +27,9 @@ __all__ = [
     "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
+    "StructuredOutputUnsupportedError",
+    "OutputValidationError",
+    "OutputRefusalError",
 ]
 
 
@@ -102,6 +105,37 @@ class ProviderError(LogposeError):
             f"error_code={self.error_code!r}, request_id={self.request_id!r}, "
             f"retry_after={self.retry_after!r}, partial={self.partial!r}, "
             f"attempts={self.attempts!r})"
+        )
+
+
+class StructuredOutputUnsupportedError(ProviderError):
+    """Raised when a server rejects a strict ``json_schema`` ``response_format``.
+
+    Never retryable: the same request will be rejected again.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        error_code: str | None = None,
+        request_id: str | None = None,
+        retry_after: float | None = None,
+        partial: bool = False,
+        attempts: int = 1,
+    ) -> None:
+        """Initialize the error; ``retryable`` is accepted but always forced to False."""
+        super().__init__(
+            message,
+            status_code=status_code,
+            retryable=False,
+            error_code=error_code,
+            request_id=request_id,
+            retry_after=retry_after,
+            partial=partial,
+            attempts=attempts,
         )
 
 
@@ -254,3 +288,52 @@ class ToolExecutionError(LogposeError):
         """
         super().__init__(message)
         self.safe_to_expose = safe_to_expose
+
+
+class OutputValidationError(LogposeError):
+    """Raised when the final answer cannot be parsed into the requested output type.
+
+    Attributes:
+        message: Human-readable description of the failure.
+        raw_text: The model's final text, as received.
+        errors: Structured validation errors.
+        messages: The full conversation accumulated so far.
+        output_type: The type the answer was meant to satisfy.
+        reason: ``"invalid"`` for a bad answer, ``"max_tokens"`` if it was truncated.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        raw_text: str,
+        errors: list[dict[str, Any]],
+        messages: list[Message],
+        output_type: type,
+        reason: Literal["invalid", "max_tokens"] = "invalid",
+    ) -> None:
+        """Initialize the error."""
+        super().__init__(message)
+        self.message = message
+        self.raw_text = raw_text
+        self.errors = errors
+        self.messages = messages
+        self.output_type = output_type
+        self.reason = reason
+
+
+class OutputRefusalError(LogposeError):
+    """Raised when the model refuses to produce the structured answer.
+
+    Attributes:
+        message: Human-readable description of the failure.
+        refusal: The model's refusal text.
+        messages: The full conversation accumulated so far.
+    """
+
+    def __init__(self, message: str, *, refusal: str, messages: list[Message]) -> None:
+        """Initialize the error."""
+        super().__init__(message)
+        self.message = message
+        self.refusal = refusal
+        self.messages = messages
