@@ -61,3 +61,34 @@ output-token ceiling sized for current reasoning models.
   `turn_timeout` recommendations, and `DEFAULT_DOCKER_BASE_URL`.
 - `examples/local_docker.py` becomes an `openai-compat` example passing the Docker
   Model Runner URL explicitly. Docs, CHANGELOG (breaking), and CI updated.
+
+## Amendment: web-app safe limits (approved 2026-11-19)
+
+Target client: a small web app where a user waits on one request. Every value
+that could run unbounded gets a safe default; `None` stays available as an
+explicit "unlimited". Tool output shares one budget of ~4k tokens per call so a
+result fits even a 32k-context model.
+
+| Setting | Default |
+|---|---|
+| `Agent(run_timeout=)` (new) | 320 s wall clock for a whole run; `None` = unlimited |
+| `Agent(provider_turn_timeout=)` | 120 s |
+| `Agent(max_tokens=)` fallback | 8192 (was 32000) |
+| `Agent(max_iterations=)` | 10 (was 25) |
+| `Agent(tool_timeout=)` | 30 s (was 300) |
+| `OpenAICompatProvider(timeout=)` | connect 5 s, read 60 s, write 10 s, pool 5 s; `None` = no HTTP timeouts |
+| `RetryPolicy` | `max_attempts=2`, `max_delay=4.0`, `max_retry_after=10.0` |
+| shell | timeout 30 s, capture 1 MB, output to model 16,000 chars |
+| `read_file` | no line cap (`max_lines=None` reads to the page limit); page 16,000 chars |
+| `list_dir` | no entry cap (`max_entries=None`); output 16,000 chars with continuation |
+| grep | output 16,000 chars |
+| `fetch_readable_text` | timeout 10 s, 1 MB, output 16,000 chars |
+| `search_duckduckgo` | timeout 10 s |
+| `make_search_tool` | output 8,000 chars |
+
+Run deadline behavior: measured from run start, including time the caller
+spends between streamed events. Each provider turn is bounded by the smaller of
+`provider_turn_timeout` and the remaining run time; tool execution is bounded
+by the remaining run time. Expiry raises `RunTimeoutError(LogposeError)`
+carrying the partial `messages` and `run_timeout`, emits a `run.timed_out`
+runtime event, and is never retried.
