@@ -270,7 +270,7 @@ async def test_max_tokens_falls_back_to_the_providers_own_ceiling() -> None:
     # A provider with no opinion gets the loop's documented default.
     bare = FakeProvider([ScriptedTurn.text("hi")])
     await Agent(bare, model="test-model").run("hello")
-    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 8192
+    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 16384
 
 
 async def test_deltas_are_re_emitted_as_public_events() -> None:
@@ -1894,7 +1894,7 @@ async def test_web_app_defaults() -> None:
     assert agent.provider_turn_timeout == 120
     assert agent.run_timeout == 320
     await agent.run("hello")
-    assert provider.last_request.max_tokens == 8192
+    assert provider.last_request.max_tokens == 16384
 
 
 async def test_run_timeout_raises_with_partial_history() -> None:

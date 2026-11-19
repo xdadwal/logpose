@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (defaults)
+
+- **Breaking:** the output ceiling is now sent as `max_completion_tokens`
+  instead of `max_tokens`, as OpenAI's reasoning models require. Use
+  `OpenAICompatProvider(max_tokens_field="max_tokens")` for servers that only
+  accept the legacy field.
+- `Agent` `max_tokens` default raised from 8192 to 16384. A full-length reply
+  can exceed the 120 s `provider_turn_timeout` on slower models; raise the
+  deadlines too if replies run that long.
+- Tool output caps reduced from 16,000 to 8,000 characters (about 2k tokens):
+  shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
+  search was already 8,000.
+
 ### Added
 
 - Structured output: `agent.run(..., output_type=Model)` (also on `stream`, the sync

@@ -52,7 +52,7 @@ def fetch_readable_text(
     get: Callable[..., requests.Response] | None = None,
     timeout: float = _REQUEST_TIMEOUT,
     max_bytes: int = 1024 * 1024,
-    output_char_cap: int | None = 16_000,
+    output_char_cap: int | None = 8_000,
     on_output: Callable[[str, bool], None] | None = None,
 ) -> str:
     """Fetch ``url`` and return its readable text, scripts/styles stripped.

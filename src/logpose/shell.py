@@ -32,7 +32,7 @@ _DEFAULT_CAPTURE_LIMIT = 1024 * 1024
 _DEFAULT_TIMEOUT = 25.0
 # Shorter than the agent's 30 s tool_timeout, so this timer fires first and the
 # model sees the partial output instead of a bare "exceeded its limit" result.
-_DEFAULT_OUTPUT_CAP = 16_000
+_DEFAULT_OUTPUT_CAP = 8_000
 
 
 def _kill_group(pid: int) -> None:

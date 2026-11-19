@@ -19,7 +19,7 @@ from logpose.tools import ToolDef, tool
 
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 _MAX_LINE = 200
-_MAX_PAGE_CHARS = 16_000
+_MAX_PAGE_CHARS = 8_000
 _TARGETS = ("content", "names", "both")
 
 
@@ -240,7 +240,7 @@ def make_grep_tool(
     *,
     name: str = "grep",
     description: str | None = None,
-    output_char_cap: int | None = 16_000,
+    output_char_cap: int | None = 8_000,
     on_output: Callable[[str], None] | None = None,
     skip_dirs: set[str] | None = None,
 ) -> ToolDef:

@@ -74,4 +74,4 @@ def test_fetch_output_is_capped_by_default():
     body = b"<p>" + b"word " * 10000 + b"</p>"
     out = fetch_readable_text("http://example.test", get=lambda *a, **k: _FakeStream(body))
     assert out.endswith("...[truncated]")
-    assert len(out) <= 16_000 + 200
+    assert len(out) <= 8_000 + 200

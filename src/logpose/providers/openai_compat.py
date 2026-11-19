@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import AsyncIterator, Mapping
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -345,6 +345,9 @@ class OpenAICompatProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         max_tokens: int | None = None,
+        max_tokens_field: Literal["max_completion_tokens", "max_tokens"] = (
+            "max_completion_tokens"
+        ),
         timeout: float | httpx.Timeout | None = DEFAULT_HTTP_TIMEOUT,
         parse_think_tags: bool = True,
         default_headers: dict[str, str] | None = None,
@@ -364,6 +367,10 @@ class OpenAICompatProvider:
                 env var is set.
             max_tokens: Output-token ceiling for a turn, or ``None`` to let the
                 agent decide.
+            max_tokens_field: Request field that carries the output ceiling.
+                ``"max_completion_tokens"`` (default) is what OpenAI, vLLM and
+                llama.cpp expect, and OpenAI reasoning models require it. Use
+                ``"max_tokens"`` for servers that only accept the legacy field.
             timeout: httpx timeout. Defaults to :data:`DEFAULT_HTTP_TIMEOUT`
                 (connect 5 s, read 60 s, write 10 s, pool 5 s); ``None`` disables
                 every HTTP timeout.
@@ -390,7 +397,13 @@ class OpenAICompatProvider:
             timeout = httpx.Timeout(None)
 
         self.base_url = resolved_base.rstrip("/")
+        if max_tokens_field not in ("max_completion_tokens", "max_tokens"):
+            raise LogposeError(
+                "max_tokens_field must be 'max_completion_tokens' or 'max_tokens'; "
+                f"got {max_tokens_field!r}."
+            )
         self.max_tokens = max_tokens
+        self.max_tokens_field = max_tokens_field
         self.parse_think_tags = parse_think_tags
         self.preserve_reasoning = preserve_reasoning
         # An explicit api_key always wins, and a blank one means "no auth": it is
@@ -571,7 +584,7 @@ class OpenAICompatProvider:
             "messages": _messages_to_wire(
                 req.messages, req.system, preserve_reasoning=self.preserve_reasoning
             ),
-            "max_tokens": req.max_tokens,
+            self.max_tokens_field: req.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
