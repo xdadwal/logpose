@@ -80,7 +80,6 @@ class LoopProbeProvider:
     """Wraps a provider and records the loop each turn ran on."""
 
     name = "loop-probe"
-    model_default = "loop-probe-1"
 
     def __init__(self, inner: Provider) -> None:
         self.inner = inner
@@ -98,7 +97,6 @@ class BlockingToolProvider:
     """Asks for one tool forever; used to test cancellation of in-flight tools."""
 
     name = "blocking"
-    model_default = "blocking-1"
 
     def __init__(self) -> None:
         self.calls = 0
@@ -114,6 +112,7 @@ class BlockingToolProvider:
 def _fresh_agent(*turns: ScriptedTurn, **kwargs: Any) -> tuple[Agent, FakeProvider]:
     """Build an agent over a scripted FakeProvider."""
     provider = FakeProvider(list(turns))
+    kwargs.setdefault("model", "test-model")
     return Agent(provider, **kwargs), provider
 
 
@@ -231,7 +230,7 @@ def test_run_sync_propagates_max_iterations_with_partial_history() -> None:
         [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}))],
         repeat_last=True,
     )
-    agent = Agent(provider, tools=[add], max_iterations=2)
+    agent = Agent(provider, model="test-model", tools=[add], max_iterations=2)
     try:
         with pytest.raises(MaxIterationsError) as excinfo:
             run_sync(agent, "loop forever")
@@ -255,7 +254,7 @@ def test_run_sync_reuses_one_loop_across_calls() -> None:
     probe = LoopProbeProvider(
         FakeProvider([ScriptedTurn.text("one"), ScriptedTurn.text("two")]),
     )
-    agent = Agent(probe)
+    agent = Agent(probe, model="test-model")
     try:
         run_sync(agent, "a")
         run_sync(agent, "b")
@@ -271,7 +270,7 @@ def test_run_sync_reuses_one_loop_across_calls() -> None:
 def test_each_agent_gets_its_own_loop() -> None:
     probe_a = LoopProbeProvider(FakeProvider([ScriptedTurn.text("a")]))
     probe_b = LoopProbeProvider(FakeProvider([ScriptedTurn.text("b")]))
-    agent_a, agent_b = Agent(probe_a), Agent(probe_b)
+    agent_a, agent_b = Agent(probe_a, model="test-model"), Agent(probe_b, model="test-model")
     try:
         run_sync(agent_a, "x")
         run_sync(agent_b, "y")
@@ -387,7 +386,7 @@ def test_breaking_at_a_tool_call_closes_without_running_the_tool() -> None:
         await asyncio.sleep(30)
         return "never"  # pragma: no cover
 
-    agent = Agent(BlockingToolProvider(), tools=[block])
+    agent = Agent(BlockingToolProvider(), model="test-model", tools=[block])
     try:
         events = stream_sync(agent, "go")
         seen: list[Any] = []
@@ -417,7 +416,7 @@ def test_iterating_after_close_raises_a_clear_error() -> None:
 
 def test_stream_sync_after_close_starts_a_new_loop() -> None:
     probe = LoopProbeProvider(FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]))
-    agent = Agent(probe)
+    agent = Agent(probe, model="test-model")
     try:
         run_sync(agent, "one")
         close_sync(agent)
@@ -444,7 +443,7 @@ def test_sync_agent_run_and_stream() -> None:
 
 def test_sync_agent_shares_the_runner_with_the_free_functions() -> None:
     probe = LoopProbeProvider(FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]))
-    agent = Agent(probe)
+    agent = Agent(probe, model="test-model")
     sync_agent = SyncAgent(agent)
     try:
         run_sync(agent, "one")
@@ -477,7 +476,7 @@ def test_close_closes_a_provider_the_agent_built() -> None:
 
     provider = ClosableProvider([ScriptedTurn.text("hi")])
     with _registered("closable-test", lambda **kwargs: provider):
-        agent = Agent("closable-test")
+        agent = Agent("closable-test", model="test-model")
         with SyncAgent(agent) as sync_agent:
             sync_agent.run("hello")
     assert closed == ["yes"]
@@ -490,7 +489,7 @@ def test_close_leaves_an_injected_provider_alone() -> None:
         async def aclose(self) -> None:
             closed.append("yes")
 
-    agent = Agent(ClosableProvider([ScriptedTurn.text("hi")]))
+    agent = Agent(ClosableProvider([ScriptedTurn.text("hi")]), model="test-model")
     with SyncAgent(agent) as sync_agent:
         sync_agent.run("hello")
     assert closed == []
@@ -603,7 +602,7 @@ def test_concurrent_callers_share_one_agent_safely() -> None:
     probe = LoopProbeProvider(
         FakeProvider([ScriptedTurn.text(f"answer {i}", delay=0.01) for i in range(6)]),
     )
-    agent = Agent(probe)
+    agent = Agent(probe, model="test-model")
     results: dict[int, str] = {}
     errors: list[BaseException] = []
 

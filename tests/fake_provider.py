@@ -14,7 +14,7 @@ tests can assert on what the loop actually sent.
             ScriptedTurn.text("The answer is 3."),
         ]
     )
-    agent = Agent(provider, tools=[add])
+    agent = Agent(provider, model="test-model", tools=[add])
     result = await agent.run("what is 1 + 2?")
 
     assert provider.call_count == 2
@@ -238,8 +238,6 @@ class FakeProvider:
 
     Attributes:
         name: Provider name reported to the loop.
-        model_default: Model reported to the loop when the agent has no
-            ``model=`` override. Part of the ``Provider`` protocol.
         turns: The scripted turns, one per request.
         repeat_last: Whether to replay the final turn once the script runs out.
         requests: Every :class:`~logpose.providers.base.CompletionRequest`
@@ -248,14 +246,12 @@ class FakeProvider:
     """
 
     name: str = "fake"
-    model_default: str = "fake-model"
 
     def __init__(
         self,
         turns: Sequence[ScriptedTurn] | ScriptedTurn = (),
         *,
         name: str = "fake",
-        model_default: str = "fake-model",
         repeat_last: bool = False,
     ) -> None:
         """Initialize the double.
@@ -264,14 +260,11 @@ class FakeProvider:
             turns: Turns to replay, one per request. A bare
                 :class:`ScriptedTurn` is accepted for the single-turn case.
             name: Provider name reported to the loop.
-            model_default: Model reported when the agent has no override. Pass
-                ``""`` to script a provider that declares no default.
             repeat_last: Replay the final turn forever once the script is
                 exhausted, instead of raising ``AssertionError``.
         """
         self.turns: list[ScriptedTurn] = [turns] if isinstance(turns, ScriptedTurn) else list(turns)
         self.name = name
-        self.model_default = model_default
         self.repeat_last = repeat_last
         self.requests: list[CompletionRequest] = []
         self.closed = 0

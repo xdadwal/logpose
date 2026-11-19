@@ -24,7 +24,7 @@ async def test_persistence_failure_aborts_without_repeating_handler(phase, expec
         if event.phase == phase:
             raise OSError("storage unavailable")
 
-    agent = Agent(FakeProvider(), tools=[effect], tool_observer=persist)
+    agent = Agent(FakeProvider(), model="test-model", tools=[effect], tool_observer=persist)
     context = RuntimeContext(run_id="run", provider="fake", model="fake")
     with pytest.raises(ToolObservationError) as error:
         await agent._execute([ToolUseBlock(id="call", name="effect", input={})], context)
@@ -50,7 +50,9 @@ async def test_live_loop_stops_before_next_model_request_on_outcome_failure():
         [ScriptedTurn.tool_use(tool_call("effect", {})), ScriptedTurn.text("should not run")]
     )
     with pytest.raises(ToolObservationError):
-        await Agent(provider, tools=[effect], tool_observer=persist).run("execute")
+        await Agent(provider, model="test-model", tools=[effect], tool_observer=persist).run(
+            "execute"
+        )
     assert provider.call_count == 1
 
 
@@ -71,7 +73,9 @@ async def test_denied_tool_is_not_journaled():
     async def deny(call):
         return ToolGateResult("denied")
 
-    agent = Agent(FakeProvider(), tools=[effect], on_tool_call=deny, tool_observer=persist)
+    agent = Agent(
+        FakeProvider(), model="test-model", tools=[effect], on_tool_call=deny, tool_observer=persist
+    )
     await agent._execute(
         [ToolUseBlock(id="call", name="effect", input={})],
         RuntimeContext(run_id="run", provider="fake", model="fake"),
@@ -95,7 +99,7 @@ async def test_observer_mutation_cannot_change_execution_or_result():
         if event.result is not None:
             event.result.content = "changed"
 
-    agent = Agent(FakeProvider(), tools=[echo], tool_observer=persist)
+    agent = Agent(FakeProvider(), model="test-model", tools=[echo], tool_observer=persist)
     call = ToolUseBlock(id="call", name="echo", input={"value": "original"})
     result = await agent._execute(
         [call], RuntimeContext(run_id="run", provider="fake", model="fake")
@@ -134,7 +138,7 @@ async def test_batch_persistence_failure_drains_synchronous_sibling():
             raise OSError("unavailable")
         observed.append((event.call.id, event.phase))
 
-    agent = Agent(FakeProvider(), tools=[slow, other], tool_observer=persist)
+    agent = Agent(FakeProvider(), model="test-model", tools=[slow, other], tool_observer=persist)
     with pytest.raises(ToolObservationError):
         await agent._execute(
             [

@@ -135,7 +135,6 @@ __all__ = [
     "RuntimeObserver",
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
-    "DEFAULT_PROVIDER_TURN_TIMEOUT",
     "DEFAULT_MAX_CONCURRENT_TOOLS",
     "DEFAULT_TOOL_TIMEOUT",
     "EMPTY_TOOL_RESULT",
@@ -146,16 +145,14 @@ __all__ = [
 DEFAULT_MAX_ITERATIONS = 25
 """Provider round trips a single run may take before it gives up."""
 
-DEFAULT_MAX_TOKENS = 16000
+DEFAULT_MAX_TOKENS = 32000
 """Output-token ceiling used when neither the agent nor the provider names one.
 
 An explicit ``Agent(max_tokens=...)`` wins; failing that the provider's own
 ``max_tokens`` is honoured, so configuring a provider to cap output cost is not
-silently overridden.
+silently overridden. Sized so a current reasoning model has room to think
+and still answer; lower it for small-context local models.
 """
-
-DEFAULT_PROVIDER_TURN_TIMEOUT = 900.0
-"""Fallback deadline, in seconds, for one complete cloud provider turn."""
 
 DEFAULT_MAX_CONCURRENT_TOOLS = 8
 """Maximum tool handlers one agent executes at once across concurrent runs."""
@@ -339,7 +336,7 @@ class Agent:
 
     Attributes:
         provider: The backend this agent drives.
-        model: Model override, or ``None`` to use the provider's default.
+        model: Model identifier sent with every request.
         system: System prompt sent with every turn.
         tools: The tools advertised to the model.
         max_iterations: Provider round trips allowed per run, or ``None`` for no cap.
@@ -353,13 +350,13 @@ class Agent:
         self,
         provider: Provider | str,
         *,
-        model: str | None = None,
+        model: str,
         system: str | None = None,
         tools: Sequence[ToolDef] = (),
         max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
-        provider_turn_timeout: float | None | Literal["default"] = "default",
+        provider_turn_timeout: float | None = None,
         max_concurrent_tools: int = DEFAULT_MAX_CONCURRENT_TOOLS,
         tool_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
         tool_error_mode: ToolErrorMode = "safe",
@@ -376,8 +373,8 @@ class Agent:
         Args:
             provider: A provider instance, or the name of a registered one
                 (see :func:`logpose.providers.resolve`).
-            model: Model identifier. Defaults to the provider's own
-                ``model_default``.
+            model: Model identifier sent with every request. Required;
+                ``"auto"`` asks an OpenAI-compatible server for its first model.
             system: System prompt sent with every turn.
             tools: Tools the model may call, built with :func:`logpose.tools.tool`.
             max_iterations: Maximum provider round trips per run. Exceeding it
@@ -392,9 +389,8 @@ class Agent:
             retry_policy: Provider retry timing. Retryable failures are replayed
                 only before a text or reasoning delta reaches the caller;
                 ``RetryPolicy(max_attempts=1)`` disables retries.
-            provider_turn_timeout: Complete-turn deadline in seconds. The
-                default uses the provider's recommendation; ``None`` disables
-                the deadline.
+            provider_turn_timeout: Complete-turn deadline in seconds, or
+                ``None`` (the default) for no deadline.
             max_concurrent_tools: Tool handlers this agent may execute at once,
                 across all of its concurrent runs. Extra calls wait for capacity.
             tool_timeout: Execution deadline in seconds after a call acquires
@@ -449,12 +445,15 @@ class Agent:
             raise LogposeError(
                 f"retry_policy must be a RetryPolicy, got {type(retry_policy).__name__}."
             )
-        if provider_turn_timeout != "default" and (
-            provider_turn_timeout is not None
-            and (not isinstance(provider_turn_timeout, (int, float)) or provider_turn_timeout <= 0)
+        if not isinstance(model, str) or not model.strip():
+            raise LogposeError(f"model must be a non-empty string, got {model!r}.")
+        if provider_turn_timeout is not None and (
+            isinstance(provider_turn_timeout, bool)
+            or not isinstance(provider_turn_timeout, (int, float))
+            or provider_turn_timeout <= 0
         ):
             raise LogposeError(
-                "provider_turn_timeout must be a positive number, None, or 'default'; "
+                "provider_turn_timeout must be a positive number or None; "
                 f"got {provider_turn_timeout!r}."
             )
         if (
@@ -498,7 +497,7 @@ class Agent:
             if not isinstance(provider, Provider):
                 raise LogposeError(
                     f"{type(provider).__name__} does not implement the Provider protocol; "
-                    "it needs 'name' and 'model_default' attributes and a 'stream' method."
+                    "it needs a 'name' attribute and a 'stream' method."
                 )
             self.provider = provider
             self._owns_provider = False
@@ -563,8 +562,7 @@ class Agent:
             The completed :class:`~logpose.events.RunResult`.
 
         Raises:
-            LogposeError: If there is nothing to send, if no model could be
-                resolved (no ``model=`` and no provider ``model_default``), or if
+            LogposeError: If there is nothing to send, or if
                 ``on_tool_call`` returns an unsupported type.
             MaxIterationsError: If the run exceeds ``max_iterations``. The
                 partial conversation is attached to the error.
@@ -1052,13 +1050,8 @@ class Agent:
         )
 
     def _turn_timeout(self) -> float | None:
-        """Resolve the complete-turn deadline for the selected provider."""
-        if self.provider_turn_timeout != "default":
-            return self.provider_turn_timeout
-        candidate = getattr(self.provider, "turn_timeout", DEFAULT_PROVIDER_TURN_TIMEOUT)
-        if isinstance(candidate, (int, float)) and candidate > 0:
-            return float(candidate)
-        return DEFAULT_PROVIDER_TURN_TIMEOUT
+        """Return the complete-turn deadline, or ``None`` for no deadline."""
+        return self.provider_turn_timeout
 
     async def _prepare_request(self, history: Sequence[Message]) -> CompletionRequest:
         """Await selection before inference; isolate policy mutation from canonical data."""
@@ -1113,9 +1106,6 @@ class Agent:
         Returns:
             The :class:`~logpose.providers.base.CompletionRequest` to send.
 
-        Raises:
-            LogposeError: If no model could be resolved. Sending an empty model
-                would fail as an opaque provider 400 on the first live request.
         """
         return CompletionRequest(
             messages=list(history),
@@ -1127,23 +1117,8 @@ class Agent:
         )
 
     def _model(self) -> str:
-        """Resolve the model identifier for a request.
-
-        Returns:
-            The explicit ``model=`` override, else the provider's
-            ``model_default``.
-
-        Raises:
-            LogposeError: If neither yields a non-empty string.
-        """
-        model = self.model or str(getattr(self.provider, "model_default", "") or "")
-        if not model.strip():
-            raise LogposeError(
-                f"Provider {self.provider_name!r} has no usable model_default; "
-                f"pass model=... to Agent, or give the provider a non-empty "
-                "model_default attribute."
-            )
-        return model
+        """Return the model identifier sent with every request."""
+        return self.model
 
     def _max_tokens(self) -> int:
         """Resolve the output-token ceiling for a request.

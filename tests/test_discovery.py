@@ -141,7 +141,7 @@ def test_a_re_exported_tool_is_returned_once():
 
 def test_a_re_exported_tool_does_not_trip_the_agent_duplicate_check():
     """The point of identity dedupe: the result must be Agent-compatible."""
-    agent = Agent(FakeProvider(), tools=discover_tools(PKG))
+    agent = Agent(FakeProvider(), model="test-model", tools=discover_tools(PKG))
     assert "alpha" in {t.name for t in agent.tools}
 
 
@@ -300,7 +300,7 @@ async def test_discovered_tools_reach_the_provider_and_can_be_called():
             ScriptedTurn.text("done"),
         ]
     )
-    agent = Agent(provider, tools=discover_tools(PKG))
+    agent = Agent(provider, model="test-model", tools=discover_tools(PKG))
     result = await agent.run("go")
 
     advertised = {spec.name for spec in provider.requests[0].tools}
