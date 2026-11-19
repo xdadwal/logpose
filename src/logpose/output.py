@@ -16,7 +16,7 @@ import re
 import types
 from typing import Any, TypeVar, Union, get_args, get_origin
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 __all__ = [
     "OutputParseFailure",
@@ -134,8 +134,11 @@ def _strip_value(annotation: Any, value: Any) -> Any:
             if arg is type(None):
                 continue
             stripped = _strip_value(arg, value)
-            if stripped is not value:
-                return stripped
+            try:
+                TypeAdapter(arg).validate_python(stripped)
+            except ValidationError:
+                continue
+            return stripped
         return value
     if origin in (list, set, frozenset) and isinstance(value, list) and args:
         return [_strip_value(args[0], v) for v in value]

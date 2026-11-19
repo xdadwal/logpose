@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from pydantic import BaseModel, create_model
+from pydantic import BaseModel, Field, create_model
 
 from logpose.output import (
     OutputParseFailure,
@@ -93,3 +93,57 @@ def test_format_errors_lists_paths() -> None:
     with pytest.raises(OutputParseFailure) as exc:
         parse_output(Order, '{"customer": "a", "items": [{"qty": 2}]}')
     assert "items.0.name: " in format_errors(exc.value.errors)
+
+
+class A(BaseModel):
+    a: str
+
+
+class B(BaseModel):
+    b: str
+    n: int = 5
+
+
+class Holder(BaseModel):
+    x: A | B
+
+
+class Registry(BaseModel):
+    by_name: dict[str, Item]
+
+
+class Batch(BaseModel):
+    rows: tuple[Item, ...]
+
+
+class Aliased(BaseModel):
+    qty: int = Field(default=7, alias="Qty")
+
+
+class Wrapper(BaseModel):
+    inner: Item | None = None
+
+
+def test_union_of_models_picks_the_fitting_arm() -> None:
+    out = parse_output(Holder, '{"x":{"b":"q","n":null}}')
+    assert out.x == B(b="q", n=5)
+
+
+def test_dict_of_models_strips_nested_nulls() -> None:
+    out = parse_output(Registry, '{"by_name":{"k":{"name":"x","qty":null}}}')
+    assert out.by_name["k"].qty == 1
+
+
+def test_tuple_of_models_strips_nested_nulls() -> None:
+    out = parse_output(Batch, '{"rows":[{"name":"x","qty":null}]}')
+    assert out.rows[0].qty == 1
+
+
+def test_aliased_defaulted_field_null_takes_default() -> None:
+    assert parse_output(Aliased, '{"Qty":null}').qty == 7
+
+
+def test_optional_model_field_null_and_nested_null() -> None:
+    assert parse_output(Wrapper, '{"inner":null}').inner is None
+    out = parse_output(Wrapper, '{"inner":{"name":"x","qty":null}}')
+    assert out.inner == Item(name="x", qty=1)
