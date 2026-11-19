@@ -174,9 +174,10 @@ handle lost, and the final save is refused as below.
   `logpose.db` in the process's working directory. Blank counts as unset,
   matching the other `LOGPOSE_*` variables. The parent directory is created if
   missing.
-- **Lifecycle:** one store per path per process, created and opened (schema
-  migrated) lazily on first session use, and shared by every `Agent` in that
-  process. Closed at `Agent.aclose()` of the last agent using it, or at
+- **Lifecycle:** one store per (path, event loop), because an aiosqlite
+  connection is bound to its loop and the sync facade runs a private loop.
+  Created and opened (schema migrated) lazily on first session use, and shared
+  by every `Agent` on that loop. Closed at `Agent.aclose()` of the last agent using it, or at
   interpreter exit; best effort.
 - **No public store parameter.** `Agent` has no `store=` argument. Tests point
   `LOGPOSE_DB_PATH` at a temporary file. A private constructor hook for

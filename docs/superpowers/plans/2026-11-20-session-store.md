@@ -136,7 +136,7 @@
 **Interfaces:**
 - **Consumes:** the Task 2 and 3 store APIs.
 - **Produces:**
-  - `manager.get_store() -> SessionStore`. Async; resolves the path from `LOGPOSE_DB_PATH` (or `logpose.db`); one opened store per absolute path per process, guarded by an `asyncio.Lock`; imports `aiosqlite` lazily.
+  - `manager.get_store() -> SessionStore`. Async; resolves the path from `LOGPOSE_DB_PATH` (or `logpose.db`); one opened store **per (absolute path, running event loop)**, because an aiosqlite connection is bound to its loop and the sync facade runs a private loop. Creation is guarded per key; `aiosqlite` is imported lazily. `Agent.aclose()` closes the stores this agent opened.
   - `manager.reset_stores_for_tests()`, which is private.
   - `Agent(..., session_wait: float = 0.0)`.
   - `Agent.session(session_id, *, metadata=None) -> AsyncContextManager[SessionHandle]`.
