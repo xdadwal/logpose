@@ -196,15 +196,13 @@ openai_decision_guard(
 4. **The run deadline during guards** raises `RunTimeoutError` (session outcome
    `run_timeout`), the same as a deadline anywhere else in the run. It is not a
    block.
-5. **Non-text prompts:**
-   - the guard sees the prompt's text blocks, concatenated with newlines, plus
-     its images;
-   - `openai_decision_guard` forwards images as `input_image` (the Decisions API
-     accepts them);
-   - `pattern_guard` checks only the text;
-   - a prompt with neither text nor images (for example tool results only)
-     skips the guards;
-   - for `recent`, only text is sent.
+5. **Text only.** logpose messages have no image blocks, and the owner excluded
+   multimodal input.
+   - The guard sees the prompt's text blocks, concatenated with newlines.
+   - A prompt with no text (for example tool results only) skips the guards.
+   - For `recent`, only user and assistant **text** is sent. Messages with only
+     tool calls or tool results are skipped, and still count toward `history`
+     only if they contain text.
 6. **Usage counts everything the Decisions response reports:** `input_tokens`,
    `output_tokens`, and `output_tokens_details.reasoning_tokens` are mapped into
    `Usage` (cached input goes to `cache_read_input_tokens`), and added to the
