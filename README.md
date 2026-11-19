@@ -69,9 +69,8 @@ Point logpose at any Chat Completions server, such as OpenAI, vLLM, Ollama, LM
 Studio, llama.cpp, or OpenRouter:
 
 ```bash
-export OPENAI_BASE_URL=https://api.openai.com/v1
-export OPENAI_MODEL=gpt-5.1
-export OPENAI_API_KEY=sk-...   # omit for a local server that needs no key
+export LOGPOSE_BASE_URL=https://api.openai.com/v1
+export LOGPOSE_API_KEY=sk-...   # omit for a local server that needs no key
 ```
 
 Then create a tool and run an agent:
@@ -97,6 +96,7 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
 async def main() -> None:
     agent = Agent(
         "openai-compat",
+        model="gpt-5.1",
         tools=[get_weather],
         system="Answer in one concise sentence.",
     )
@@ -122,33 +122,19 @@ A runnable streaming version is available in
 
 Each provider name selects an explicit backend and credential type.
 
-Every built-in provider speaks the OpenAI Chat Completions API.
+logpose ships one provider, `openai-compat`, for any server speaking the OpenAI
+Chat Completions API, local or hosted (including OpenAI).
 
-| Provider | Use case | Authentication |
+logpose makes no assumptions about your server. The application supplies:
+
+| Setting | How | If missing |
 | --- | --- | --- |
-| `openai-compat` | Any Chat Completions server, local or hosted (including OpenAI) | Optional, server-dependent |
-| `docker` | Models hosted locally by Docker Model Runner | None |
+| Model | `Agent(model=...)` (required) | `TypeError`; `model="auto"` uses the server's first listed model |
+| Endpoint | `base_url=` or `LOGPOSE_BASE_URL` | `LogposeError` at construction |
+| API key | `api_key=` or `LOGPOSE_API_KEY` | no `Authorization` header (fine for local servers) |
 
-Credentials may be passed directly to `Agent`, which takes precedence over the
-corresponding environment variable.
-
-### Docker Model Runner
-
-Enable Docker Model Runner and pull a tool-capable model:
-
-```bash
-docker desktop enable model-runner --tcp 12434
-docker model pull ai/gemma4
-docker model ls
-```
-
-```python
-agent = Agent("docker", tools=[get_weather])
-```
-
-With no `model=`, logpose selects the first model returned by the runner. Use
-`DOCKER_MODEL` to pin a model and `DOCKER_MODEL_RUNNER_URL` to change the endpoint.
-See [`examples/local_docker.py`](examples/local_docker.py) for a complete example.
+Arguments take precedence over environment variables. Blank environment values
+count as unset.
 
 ### OpenAI-compatible servers
 
@@ -158,16 +144,34 @@ OpenAI itself and local or hosted deployments:
 ```python
 agent = Agent(
     "openai-compat",
-    base_url="http://localhost:8000/v1",
     model="my-tool-capable-model",
+    base_url="http://localhost:8000/v1",
     api_key="optional-server-key",
     tools=[get_weather],
 )
 ```
 
-The same values can be set with `OPENAI_BASE_URL`, `OPENAI_MODEL`, and
-`OPENAI_API_KEY`. The `docker` provider intentionally does not read
-`OPENAI_API_KEY`.
+Docker Model Runner, Ollama, and other local servers work the same way. For
+example, with Docker Model Runner enabled (`docker desktop enable model-runner
+--tcp 12434`):
+
+```python
+agent = Agent(
+    "openai-compat",
+    model="auto",
+    base_url="http://localhost:12434/engines/v1",
+    max_tokens=4096,
+)
+```
+
+See [`examples/local_docker.py`](examples/local_docker.py) for a complete example.
+
+### Output limit
+
+Each turn's output ceiling defaults to 32000 tokens, so current reasoning models
+have room to think and still answer. Small local models often have smaller
+context windows; lower it with `Agent(max_tokens=...)` or
+`OpenAICompatProvider(max_tokens=...)`.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
 so by default reasoning is not sent back on later turns. For servers that accept
@@ -216,6 +220,7 @@ from logpose import Agent, RetryPolicy
 
 agent = Agent(
     "openai-compat",
+    model="gpt-5.1",
     retry_policy=RetryPolicy(max_attempts=3),
 )
 ```
@@ -235,18 +240,22 @@ not a deadline for the entire run.
 
 ### Provider deadlines
 
-Each provider turn has a complete-turn deadline in addition to its transport
-timeouts: 15 minutes for cloud and generic providers, and 30 minutes for Docker
-Model Runner. A timeout before any delta can use the retry policy; a timeout
-after output is partial and is not replayed.
-
-Override the selected provider's recommendation, or disable the complete-turn
-deadline explicitly:
+logpose sets no provider deadlines by default: no complete-turn deadline and no
+HTTP timeouts. Set them for your deployment:
 
 ```python
-agent = Agent("openai-compat", provider_turn_timeout=600)
-agent = Agent("docker", provider_turn_timeout=None)
+import httpx
+
+agent = Agent(
+    "openai-compat",
+    model="gpt-5.1",
+    provider_turn_timeout=600,
+    timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10),
+)
 ```
+
+A turn timeout before any delta can use the retry policy; a timeout after output
+is partial and is not replayed.
 
 Providers also accept `timeout=` for connection, pool, write, and idle-read
 settings.
@@ -293,7 +302,7 @@ tools:
 from logpose import Agent, discover_tools
 
 tools = discover_tools("myapp.tools", "myapp.integrations")
-agent = Agent("openai-compat", tools=tools)
+agent = Agent("openai-compat", model="gpt-5.1", tools=tools)
 ```
 
 It deduplicates re-exported tools and reports conflicting names. Because discovery
@@ -312,7 +321,7 @@ def approve(call):
     return None
 
 
-agent = Agent("openai-compat", tools=[...], on_tool_call=approve)
+agent = Agent("openai-compat", model="gpt-5.1", tools=[...], on_tool_call=approve)
 ```
 
 The gate sees calls in wire order before any tool in that turn starts. Return
@@ -331,6 +340,7 @@ acquires a slot:
 ```python
 agent = Agent(
     "openai-compat",
+    model="gpt-5.1",
     tools=[get_weather],
     max_concurrent_tools=8,
     tool_timeout=300,
@@ -353,7 +363,7 @@ Use `tool_error_mode="message"` or `tool_error_mode="traceback"` only when the
 model is allowed to see that diagnostic detail:
 
 ```python
-agent = Agent("openai-compat", tools=[get_weather], tool_error_mode="message")
+agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather], tool_error_mode="message")
 ```
 
 For application-specific redaction, supply a formatter. It receives raw failure
@@ -368,7 +378,7 @@ def tool_error(context: ToolErrorContext) -> str:
     return f"{context.tool_name} failed; reference {context.error_id}."
 
 
-agent = Agent("openai-compat", tools=[get_weather], tool_error_formatter=tool_error)
+agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather], tool_error_formatter=tool_error)
 ```
 
 ## Runtime observability
@@ -424,7 +434,7 @@ def lookup_customer(customer_id: str) -> str:
     return "..."
 
 
-agent = Agent("openai-compat", tools=[lookup_customer], observers=[metrics])
+agent = Agent("openai-compat", model="gpt-5.1", tools=[lookup_customer], observers=[metrics])
 ```
 
 `current_runtime_context()` returns `None` outside runtime execution. Within a
@@ -438,7 +448,7 @@ Pass a `Conversation` to retain history across calls:
 ```python
 from logpose import Agent, Conversation
 
-agent = Agent("openai-compat", tools=[get_weather])
+agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather])
 conversation = Conversation()
 
 await agent.run("My name is Ada.", conversation=conversation)
@@ -456,7 +466,7 @@ state in the history.
 ```python
 from logpose import Agent, SyncAgent
 
-with SyncAgent(Agent("openai-compat", tools=[get_weather])) as agent:
+with SyncAgent(Agent("openai-compat", model="gpt-5.1", tools=[get_weather])) as agent:
     result = agent.run("What is the weather in Pune?")
     print(result.text)
 ```
@@ -488,16 +498,15 @@ models = await resolve("openai-compat").list_models()
 
 ## Configuration reference
 
-| Provider | Model | Endpoint | Other |
+| Provider | Model | Endpoint | Credential |
 | --- | --- | --- | --- |
-| `openai-compat` | `OPENAI_MODEL` | `OPENAI_BASE_URL` | optional `OPENAI_API_KEY` |
-| `docker` | `DOCKER_MODEL` | `DOCKER_MODEL_RUNNER_URL` | no credential |
+| `openai-compat` | `Agent(model=)` | `base_url=` / `LOGPOSE_BASE_URL` | optional `api_key=` / `LOGPOSE_API_KEY` |
 
 Provider-specific request fields that logpose does not model can be passed with
 `extra=`:
 
 ```python
-agent = Agent("openai-compat", extra={"tool_choice": "required"})
+agent = Agent("openai-compat", model="gpt-5.1", extra={"tool_choice": "required"})
 ```
 
 ## Errors
@@ -532,7 +541,6 @@ from logpose import CompletionDone, CompletionRequest, ProviderEvent, register
 
 class MyProvider:
     name = "mine"
-    model_default = "my-model-1"
 
     async def stream(self, request: CompletionRequest) -> AsyncIterator[ProviderEvent]:
         ...

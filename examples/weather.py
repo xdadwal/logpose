@@ -8,9 +8,9 @@ Run it
 Point it at any Chat Completions server — OpenAI, vLLM, Ollama, LM Studio,
 llama.cpp, OpenRouter, and so on::
 
-    export OPENAI_BASE_URL=https://api.openai.com/v1
-    export OPENAI_MODEL=gpt-5.1
-    export OPENAI_API_KEY=sk-...          # omit for a local server that needs none
+    export LOGPOSE_BASE_URL=https://api.openai.com/v1
+    export LOGPOSE_API_KEY=sk-...         # omit for a local server that needs none
+    export MODEL=gpt-5.1                  # this example's own setting
     uv run python examples/weather.py
 
 Expected output: a couple of thinking/text deltas, a ``get_weather`` tool call
@@ -20,6 +20,7 @@ and its result, then a final answer and a non-zero token count.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from typing import Literal
 
@@ -57,13 +58,20 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
 
 
 def build_agent() -> Agent:
-    """Build the agent for this example from the ``OPENAI_*`` environment.
+    """Build the agent for this example.
+
+    logpose reads the endpoint and key from ``LOGPOSE_*``; the model is the
+    application's choice, so this example reads its own ``$MODEL``.
 
     Returns:
         A configured :class:`~logpose.Agent`.
     """
+    model = os.environ.get("MODEL", "").strip()
+    if not model:
+        raise LogposeError("Set MODEL to the model this example should use.")
     return Agent(
         "openai-compat",
+        model=model,
         tools=[get_weather],
         system="You are a terse weather assistant.",
         max_iterations=8,
@@ -108,7 +116,7 @@ async def main() -> int:
                 )
     except AuthError as exc:
         print(f"\nauth failed: {exc}", file=sys.stderr)
-        print("Check OPENAI_API_KEY.", file=sys.stderr)
+        print("Check LOGPOSE_API_KEY.", file=sys.stderr)
         return 2
     except LogposeError as exc:
         print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)

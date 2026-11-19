@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `Agent(model=...)` is required; a blank model raises
+  `LogposeError`. Model discovery happens only for an explicit `model="auto"`.
+- **Breaking:** `Agent` defaults to `max_tokens=32000`, sized for current
+  reasoning models; the provider's former 4096 default is gone. Lower it for
+  small-context local models.
+- **Breaking:** no provider deadlines by default. `Agent(provider_turn_timeout=)`
+  defaults to `None` (the `"default"` sentinel is rejected), and
+  `OpenAICompatProvider(timeout=None)` disables HTTP timeouts.
+
 ### Removed
 
+- **Breaking:** the `docker` provider and its `docker-models` alias. Point
+  `openai-compat` at Docker Model Runner instead:
+  `Agent("openai-compat", model="auto", base_url="http://localhost:12434/engines/v1")`.
+- **Breaking:** all provider-specific defaults. `openai-compat` no longer reads
+  `OPENAI_BASE_URL`, `OPENAI_MODEL`, `OPENAI_API_KEY`, or `DOCKER_*`, and its
+  `api_key_env` and `model` arguments are gone. It reads only
+  `LOGPOSE_BASE_URL` and `LOGPOSE_API_KEY`; blank values count as unset.
+- **Breaking:** `Provider.model_default` is no longer part of the provider
+  protocol, and `DEFAULT_PROVIDER_TURN_TIMEOUT`, `DEFAULT_CLOUD_TURN_TIMEOUT`,
+  `DEFAULT_LOCAL_TURN_TIMEOUT`, and `LOCAL_TURN_TIMEOUT_MULTIPLIER` are removed.
 - **Breaking:** logpose now ships only OpenAI-compatible Chat Completions
   backends: `openai-compat` and `docker`. Removed the `anthropic`, `claude-code`,
   `openai` (Responses API), `codex`, and `zai` providers, the Z.ai MCP web-search

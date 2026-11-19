@@ -34,7 +34,8 @@ Concrete examples that would qualify:
 - A credential surviving into `str(exc)` or `traceback.format_exception(...)`,
   including through a chained `__cause__`.
 - A credential being sent to a host it was not configured for — for instance an
-  ambient `$OPENAI_API_KEY` reaching a `localhost` model server.
+  environment variable belonging to another vendor (logpose reads only
+  `LOGPOSE_*`) being sent to a model server.
 - Two conflicting auth headers being sent at once, leaking one credential to a
   provider that has no business seeing it.
 

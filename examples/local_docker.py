@@ -12,9 +12,12 @@ Then::
 
     uv run python examples/local_docker.py
 
+Docker Model Runner speaks the OpenAI Chat Completions API, so this uses the
+``openai-compat`` provider with the runner's address passed explicitly.
+
 Not every local model can call tools. If the run finishes without the tool being
 invoked, the model — not logpose — declined to use it; try a larger or more
-tool-tuned model, or set DOCKER_MODEL to pick a specific one.
+tool-tuned model by passing its name instead of ``"auto"``.
 """
 
 from __future__ import annotations
@@ -39,9 +42,14 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
 
 async def main() -> None:
     """Stream one tool-using turn against the local model."""
-    # model= is optional: omit it and logpose asks the runner for its first model.
+    # model="auto" asks the runner for its first model; name one to pin it.
     agent = Agent(
-        "docker",
+        "openai-compat",
+        model="auto",
+        base_url="http://localhost:12434/engines/v1",
+        # Small local models have small context windows; the 32000 default
+        # output ceiling would exceed them.
+        max_tokens=4096,
         tools=[get_weather],
         system="You are terse. Use the tools available to you. Answer in one sentence.",
         max_iterations=6,
