@@ -11,7 +11,7 @@ Two equivalent spellings, pick whichever reads better:
 
     from logpose import Agent, SyncAgent, run_sync
 
-    agent = Agent("anthropic", tools=[get_weather])
+    agent = Agent("docker", tools=[get_weather])
 
     # 1. wrapper object — best when you make several calls
     with SyncAgent(agent) as sync_agent:
@@ -27,9 +27,9 @@ How the bridge works
 Each :class:`~logpose.agent.Agent` gets **one** private event loop running on a
 dedicated daemon thread, created on first use and reused for every later sync
 call on that agent. Reusing one loop is not an optimization; it is required.
-Objects the async stack builds lazily — notably the :class:`asyncio.Lock` inside
-:class:`~logpose.auth.claude_code.CredentialProvider` — bind themselves to the
-first loop that touches them and raise if a second loop touches them later. A
+Objects the async stack builds lazily — notably the provider's ``httpx.AsyncClient``
+and any :class:`asyncio.Lock` — bind themselves to the first loop that touches
+them and fail if a second loop touches them later. A
 fresh loop per call would therefore work once and fail on the second call
 against a real provider.
 
@@ -422,7 +422,7 @@ class SyncAgent:
 
     .. code-block:: python
 
-        with SyncAgent(Agent("anthropic", tools=[get_weather])) as agent:
+        with SyncAgent(Agent("docker", tools=[get_weather])) as agent:
             print(agent.run("What's the weather in Pune?").text)
 
     Using it as a context manager closes the provider and stops the private loop
@@ -447,7 +447,7 @@ class SyncAgent:
         if not isinstance(agent, Agent):
             raise LogposeError(
                 f"SyncAgent wraps an Agent, got {type(agent).__name__}. "
-                "Build one first: SyncAgent(Agent('anthropic', tools=[...]))."
+                "Build one first: SyncAgent(Agent('docker', tools=[...]))."
             )
         self.agent = agent
 

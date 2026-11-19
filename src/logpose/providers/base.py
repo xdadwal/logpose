@@ -5,8 +5,8 @@ A provider turns a :class:`CompletionRequest` into a stream of
 that :class:`ToolSpec` deliberately carries no handler — so the loop stays the
 single place where side effects happen.
 
-v0.1 ships an Anthropic provider; v0.2 implements this same protocol for
-OpenAI-compatible backends.
+The built-in backends all speak the OpenAI Chat Completions API; a custom
+backend implements this same protocol and registers itself by name.
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class Provider(Protocol):
     explicit ``max_tokens=`` will honour it.
 
     Attributes:
-        name: Short identifier for the provider, e.g. ``"anthropic"``.
+        name: Short identifier for the provider, e.g. ``"openai-compat"``.
         model_default: Model identifier used when a request omits one. Must be
             a non-empty string.
     """

@@ -22,7 +22,7 @@ normalized events. Provider-specific behavior stays behind
 
 
     async def main() -> None:
-        agent = Agent("anthropic", tools=[get_weather], system="Be concise.")
+        agent = Agent("docker", tools=[get_weather], system="Be concise.")
         result = await agent.run("What's the weather in Pune?")
         print(result.text, result.usage)
 

@@ -1555,11 +1555,11 @@ def test_unknown_provider_name_raises() -> None:
 
 
 def test_named_provider_is_resolved_with_provider_kwargs() -> None:
-    agent = Agent("claude-code", model="claude-opus-5", compat_claude_code=False)
+    agent = Agent("openai-compat", model="local-model", base_url="http://local.test/v1")
 
-    assert agent.provider_name == "claude-code"
-    assert agent.provider.compat_claude_code is False  # type: ignore[attr-defined]
-    assert agent.model == "claude-opus-5"
+    assert agent.provider_name == "openai-compat"
+    assert agent.provider.base_url == "http://local.test/v1"  # type: ignore[attr-defined]
+    assert agent.model == "local-model"
 
 
 def test_provider_kwargs_alongside_a_built_provider_raise() -> None:
@@ -1591,12 +1591,8 @@ def test_repr_describes_the_configuration() -> None:
 
 
 def test_built_in_provider_deadlines_use_shared_defaults() -> None:
-    from logpose.providers._anthropic_base import AnthropicBaseProvider
-    from logpose.providers._responses import ResponsesProvider
     from logpose.providers.openai_compat import DockerModelsProvider, OpenAICompatProvider
 
-    assert AnthropicBaseProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
-    assert ResponsesProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
     assert OpenAICompatProvider.turn_timeout == DEFAULT_CLOUD_TURN_TIMEOUT
     assert DockerModelsProvider.turn_timeout == DEFAULT_LOCAL_TURN_TIMEOUT
     assert DEFAULT_LOCAL_TURN_TIMEOUT == DEFAULT_CLOUD_TURN_TIMEOUT * LOCAL_TURN_TIMEOUT_MULTIPLIER

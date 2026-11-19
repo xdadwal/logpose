@@ -6,7 +6,7 @@ Two promises are enforced here.
    name is a deliberate edit to this file rather than an accident, and every
    listed name actually exists and is re-exported from the module that owns it.
 2. ``import logpose`` is cheap and side-effect free — in particular it must not
-   import the ``anthropic`` SDK, read a credential, or touch the network.
+   import a provider module, read a credential, or touch the network.
    Backends are resolved lazily by name, so the package imports fine on a
    machine with no configuration at all. That is checked in a *fresh subprocess*
    because the test session itself has already imported everything.
@@ -273,7 +273,7 @@ def test_the_agentic_entry_points_are_usable_together() -> None:
     assert ping.spec().name == "ping"
     assert isinstance(logpose.Conversation([logpose.Message.user("hi")]), logpose.Conversation)
     assert issubclass(logpose.AuthError, logpose.LogposeError)
-    assert "anthropic" in logpose.known_providers()
+    assert "openai-compat" in logpose.known_providers()
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +281,13 @@ def test_the_agentic_entry_points_are_usable_together() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_importing_logpose_does_not_import_the_anthropic_sdk() -> None:
+def test_importing_logpose_does_not_import_a_provider_module() -> None:
     code = (
         "import sys\n"
         "import logpose\n"
         "leaked = sorted(\n"
-        "    m for m in sys.modules if m == 'anthropic' or m.startswith('anthropic.')\n"
+        "    m for m in sys.modules\n"
+        "    if m in ('httpx', 'logpose.providers.openai_compat')\n"
         ")\n"
         "assert not leaked, leaked\n"
         "print('clean')\n"
@@ -296,15 +297,15 @@ def test_importing_logpose_does_not_import_the_anthropic_sdk() -> None:
     assert result.stdout.strip() == "clean"
 
 
-def test_importing_the_sync_facade_does_not_import_the_anthropic_sdk() -> None:
+def test_importing_the_sync_facade_does_not_import_a_provider_module() -> None:
     code = (
         "import sys\n"
         "import logpose.sync\n"
         "import logpose.tools\n"
         "import logpose.agent\n"
-        "import logpose.auth\n"
         "leaked = sorted(\n"
-        "    m for m in sys.modules if m == 'anthropic' or m.startswith('anthropic.')\n"
+        "    m for m in sys.modules\n"
+        "    if m in ('httpx', 'logpose.providers.openai_compat')\n"
         ")\n"
         "assert not leaked, leaked\n"
         "print('clean')\n"
@@ -314,14 +315,14 @@ def test_importing_the_sync_facade_does_not_import_the_anthropic_sdk() -> None:
     assert result.stdout.strip() == "clean"
 
 
-def test_resolving_the_anthropic_provider_is_what_imports_the_sdk() -> None:
+def test_resolving_a_provider_is_what_imports_its_module() -> None:
     """The laziness is real, not an accident of import ordering."""
     code = (
         "import sys\n"
         "import logpose\n"
-        "assert 'anthropic' not in sys.modules\n"
-        "logpose.resolve('anthropic', api_key='not-a-real-key')\n"
-        "assert 'anthropic' in sys.modules\n"
+        "assert 'logpose.providers.openai_compat' not in sys.modules\n"
+        "logpose.resolve('openai-compat', base_url='http://local.test/v1')\n"
+        "assert 'logpose.providers.openai_compat' in sys.modules\n"
         "print('lazy')\n"
     )
     result = _run_python(code)
@@ -333,8 +334,7 @@ def test_importing_logpose_reads_no_credentials_and_opens_no_loop() -> None:
     code = (
         "import asyncio\n"
         "import os\n"
-        "os.environ.pop('ANTHROPIC_API_KEY', None)\n"
-        "os.environ.pop('CLAUDE_CODE_OAUTH_TOKEN', None)\n"
+        "os.environ.pop('OPENAI_API_KEY', None)\n"
         "import logpose\n"
         "try:\n"
         "    asyncio.get_event_loop_policy().get_event_loop().close()\n"

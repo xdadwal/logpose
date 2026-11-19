@@ -5,20 +5,13 @@ selected authentication path.
 
 Run it
 ------
-Anthropic API key (the default)::
+Point it at any Chat Completions server — OpenAI, vLLM, Ollama, LM Studio,
+llama.cpp, OpenRouter, and so on::
 
-    export ANTHROPIC_API_KEY=sk-ant-api03-...
+    export OPENAI_BASE_URL=https://api.openai.com/v1
+    export OPENAI_MODEL=gpt-5.1
+    export OPENAI_API_KEY=sk-...          # omit for a local server that needs none
     uv run python examples/weather.py
-
-Experimental Claude Code subscription auth::
-
-    claude setup-token
-    export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-    uv run python examples/weather.py --claude-code
-
-If Claude Code is already installed and logged in, the export is optional.
-This path depends on unstable CLI authentication details and may stop working
-without notice.
 
 Expected output: a couple of thinking/text deltas, a ``get_weather`` tool call
 and its result, then a final answer and a non-zero token count.
@@ -27,7 +20,6 @@ and its result, then a final answer and a non-zero token count.
 from __future__ import annotations
 
 import asyncio
-import os
 import sys
 from typing import Literal
 
@@ -64,32 +56,14 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
     return f"{degrees}{unit.upper()}, {description}"
 
 
-def build_agent(*, claude_code: bool) -> Agent:
-    """Build the agent for this example.
-
-    Args:
-        claude_code: When ``True``, use the experimental ``claude-code``
-            subscription provider. Otherwise use ``anthropic`` with an API key.
+def build_agent() -> Agent:
+    """Build the agent for this example from the ``OPENAI_*`` environment.
 
     Returns:
         A configured :class:`~logpose.Agent`.
     """
-    if claude_code:
-        return Agent(
-            "claude-code",
-            tools=[get_weather],
-            system="You are a terse weather assistant.",
-            max_iterations=8,
-        )
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise SystemExit(
-            "Set ANTHROPIC_API_KEY, or pass --claude-code for the experimental path."
-        )
     return Agent(
-        "anthropic",
-        api_key=api_key,
+        "openai-compat",
         tools=[get_weather],
         system="You are a terse weather assistant.",
         max_iterations=8,
@@ -102,8 +76,11 @@ async def main() -> int:
     Returns:
         A process exit code.
     """
-    use_claude_code = "--claude-code" in sys.argv
-    agent = build_agent(claude_code=use_claude_code)
+    try:
+        agent = build_agent()
+    except LogposeError as exc:
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     prompt = "What's the weather in Pune and in Reykjavik? Answer in one sentence."
 
     print(f"> {prompt}\n")
@@ -131,10 +108,7 @@ async def main() -> int:
                 )
     except AuthError as exc:
         print(f"\nauth failed: {exc}", file=sys.stderr)
-        if use_claude_code:
-            print("Run `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.", file=sys.stderr)
-        else:
-            print("Export ANTHROPIC_API_KEY.", file=sys.stderr)
+        print("Check OPENAI_API_KEY.", file=sys.stderr)
         return 2
     except LogposeError as exc:
         print(f"\n{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -148,7 +122,7 @@ async def main() -> int:
 #
 #     from logpose import SyncAgent
 #
-#     with SyncAgent(build_agent(claude_code=False)) as agent:
+#     with SyncAgent(build_agent()) as agent:
 #         for event in agent.stream(prompt):
 #             ...
 

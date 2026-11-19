@@ -1,9 +1,8 @@
 """OpenAI-compatible provider, and the Docker Model Runner backend built on it.
 
-This is the second implementation of :class:`~logpose.providers.base.Provider`,
-and the one that proves the seam: nothing here is shared with the Anthropic
-backend except the neutral message model, and nothing above
-``logpose.providers`` changes to use it.
+This is the built-in implementation of :class:`~logpose.providers.base.Provider`.
+It depends only on the neutral message model, and nothing above
+``logpose.providers`` is specific to it.
 
 Why raw ``httpx`` and not the ``openai`` SDK
 --------------------------------------------
@@ -18,7 +17,7 @@ The three real impedance mismatches with logpose's model
 1. **Tool results.** logpose batches every result of a turn into one ``user``
    message; Chat Completions wants one ``{"role": "tool"}`` message per call.
    :func:`_messages_to_wire` fans them out, preserving order.
-2. **Tool arguments.** Anthropic returns parsed JSON; Chat Completions streams a
+2. **Tool arguments.** logpose stores parsed JSON; Chat Completions streams a
    *string* in fragments that must be concatenated by ``index`` and parsed at
    the end. Small local models routinely emit invalid JSON here, so a parse
    failure is reported to the model rather than raised (see

@@ -2,23 +2,21 @@
 
 Providers are resolved by name so consumers never import a backend directly::
 
-    provider = resolve("anthropic", model="claude-opus-5")
+    provider = resolve("openai-compat", base_url="http://localhost:8000/v1")
 
 Built-in providers are registered with a factory that imports their module
-lazily, so ``import logpose`` never requires a configured backend (or even an
-installed optional dependency).
+lazily, so ``import logpose`` never requires a configured backend.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
 import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from logpose.errors import AuthError, LogposeError
+from logpose.errors import LogposeError
 from logpose.providers.base import (
     CompletionDone,
     CompletionRequest,
@@ -154,10 +152,7 @@ def provider_info(name: str) -> ProviderInfo:
 
 
 def _probe(info: ProviderInfo) -> ProviderStatus:
-    """Check one backend's credential, synchronously.
-
-    Run in a worker thread by :func:`provider_status`, because resolving a Claude
-    Code credential can shell out to the macOS Keychain.
+    """Check one backend's endpoint and credential, synchronously.
 
     Args:
         info: The backend to check.
@@ -171,42 +166,30 @@ def _probe(info: ProviderInfo) -> ProviderStatus:
             ready=False,
             detail=(f"No endpoint configured. Pass base_url=... or set ${info.base_url_env}."),
         )
-    if info.credential_module is None:
-        if info.credential_kind == "api_key":
-            ready = bool(info.env_vars and os.environ.get(info.env_vars[0], "").strip())
-            return ProviderStatus(
-                name=info.name,
-                ready=ready,
-                credential="api_key" if ready else "none",
-                detail=""
-                if ready
-                else (
-                    f"Set ${info.env_vars[0]}."
-                    if info.env_vars
-                    else "No credential source configured."
-                ),
-            )
-        return ProviderStatus(name=info.name, ready=True, credential="none")
-
-    module = importlib.import_module(info.credential_module)
-    try:
-        credential = module.resolve_credential(require_kind=info.credential_kind)
-        if info.credential_verify is not None:
-            getattr(module, info.credential_verify)(credential)
-    except AuthError as exc:
-        return ProviderStatus(name=info.name, ready=False, detail=str(exc))
-    return ProviderStatus(name=info.name, ready=True, credential=credential.kind)
+    if info.credential == "api_key":
+        ready = bool(info.env_vars and os.environ.get(info.env_vars[0], "").strip())
+        return ProviderStatus(
+            name=info.name,
+            ready=ready,
+            credential="api_key" if ready else "none",
+            detail=""
+            if ready
+            else (
+                f"Set ${info.env_vars[0]}."
+                if info.env_vars
+                else "No credential source configured."
+            ),
+        )
+    return ProviderStatus(name=info.name, ready=True, credential="none")
 
 
 async def provider_status(names: Iterable[str] | None = None) -> tuple[ProviderStatus, ...]:
     """Report which backends can be used right now.
 
-    Unlike :func:`provider_catalog` this **reads credential stores** — environment
-    variables, ``~/.codex/auth.json``, and on macOS the Claude Code Keychain entry,
-    which costs a subprocess. That is why it is async and separate: a picker wants
-    both, but a catalog lookup should never quietly touch the filesystem. Nothing is
-    written, and no request is sent, so a ``ready`` provider can still fail later on
-    an expired token or a network error.
+    Unlike :func:`provider_catalog` this reads the environment to check for each
+    backend's endpoint and API key. Nothing is written and no request is sent, so a
+    ``ready`` provider can still fail later on a rejected key or a network error.
+    Async so a slower readiness check can be added without changing callers.
 
     Args:
         names: Backends to check, by canonical name or alias. Defaults to every
@@ -230,7 +213,7 @@ def resolve(name: str, **kwargs: Any) -> Provider:
     """Build the provider registered under ``name``.
 
     Args:
-        name: A registered provider name, e.g. ``"anthropic"``.
+        name: A registered provider name, e.g. ``"openai-compat"``.
         **kwargs: Passed straight through to the provider's factory.
 
     Returns:
@@ -246,79 +229,6 @@ def resolve(name: str, **kwargs: Any) -> Provider:
         known = ", ".join(known_providers()) or "<none>"
         raise LogposeError(f"Unknown provider {name!r}. Known providers: {known}.") from None
     return entry.factory(**kwargs)
-
-
-def _anthropic_factory(**kwargs: Any) -> Provider:
-    """Build the Anthropic provider, importing its module lazily.
-
-    Args:
-        **kwargs: Forwarded to ``AnthropicProvider``.
-
-    Returns:
-        A configured Anthropic provider.
-    """
-    return _optional_provider("logpose.providers.anthropic", "AnthropicProvider", **kwargs)
-
-
-def _claude_code_factory(**kwargs: Any) -> Provider:
-    """Build the Claude Code provider, importing its module lazily.
-
-    Args:
-        **kwargs: Forwarded to ``ClaudeCodeProvider``.
-
-    Returns:
-        A configured Claude Code provider.
-    """
-    return _optional_provider("logpose.providers.claude_code", "ClaudeCodeProvider", **kwargs)
-
-
-def _optional_provider(module_path: str, class_name: str, **kwargs: Any) -> Provider:
-    """Construct an Anthropic-backed provider or name the missing extra.
-
-    The package intentionally keeps the vendor SDK optional so applications using
-    other providers do not install it. Catch only a missing top-level SDK: an
-    unrelated import error inside the provider should remain visible to aid
-    diagnosis.
-    """
-    try:
-        module = importlib.import_module(module_path)
-    except ModuleNotFoundError as exc:
-        if exc.name == "anthropic":
-            raise LogposeError(
-                "The Anthropic providers require the optional dependency. "
-                'Install it with `pip install "logpose[anthropic]"`.'
-            ) from None
-        raise
-    provider_class = getattr(module, class_name)
-    return provider_class(**kwargs)
-
-
-def _codex_factory(**kwargs: Any) -> Provider:
-    """Build the Codex provider, importing its module lazily.
-
-    Args:
-        **kwargs: Forwarded to ``CodexProvider``.
-
-    Returns:
-        A configured Codex provider.
-    """
-    from logpose.providers.codex import CodexProvider
-
-    return CodexProvider(**kwargs)
-
-
-def _openai_factory(**kwargs: Any) -> Provider:
-    """Build the OpenAI Responses provider, importing its module lazily.
-
-    Args:
-        **kwargs: Forwarded to ``OpenAIProvider``.
-
-    Returns:
-        A configured OpenAI provider.
-    """
-    from logpose.providers.openai import OpenAIProvider
-
-    return OpenAIProvider(**kwargs)
 
 
 def _docker_factory(**kwargs: Any) -> Provider:
@@ -349,65 +259,9 @@ def _openai_compat_factory(**kwargs: Any) -> Provider:
     return OpenAICompatProvider(**kwargs)
 
 
-def _zai_factory(**kwargs: Any) -> Provider:
-    """Build the Z.ai Coding Plan provider without importing a vendor SDK."""
-    from logpose.providers.zai import ZaiCodingProvider
-
-    return ZaiCodingProvider(**kwargs)
-
-
 # Metadata lives here, not on the provider classes, so provider_catalog() never
-# has to import a vendor SDK to answer "what are my options". Each declaration is
+# has to import a provider module to answer "what are my options". Each declaration is
 # pinned against the class it describes by tests/test_provider_catalog.py.
-_ANTHROPIC_INFO = ProviderInfo(
-    name="anthropic",
-    summary="Anthropic Claude models with an API key.",
-    api="messages",
-    credential="api_key",
-    default_model="claude-opus-5",
-    env_vars=("ANTHROPIC_API_KEY",),
-    credential_module="logpose.auth.claude_code",
-    credential_kind="api_key",
-)
-
-_CLAUDE_CODE_INFO = ProviderInfo(
-    name="claude-code",
-    summary="Anthropic Claude models on a Claude Code subscription.",
-    api="messages",
-    credential="subscription",
-    default_model="claude-opus-5",
-    env_vars=("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"),
-    officially_supported=False,
-    credential_module="logpose.auth.claude_code",
-    credential_kind="oauth",
-)
-
-_OPENAI_INFO = ProviderInfo(
-    name="openai",
-    summary="OpenAI models on the Responses API with an API key.",
-    api="responses",
-    credential="api_key",
-    default_model="gpt-5.1",
-    env_vars=("OPENAI_API_KEY", "OPENAI_RESPONSES_MODEL", "OPENAI_RESPONSES_BASE_URL"),
-    credential_module="logpose.auth.codex",
-    credential_kind="api_key",
-)
-
-_CODEX_INFO = ProviderInfo(
-    name="codex",
-    summary="OpenAI models on a ChatGPT subscription, via the Codex backend.",
-    api="responses",
-    credential="subscription",
-    default_model="gpt-5.5",
-    env_vars=("CODEX_HOME", "CODEX_MODEL", "CODEX_BASE_URL", "CHATGPT_ACCOUNT_ID"),
-    officially_supported=False,
-    credential_module="logpose.auth.codex",
-    credential_kind="oauth",
-    # A token alone is not enough here: the backend rejects a request that does not
-    # name a ChatGPT account, so readiness has to include that check.
-    credential_verify="require_account_id",
-)
-
 _DOCKER_INFO = ProviderInfo(
     name="docker",
     summary="Local models served by Docker Model Runner.",
@@ -430,24 +284,6 @@ _OPENAI_COMPAT_INFO = ProviderInfo(
     base_url_env="OPENAI_BASE_URL",
 )
 
-register("anthropic", _anthropic_factory, info=_ANTHROPIC_INFO)
-register("claude-code", _claude_code_factory, info=_CLAUDE_CODE_INFO)
-register("codex", _codex_factory, info=_CODEX_INFO)
 register("docker", _docker_factory, info=_DOCKER_INFO)
-register("openai", _openai_factory, info=_OPENAI_INFO)
 register("docker-models", _docker_factory, info=_DOCKER_INFO)
 register("openai-compat", _openai_compat_factory, info=_OPENAI_COMPAT_INFO)
-register(
-    "zai",
-    _zai_factory,
-    info=ProviderInfo(
-        name="zai",
-        summary="Z.ai GLM Coding Plan with preserved thinking and tool calls.",
-        api="chat-completions",
-        credential="api_key",
-        credential_kind="api_key",
-        default_model="glm-5.3-flash",
-        env_vars=("ZAI_KEY",),
-        reasoning_replay=True,
-    ),
-)
