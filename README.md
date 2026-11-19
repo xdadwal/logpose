@@ -169,10 +169,10 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 
 ### Output limit
 
-Each turn's output ceiling defaults to 8192 tokens: room for moderate reasoning
-plus an answer inside the 120-second turn deadline. For long, high-effort
-outputs raise `max_tokens` together with `provider_turn_timeout` and
-`run_timeout`. Small local models often need it lower; set it with
+Each turn's output ceiling defaults to 16384 tokens: room for reasoning plus a
+long answer. A reply that long can take longer than the 120-second turn
+deadline on slower models; if your replies run that long, raise
+`provider_turn_timeout` and `run_timeout` as well. Small local models often need it lower; set it with
 `Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
@@ -245,13 +245,12 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `Agent(provider_turn_timeout=)` | 120 s | one model turn |
 | `OpenAICompatProvider(timeout=)` | connect 5 s, read 60 s, write 10 s, pool 5 s | HTTP; `read` is the longest silence between streamed chunks |
 | `Agent(max_iterations=)` | 10 | model round trips per run |
-| `Agent(max_tokens=)` | 8192 | output tokens per turn |
+| `Agent(max_tokens=)` | 16384 | output tokens per turn |
 | `Agent(tool_timeout=)` | 30 s | one tool call, after it gets a slot |
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
-Tool output is budgeted to about 4k tokens per call: shell, `read_file` pages,
-`list_dir`, grep, and page fetches return at most 16,000 characters, and web
-search 8,000. `read_file` has no line cap and `list_dir` no entry cap; both page
+Tool output is budgeted to about 2k tokens per call: shell, `read_file` pages,
+`list_dir`, grep, page fetches, and web search return at most 8,000 characters. `read_file` has no line cap and `list_dir` no entry cap; both page
 by characters with a continuation the model can follow.
 
 ```python

@@ -75,7 +75,7 @@ def test_shell_defaults_are_web_app_safe(tmp_path):
     shell = make_shell_tool(cwd=str(tmp_path))
     out = shell("yes x | head -c 20000")
     assert out.endswith("...[truncated]")
-    assert len(out) <= 16_000 + 20
+    assert len(out) <= 8_000 + 20
 
 
 def test_bounded_run_registers_a_group_kill_with_the_tool_deadline(tmp_path):

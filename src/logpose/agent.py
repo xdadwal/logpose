@@ -165,13 +165,14 @@ __all__ = [
 DEFAULT_MAX_ITERATIONS = 10
 """Provider round trips a single run may take before it gives up."""
 
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 16384
 """Output-token ceiling used when neither the agent nor the provider names one.
 
 An explicit ``Agent(max_tokens=...)`` wins; failing that the provider's own
 ``max_tokens`` is honoured, so configuring a provider to cap output cost is not
-silently overridden. Sized so moderate reasoning plus an answer fits inside
-:data:`DEFAULT_PROVIDER_TURN_TIMEOUT`; raise both together for long outputs.
+silently overridden. Room for reasoning plus a long answer. A full 16k-token
+reply can take longer than :data:`DEFAULT_PROVIDER_TURN_TIMEOUT` on slower
+models; raise the turn and run deadlines too if replies run that long.
 """
 
 DEFAULT_PROVIDER_TURN_TIMEOUT = 120.0

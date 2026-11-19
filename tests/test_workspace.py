@@ -95,7 +95,7 @@ def test_read_file_page_is_char_bounded(tmp_path):
     assert len(text) > 40_000
     (tmp_path / "big.txt").write_text(text)
     first = read_file_page("big.txt", base_path=tmp_path)
-    assert len(first) <= 16_000 + 200
+    assert len(first) <= 8_000 + 200
     assert "cursor=" in first
     rebuilt, pages = _follow_read(tmp_path, "big.txt")
     assert rebuilt == text
@@ -116,7 +116,7 @@ def test_list_dir_char_budget_continues_without_gaps(tmp_path):
     seen, after = [], ""
     while True:
         out = list_directory(base_path=tmp_path, after=after)
-        assert len(out) <= 16_000 + 200
+        assert len(out) <= 8_000 + 200
         match = re.search(r'\n\[More entries; continue list_dir\(.*after="([^"]+)".*\)\]$', out)
         body = out[: match.start()] if match else out
         seen.extend(body.splitlines())
@@ -131,4 +131,4 @@ def test_grep_output_is_capped_by_default(tmp_path):
         (tmp_path / f"f{i}.txt").write_text("needle " * 50 + "\n")
     grep = make_grep_tool(str(tmp_path))
     out = grep("needle")
-    assert len(out) <= 16_000 + 200
+    assert len(out) <= 8_000 + 200
