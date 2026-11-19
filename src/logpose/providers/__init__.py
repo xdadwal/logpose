@@ -231,20 +231,6 @@ def resolve(name: str, **kwargs: Any) -> Provider:
     return entry.factory(**kwargs)
 
 
-def _docker_factory(**kwargs: Any) -> Provider:
-    """Build the Docker Model Runner provider, importing its module lazily.
-
-    Args:
-        **kwargs: Forwarded to ``DockerModelsProvider``.
-
-    Returns:
-        A configured local-model provider.
-    """
-    from logpose.providers.openai_compat import DockerModelsProvider
-
-    return DockerModelsProvider(**kwargs)
-
-
 def _openai_compat_factory(**kwargs: Any) -> Provider:
     """Build a generic OpenAI-compatible provider, importing its module lazily.
 
@@ -262,18 +248,6 @@ def _openai_compat_factory(**kwargs: Any) -> Provider:
 # Metadata lives here, not on the provider classes, so provider_catalog() never
 # has to import a provider module to answer "what are my options". Each declaration is
 # pinned against the class it describes by tests/test_provider_catalog.py.
-_DOCKER_INFO = ProviderInfo(
-    name="docker",
-    summary="Local models served by Docker Model Runner.",
-    api="chat-completions",
-    credential="none",
-    # Left unset on purpose: with no model= the backend asks the runner for its
-    # first model on the first request, so there is no default to report.
-    default_model=None,
-    aliases=("docker-models",),
-    env_vars=("DOCKER_MODEL_RUNNER_URL", "DOCKER_MODEL"),
-)
-
 _OPENAI_COMPAT_INFO = ProviderInfo(
     name="openai-compat",
     summary="Any server speaking the Chat Completions API — llama.cpp, vLLM, Ollama, Kimi.",
@@ -284,6 +258,4 @@ _OPENAI_COMPAT_INFO = ProviderInfo(
     base_url_env="OPENAI_BASE_URL",
 )
 
-register("docker", _docker_factory, info=_DOCKER_INFO)
-register("docker-models", _docker_factory, info=_DOCKER_INFO)
 register("openai-compat", _openai_compat_factory, info=_OPENAI_COMPAT_INFO)
