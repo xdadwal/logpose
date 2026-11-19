@@ -98,11 +98,13 @@ class CompletionDone:
             :class:`~logpose.messages.ToolUseBlock` content in wire order.
         stop_reason: Why the model stopped generating.
         usage: Token usage for this turn.
+        refusal: The model's refusal text, if it refused; otherwise ``None``.
     """
 
     message: Message
     stop_reason: StopReason
     usage: Usage
+    refusal: str | None = None
 
 
 ProviderEvent = Union[  # noqa: UP007 - explicit Union keeps the alias importable at runtime

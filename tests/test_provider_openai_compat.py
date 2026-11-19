@@ -23,7 +23,12 @@ from logpose import (
     resolve,
     tool,
 )
-from logpose.errors import AuthError, LogposeError, ProviderError
+from logpose.errors import (
+    AuthError,
+    LogposeError,
+    ProviderError,
+    StructuredOutputUnsupportedError,
+)
 from logpose.providers.base import CompletionRequest, ToolSpec
 from logpose.providers.openai_compat import (
     AUTO_MODEL,
@@ -786,3 +791,69 @@ async def test_agent_reports_a_failed_tool_back_to_the_model() -> None:
     tool_message = handler.body(1)["messages"][-1]
     assert tool_message["role"] == "tool"
     assert tool_message["content"].startswith("ERROR: ")
+
+
+# ---------------------------------------------------------------------------
+# structured output: refusal and incompatibility
+# ---------------------------------------------------------------------------
+
+_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {"name": "out", "strict": True, "schema": {"type": "object"}},
+}
+
+
+async def test_refusal_deltas_are_collected() -> None:
+    handler = Recorder(
+        sse(
+            delta_chunk(refusal="I can't "),
+            delta_chunk(refusal="help."),
+            finish_chunk("stop"),
+        )
+    )
+    events = await drain(make_provider(handler), request())
+    assert events[-1].refusal == "I can't help."
+
+
+async def test_no_refusal_by_default() -> None:
+    handler = Recorder(sse(delta_chunk(content="hi"), finish_chunk("stop")))
+    events = await drain(make_provider(handler), request())
+    assert events[-1].refusal is None
+
+
+def _rejecting(status: int) -> Any:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status, json={"error": {"message": "response_format json_schema is not supported"}}
+        )
+
+    return handler
+
+
+@pytest.mark.parametrize("status", [400, 422])
+async def test_rejected_response_format_is_flagged(status: int) -> None:
+    provider = make_provider(_rejecting(status))
+    req = request(extra={"response_format": _RESPONSE_FORMAT})
+    with pytest.raises(StructuredOutputUnsupportedError) as excinfo:
+        await drain(provider, req)
+    assert excinfo.value.retryable is False
+    message = str(excinfo.value)
+    assert "does not support strict json_schema structured output" in message
+    assert BASE in message
+    assert "is not supported" not in message
+
+
+async def test_400_without_response_format_is_a_plain_provider_error() -> None:
+    provider = make_provider(_rejecting(400))
+    with pytest.raises(ProviderError) as excinfo:
+        await drain(provider, request())
+    assert type(excinfo.value) is ProviderError
+
+
+async def test_extra_body_and_request_response_format_conflict() -> None:
+    provider = make_provider(
+        Recorder(), extra_body={"response_format": {"type": "text"}}
+    )
+    req = request(extra={"response_format": _RESPONSE_FORMAT})
+    with pytest.raises(LogposeError, match="response_format"):
+        await drain(provider, req)
