@@ -47,6 +47,9 @@ async def main() -> None:
         "openai-compat",
         model="auto",
         base_url="http://localhost:12434/engines/v1",
+        # The runner needs no key; "" keeps an ambient LOGPOSE_API_KEY meant for
+        # a hosted API from being sent to localhost.
+        api_key="",
         # Small local models have small context windows, so keep output short.
         max_tokens=4096,
         # Local inference is slower than a hosted API; widen the web-app

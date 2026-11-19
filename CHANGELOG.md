@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider retries and tool execution. Expiry raises the new
   `RunTimeoutError` (with partial messages), emits `run.timed_out`, and is never
   retried. `None` disables it.
+  It interrupts only awaits logpose makes, never caller code between streamed
+  events. Cancelled tools run their terminators and get error results (and
+  `tool_observer` outcomes), so the conversation stays valid. A provider error
+  that cannot be retried within the remaining time surfaces as itself.
+- `bounded_run` registers a process-group kill with `current_tool_deadline()`,
+  so a tool or run deadline stops shell commands. The shell's own default
+  timeout is 25 s, below the agent's 30 s `tool_timeout`.
 
 ### Changed
 

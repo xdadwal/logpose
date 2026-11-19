@@ -76,3 +76,41 @@ def test_shell_defaults_are_web_app_safe(tmp_path):
     out = shell("yes x | head -c 20000")
     assert out.endswith("...[truncated]")
     assert len(out) <= 16_000 + 20
+
+
+def test_bounded_run_registers_a_group_kill_with_the_tool_deadline(tmp_path):
+    import threading
+    import time
+
+    from logpose.cancellation import (
+        ToolDeadlineHandle,
+        _clear_deadline_handle,
+        _install_deadline_handle,
+    )
+
+    handle = ToolDeadlineHandle()
+    outcome = {}
+
+    def run():
+        _install_deadline_handle(handle)
+        try:
+            outcome["result"] = bounded_run("sleep 5", cwd=str(tmp_path), timeout=10)
+        finally:
+            _clear_deadline_handle()
+
+    worker = threading.Thread(target=run)
+    started = time.monotonic()
+    worker.start()
+    time.sleep(0.3)
+    handle.terminate()
+    worker.join(3)
+    assert not worker.is_alive()
+    assert time.monotonic() - started < 2
+    assert outcome["result"].returncode != 0
+
+
+def test_shell_timeout_is_shorter_than_the_agent_tool_timeout():
+    from logpose.agent import DEFAULT_TOOL_TIMEOUT
+    from logpose.shell import _DEFAULT_TIMEOUT
+
+    assert _DEFAULT_TIMEOUT < DEFAULT_TOOL_TIMEOUT

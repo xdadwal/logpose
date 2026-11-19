@@ -409,8 +409,11 @@ class Agent:
             run_timeout: Wall-clock deadline in seconds for a whole run
                 (default 320), measured from the start of ``run``/``stream``
                 and including time the caller spends between streamed events.
-                Expiry raises :class:`~logpose.errors.RunTimeoutError` and is
-                never retried. ``None`` disables it.
+                It interrupts only awaits logpose makes (provider, tools,
+                ``on_tool_call``, ``tool_observer``, ``context_policy``), never
+                the caller's own code. Expiry raises
+                :class:`~logpose.errors.RunTimeoutError` and is never retried.
+                ``None`` disables it.
             max_concurrent_tools: Tool handlers this agent may execute at once,
                 across all of its concurrent runs. Extra calls wait for capacity.
             tool_timeout: Execution deadline in seconds after a call acquires
@@ -1026,6 +1029,16 @@ class Agent:
                     )
                     raise exc from None
                 delay = self.retry_policy.delay(attempt)
+                if _outlasts_run(delay, run_deadline):
+                    self._emit_runtime(
+                        "provider.attempt.failed",
+                        context=attempt_context,
+                        duration_seconds=monotonic() - started_at,
+                        error_id=self._runtime_id("error"),
+                        exception_type=type(exc).__name__,
+                        status_code=exc.status_code,
+                    )
+                    raise exc from None
                 self._emit_runtime(
                     "provider.attempt.failed",
                     context=attempt_context,
@@ -1039,7 +1052,6 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
-                _check_backoff(delay, run_deadline)
                 await asyncio.sleep(delay)
                 continue
             except ProviderError as exc:
@@ -1057,6 +1069,16 @@ class Agent:
                     )
                     raise
                 delay = self.retry_policy.delay(attempt, retry_after=exc.retry_after)
+                if _outlasts_run(delay, run_deadline):
+                    self._emit_runtime(
+                        "provider.attempt.failed",
+                        context=attempt_context,
+                        duration_seconds=monotonic() - started_at,
+                        error_id=self._runtime_id("error"),
+                        exception_type=type(exc).__name__,
+                        status_code=exc.status_code,
+                    )
+                    raise
                 self._emit_runtime(
                     "provider.attempt.failed",
                     context=attempt_context,
@@ -1070,9 +1092,10 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
-                _check_backoff(delay, run_deadline)
                 await asyncio.sleep(delay)
                 continue
+            except _RunExpired:
+                raise
             except Exception as exc:
                 self._emit_runtime(
                     "provider.attempt.failed",
@@ -1328,7 +1351,26 @@ class Agent:
             raise
         except Exception as exc:
             raise ToolObservationError("intent") from exc
-        result = await self._invoke_handler(call, queued_at, turn_context)
+        try:
+            result = await self._invoke_handler(call, queued_at, turn_context)
+        except asyncio.CancelledError:
+            # Run deadline or abandoned stream: close the journal entry so it
+            # matches the error result the conversation records for this call.
+            await _settle(
+                self.tool_observer(
+                    ToolObservation(
+                        "outcome",
+                        context,
+                        call.model_copy(deep=True),
+                        ToolResultBlock(
+                            tool_use_id=call.id,
+                            content="Tool call was cancelled before it finished.",
+                            is_error=True,
+                        ),
+                    )
+                )
+            )
+            raise
         try:
             await self.tool_observer(
                 ToolObservation(
@@ -1581,6 +1623,10 @@ async def _aclose_with_runtime_context(
         _reset_runtime_context(token)
 
 
+class _DeadlineExpired(TimeoutError):
+    """A ``_deadline`` timer fired (as opposed to a TimeoutError raised by user code)."""
+
+
 class _RunExpired(Exception):
     """Internal signal: the whole-run deadline passed. Becomes RunTimeoutError."""
 
@@ -1592,11 +1638,28 @@ def _remaining(run_deadline: float | None) -> float | None:
     return max(0.0, run_deadline - monotonic())
 
 
-def _check_backoff(delay: float, run_deadline: float | None) -> None:
-    """Refuse a retry sleep that would outlast the run deadline."""
+def _outlasts_run(delay: float, run_deadline: float | None) -> bool:
+    """Whether a retry sleep of ``delay`` would outlast the run deadline."""
     left = _remaining(run_deadline)
-    if left is not None and delay >= left:
-        raise _RunExpired
+    return left is not None and delay >= left
+
+
+async def _settle(awaitable: Awaitable[None]) -> None:
+    """Run ``awaitable`` to completion despite repeated cancellation; swallow its errors.
+
+    Used only while already unwinding a cancellation, where the original
+    cancellation must stay the reported outcome.
+    """
+    task = asyncio.ensure_future(awaitable)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001 - the cancellation is the outcome that matters
+            return
+    if not task.cancelled():
+        task.exception()  # mark retrieved
 
 
 async def _next_within(
@@ -1621,7 +1684,9 @@ async def _next_within(
     try:
         async with _deadline(budget):
             return await _next_with_runtime_context(iterator, context)
-    except TimeoutError:
+    except _DeadlineExpired:
+        # Only our own timer is a deadline. A TimeoutError raised by the provider
+        # itself propagates unchanged and takes the turn-timeout path.
         if run_binding:
             raise _RunExpired from None
         raise
@@ -1630,13 +1695,17 @@ async def _next_within(
 @contextlib.asynccontextmanager
 async def _run_budget(run_deadline: float | None) -> AsyncIterator[None]:
     """Bound a block by the time left in the run, signalling expiry as _RunExpired."""
+    if run_deadline is None:
+        yield
+        return
     left = _remaining(run_deadline)
     if left == 0.0:
         raise _RunExpired
     try:
         async with _deadline(left):
             yield
-    except TimeoutError:
+    except _DeadlineExpired:
+        # A TimeoutError from a gate, observer, or context policy is theirs, not ours.
         raise _RunExpired from None
 
 
@@ -1667,7 +1736,7 @@ async def _deadline(seconds: float | None) -> AsyncIterator[None]:
         yield
     except asyncio.CancelledError:
         if expired:
-            raise TimeoutError from None
+            raise _DeadlineExpired from None
         raise
     finally:
         handle.cancel()

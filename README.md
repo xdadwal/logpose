@@ -160,6 +160,7 @@ agent = Agent(
     "openai-compat",
     model="auto",
     base_url="http://localhost:12434/engines/v1",
+    api_key="",  # never send an ambient LOGPOSE_API_KEY to a local server
     max_tokens=4096,
 )
 ```
@@ -273,12 +274,19 @@ except RunTimeoutError as exc:
 ```
 
 A run that exceeds `run_timeout` raises `RunTimeoutError` with the partial
-history; it is never retried. Deadlines are enforced only while logpose waits on
-the provider or on tools, never inside your code between streamed events. If the
-deadline passes while tools run, they are cancelled (registered terminators
-run), and each unfinished call gets an error tool result so the conversation
-stays valid for the next run. Approval gates (`on_tool_call`) count against the
-run deadline too. A turn timeout before any delta can use the retry
+history; it is never retried. A provider error that arrives when too little time
+is left to retry is raised as itself (with its status and `retry_after`), not as
+a run timeout.
+
+Deadlines interrupt only work logpose awaits on your behalf: the provider, your
+tools, and the callbacks it runs for them (`on_tool_call`, `tool_observer`,
+`context_policy`). Your code between streamed events is never interrupted; the
+deadline is checked when logpose next waits. If the run deadline passes while
+tools run, they are cancelled (registered terminators run, so shell commands are
+killed), `tool_observer` records an error outcome for each, and each unfinished
+call gets an error tool result so the conversation stays valid for the next run.
+A `TimeoutError` raised by your own gate, observer, or policy propagates as
+itself. A turn timeout before any delta can use the retry
 policy; a timeout after output is partial and is not replayed.
 
 ## Defining tools

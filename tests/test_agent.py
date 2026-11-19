@@ -40,6 +40,7 @@ from logpose.events import (
     ToolResult,
     TurnEnd,
 )
+from logpose.lifecycle import ToolObservation
 from logpose.messages import (
     Message,
     RedactedThinkingBlock,
@@ -1929,21 +1930,30 @@ async def test_run_deadline_binding_during_streaming_is_not_a_provider_error() -
     assert provider.calls == 1
 
 
-async def test_run_deadline_cuts_retry_backoff() -> None:
+async def test_run_deadline_cuts_retry_backoff_and_keeps_the_real_error() -> None:
+    """A retry that would outlast the run surfaces the provider's own error
+    (status, retry_after) instead of sleeping past the deadline."""
     provider = FakeProvider(
-        [ScriptedTurn.failure(ProviderError("busy", retryable=True, retry_after=5))],
+        [
+            ScriptedTurn.failure(
+                ProviderError("busy", status_code=429, retryable=True, retry_after=5)
+            )
+        ],
         repeat_last=True,
     )
     agent = Agent(
         provider,
         model="m",
         retry_policy=RetryPolicy(max_attempts=3, max_retry_after=5, jitter=0),
-        run_timeout=0.2,
+        run_timeout=0.5,
     )
     started = time.monotonic()
-    with pytest.raises(RunTimeoutError):
+    with pytest.raises(ProviderError) as excinfo:
         await agent.run("go")
     assert time.monotonic() - started < 1
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retry_after == 5
+    assert provider.call_count == 1
 
 
 async def test_run_deadline_bounds_tool_execution() -> None:
@@ -2067,3 +2077,71 @@ async def test_run_timeout_terminates_running_sync_tools() -> None:
         await agent.run("go")
     assert terminated == [True]
     assert time.monotonic() - started < 2
+
+
+
+@pytest.mark.parametrize("run_timeout", [None, 30])
+async def test_a_gates_own_timeout_is_not_a_run_timeout(run_timeout: float | None) -> None:
+    async def gate(call: ToolUseBlock) -> None:
+        raise TimeoutError("approval timed out")
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 2}))])
+    agent = Agent(provider, model="m", tools=[add], on_tool_call=gate, run_timeout=run_timeout)
+    with pytest.raises(TimeoutError, match="approval timed out"):
+        await agent.run("go")
+
+
+async def test_a_providers_own_timeout_is_a_turn_timeout_not_a_run_timeout() -> None:
+    provider = FakeProvider([ScriptedTurn.failure(TimeoutError("internal"))])
+    agent = Agent(
+        provider,
+        model="m",
+        provider_turn_timeout=60,
+        run_timeout=30,  # the run deadline is the nearer one
+        retry_policy=RetryPolicy(max_attempts=1),
+    )
+    with pytest.raises(ProviderError) as excinfo:
+        await agent.run("go")
+    assert excinfo.value.error_code == "turn_timeout"
+
+
+async def test_run_timeout_journals_an_outcome_for_cancelled_tools() -> None:
+    @tool
+    async def slow() -> str:
+        """Sleep for a long time."""
+        await asyncio.sleep(5)
+        return "done"
+
+    journal: list[ToolObservation] = []
+
+    async def observer(observation: ToolObservation) -> None:
+        journal.append(observation)
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("slow", {}, id="t1"))])
+    agent = Agent(
+        provider, model="m", tools=[slow], tool_timeout=None, run_timeout=0.2,
+        tool_observer=observer,
+    )
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert [o.phase for o in journal] == ["intent", "outcome"]
+    outcome = journal[-1].result
+    assert outcome is not None and outcome.is_error and outcome.tool_use_id == "t1"
+
+
+async def test_run_timeout_is_not_reported_as_a_provider_failure() -> None:
+    events: list[Any] = []
+
+    class SlowAfterDelta:
+        name = "slow"
+
+        async def stream(self, req: Any) -> Any:
+            yield ProviderTextDelta(text="partial")
+            await asyncio.sleep(1)
+
+    agent = Agent(SlowAfterDelta(), model="m", run_timeout=0.1, observers=[events.append])
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    failed = [e for e in events if e.name == "provider.attempt.failed"]
+    assert all(e.exception_type != "_RunExpired" for e in failed)
+    assert events[-1].name == "run.timed_out"
