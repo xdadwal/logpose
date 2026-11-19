@@ -9,7 +9,7 @@ one of :data:`Event`; the terminal :class:`RunEnd` carries the same
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Union
+from typing import Any, Generic, TypeVar, Union
 
 from logpose.messages import Message, StopReason, Usage
 
@@ -23,6 +23,8 @@ __all__ = [
     "RunEnd",
     "Event",
 ]
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ class TurnEnd:
 
 
 @dataclass(frozen=True)
-class RunResult:
+class RunResult(Generic[T]):
     """The outcome of a complete run.
 
     Attributes:
@@ -102,6 +104,8 @@ class RunResult:
         usage: Token usage aggregated across every turn of the run.
         stop_reason: Why the final turn stopped.
         iterations: Number of provider turns the loop took.
+        output: The validated structured answer when the run had an
+            ``output_type``; ``None`` otherwise. ``text`` keeps the raw JSON.
     """
 
     text: str
@@ -109,6 +113,7 @@ class RunResult:
     usage: Usage = field(default_factory=Usage)
     stop_reason: StopReason = "end_turn"
     iterations: int = 0
+    output: T | None = None
 
 
 @dataclass(frozen=True)
@@ -119,7 +124,7 @@ class RunEnd:
         result: The completed :class:`RunResult`.
     """
 
-    result: RunResult
+    result: RunResult[Any]
 
 
 Event = Union[  # noqa: UP007 - explicit Union keeps the alias importable at runtime
