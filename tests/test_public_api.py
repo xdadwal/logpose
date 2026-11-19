@@ -83,6 +83,7 @@ EXPECTED_API = {
     "AuthError",
     "ProviderError",
     "MaxIterationsError",
+    "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
     # provider seam
@@ -158,6 +159,7 @@ OWNERS = {
     "AuthError": "logpose.errors",
     "ProviderError": "logpose.errors",
     "MaxIterationsError": "logpose.errors",
+    "RunTimeoutError": "logpose.errors",
     "ToolSchemaError": "logpose.errors",
     "ToolExecutionError": "logpose.errors",
     "Provider": "logpose.providers.base",

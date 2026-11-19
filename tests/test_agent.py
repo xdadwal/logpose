@@ -24,7 +24,13 @@ from logpose.agent import (
     ToolGateResult,
 )
 from logpose.cancellation import current_tool_deadline
-from logpose.errors import AuthError, LogposeError, MaxIterationsError, ProviderError
+from logpose.errors import (
+    AuthError,
+    LogposeError,
+    MaxIterationsError,
+    ProviderError,
+    RunTimeoutError,
+)
 from logpose.events import (
     Event,
     RunEnd,
@@ -263,7 +269,7 @@ async def test_max_tokens_falls_back_to_the_providers_own_ceiling() -> None:
     # A provider with no opinion gets the loop's documented default.
     bare = FakeProvider([ScriptedTurn.text("hi")])
     await Agent(bare, model="test-model").run("hello")
-    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 32000
+    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 8192
 
 
 async def test_deltas_are_re_emitted_as_public_events() -> None:
@@ -985,8 +991,8 @@ async def test_default_iterations_remain_finite() -> None:
     )
     with pytest.raises(MaxIterationsError) as excinfo:
         await Agent(provider, model="test-model", tools=[add]).run("keep going")
-    assert excinfo.value.max_iterations == 25
-    assert provider.call_count == 25
+    assert excinfo.value.max_iterations == 10
+    assert provider.call_count == 10
 
 
 async def test_max_iterations_partial_history_lands_in_the_conversation() -> None:
@@ -1623,11 +1629,11 @@ def test_a_plain_function_is_rejected_with_a_hint() -> None:
 
 def test_repr_describes_the_configuration() -> None:
     agent = Agent(FakeProvider(), model="m", tools=[add])
-    assert repr(agent) == "Agent(provider='fake', model='m', tools=1, max_iterations=25)"
+    assert repr(agent) == "Agent(provider='fake', model='m', tools=1, max_iterations=10)"
 
 
-def test_no_turn_deadline_by_default() -> None:
-    assert Agent(FakeProvider(), model="m")._turn_timeout() is None
+def test_turn_deadline_defaults_to_120s() -> None:
+    assert Agent(FakeProvider(), model="m")._turn_timeout() == 120
 
 
 def test_turn_deadline_is_used_when_set() -> None:
@@ -1872,3 +1878,116 @@ async def test_tool_use_block_input_reaches_the_handler_unparsed() -> None:
     await Agent(provider, model="test-model", tools=[record]).run("go")
 
     assert seen == [{"nested": [1, 2]}]
+
+
+# ---------------------------------------------------------------------------
+# web-app safe limits and the whole-run deadline
+# ---------------------------------------------------------------------------
+
+
+async def test_web_app_defaults() -> None:
+    provider = FakeProvider([ScriptedTurn.text("hi")])
+    agent = Agent(provider, model="m")
+    assert agent.max_iterations == 10
+    assert agent.tool_timeout == 30
+    assert agent.provider_turn_timeout == 120
+    assert agent.run_timeout == 320
+    await agent.run("hello")
+    assert provider.last_request.max_tokens == 8192
+
+
+async def test_run_timeout_raises_with_partial_history() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}), delay=0.2)],
+        repeat_last=True,
+    )
+    agent = Agent(
+        provider, model="m", tools=[add], run_timeout=0.3, provider_turn_timeout=None
+    )
+    with pytest.raises(RunTimeoutError) as excinfo:
+        await agent.run("go")
+    assert excinfo.value.run_timeout == 0.3
+    assert excinfo.value.messages
+
+
+async def test_run_deadline_binding_during_streaming_is_not_a_provider_error() -> None:
+    class SlowAfterDelta:
+        name = "slow"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, req: Any) -> Any:
+            self.calls += 1
+            yield ProviderTextDelta(text="partial")
+            await asyncio.sleep(1)
+
+    provider = SlowAfterDelta()
+    agent = Agent(provider, model="m", provider_turn_timeout=5, run_timeout=0.1)
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert provider.calls == 1
+
+
+async def test_run_deadline_cuts_retry_backoff() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.failure(ProviderError("busy", retryable=True, retry_after=5))],
+        repeat_last=True,
+    )
+    agent = Agent(
+        provider,
+        model="m",
+        retry_policy=RetryPolicy(max_attempts=3, max_retry_after=5, jitter=0),
+        run_timeout=0.2,
+    )
+    started = time.monotonic()
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert time.monotonic() - started < 1
+
+
+async def test_run_deadline_bounds_tool_execution() -> None:
+    @tool
+    async def slow() -> str:
+        """Sleep for a long time."""
+        await asyncio.sleep(5)
+        return "done"
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("slow", {}))], repeat_last=True)
+    agent = Agent(provider, model="m", tools=[slow], tool_timeout=None, run_timeout=0.2)
+    started = time.monotonic()
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert time.monotonic() - started < 1
+
+
+async def test_unlimited_run_and_turn_are_allowed() -> None:
+    provider = FakeProvider([ScriptedTurn.text("hi")])
+    agent = Agent(provider, model="m", run_timeout=None, provider_turn_timeout=None)
+    assert agent._turn_timeout() is None
+    assert (await agent.run("hello")).text == "hi"
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, "x"])
+def test_run_timeout_validation(bad: Any) -> None:
+    with pytest.raises(LogposeError, match="run_timeout"):
+        Agent(FakeProvider(), model="m", run_timeout=bad)
+
+
+async def test_run_timed_out_event_is_emitted() -> None:
+    names: list[str] = []
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}), delay=0.2)],
+        repeat_last=True,
+    )
+    agent = Agent(
+        provider,
+        model="m",
+        tools=[add],
+        run_timeout=0.1,
+        provider_turn_timeout=None,
+        observers=[lambda event: names.append(event.name)],
+    )
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert "run.timed_out" in names

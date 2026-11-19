@@ -57,6 +57,7 @@ from logpose.errors import (
     LogposeError,
     MaxIterationsError,
     ProviderError,
+    RunTimeoutError,
     ToolExecutionError,
     ToolSchemaError,
 )
@@ -167,6 +168,7 @@ __all__ = [
     "AuthError",
     "ProviderError",
     "MaxIterationsError",
+    "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
     # provider seam (for writing your own backend)

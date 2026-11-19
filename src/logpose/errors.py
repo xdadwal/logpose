@@ -24,6 +24,7 @@ __all__ = [
     "AuthError",
     "ProviderError",
     "MaxIterationsError",
+    "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
 ]
@@ -202,6 +203,32 @@ class MaxIterationsError(LogposeError):
         self.message = message
         self.messages = messages
         self.max_iterations = max_iterations
+
+
+class RunTimeoutError(LogposeError):
+    """Raised when a whole run exceeds ``Agent(run_timeout=...)``.
+
+    Never retried. Carries the partial conversation, like
+    :class:`MaxIterationsError`.
+
+    Attributes:
+        message: Human-readable description of the failure.
+        messages: The full conversation accumulated so far, including the input.
+        run_timeout: The deadline, in seconds, that was exceeded.
+    """
+
+    def __init__(self, message: str, messages: list[Message], run_timeout: float) -> None:
+        """Initialize the error.
+
+        Args:
+            message: Human-readable description of the failure.
+            messages: The full conversation accumulated so far, including the input.
+            run_timeout: The deadline, in seconds, that was exceeded.
+        """
+        super().__init__(message)
+        self.message = message
+        self.messages = messages
+        self.run_timeout = run_timeout
 
 
 class ToolSchemaError(LogposeError):

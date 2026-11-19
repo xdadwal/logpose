@@ -89,7 +89,13 @@ from logpose.cancellation import (
     _install_deadline_handle,
 )
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
-from logpose.errors import LogposeError, MaxIterationsError, ProviderError, ToolExecutionError
+from logpose.errors import (
+    LogposeError,
+    MaxIterationsError,
+    ProviderError,
+    RunTimeoutError,
+    ToolExecutionError,
+)
 from logpose.events import (
     Event,
     RunEnd,
@@ -136,28 +142,36 @@ __all__ = [
     "DEFAULT_MAX_ITERATIONS",
     "DEFAULT_MAX_TOKENS",
     "DEFAULT_MAX_CONCURRENT_TOOLS",
+    "DEFAULT_PROVIDER_TURN_TIMEOUT",
+    "DEFAULT_RUN_TIMEOUT",
     "DEFAULT_TOOL_TIMEOUT",
     "EMPTY_TOOL_RESULT",
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",
 ]
 
-DEFAULT_MAX_ITERATIONS = 25
+DEFAULT_MAX_ITERATIONS = 10
 """Provider round trips a single run may take before it gives up."""
 
-DEFAULT_MAX_TOKENS = 32000
+DEFAULT_MAX_TOKENS = 8192
 """Output-token ceiling used when neither the agent nor the provider names one.
 
 An explicit ``Agent(max_tokens=...)`` wins; failing that the provider's own
 ``max_tokens`` is honoured, so configuring a provider to cap output cost is not
-silently overridden. Sized so a current reasoning model has room to think
-and still answer; lower it for small-context local models.
+silently overridden. Sized so moderate reasoning plus an answer fits inside
+:data:`DEFAULT_PROVIDER_TURN_TIMEOUT`; raise both together for long outputs.
 """
+
+DEFAULT_PROVIDER_TURN_TIMEOUT = 120.0
+"""Deadline, in seconds, for one complete provider turn. ``None`` disables it."""
+
+DEFAULT_RUN_TIMEOUT = 320.0
+"""Wall-clock deadline, in seconds, for a whole run. ``None`` disables it."""
 
 DEFAULT_MAX_CONCURRENT_TOOLS = 8
 """Maximum tool handlers one agent executes at once across concurrent runs."""
 
-DEFAULT_TOOL_TIMEOUT = 300.0
+DEFAULT_TOOL_TIMEOUT = 30.0
 """Default execution deadline, in seconds, for one tool after queueing."""
 
 EMPTY_TOOL_RESULT = "(no output)"
@@ -356,7 +370,8 @@ class Agent:
         max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         max_tokens: int | None = None,
         retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
-        provider_turn_timeout: float | None = None,
+        provider_turn_timeout: float | None = DEFAULT_PROVIDER_TURN_TIMEOUT,
+        run_timeout: float | None = DEFAULT_RUN_TIMEOUT,
         max_concurrent_tools: int = DEFAULT_MAX_CONCURRENT_TOOLS,
         tool_timeout: float | None = DEFAULT_TOOL_TIMEOUT,
         tool_error_mode: ToolErrorMode = "safe",
@@ -389,8 +404,13 @@ class Agent:
             retry_policy: Provider retry timing. Retryable failures are replayed
                 only before a text or reasoning delta reaches the caller;
                 ``RetryPolicy(max_attempts=1)`` disables retries.
-            provider_turn_timeout: Complete-turn deadline in seconds, or
-                ``None`` (the default) for no deadline.
+            provider_turn_timeout: Complete-turn deadline in seconds (default
+                120), or ``None`` for no deadline.
+            run_timeout: Wall-clock deadline in seconds for a whole run
+                (default 320), measured from the start of ``run``/``stream``
+                and including time the caller spends between streamed events.
+                Expiry raises :class:`~logpose.errors.RunTimeoutError` and is
+                never retried. ``None`` disables it.
             max_concurrent_tools: Tool handlers this agent may execute at once,
                 across all of its concurrent runs. Extra calls wait for capacity.
             tool_timeout: Execution deadline in seconds after a call acquires
@@ -456,6 +476,14 @@ class Agent:
                 "provider_turn_timeout must be a positive number or None; "
                 f"got {provider_turn_timeout!r}."
             )
+        if run_timeout is not None and (
+            isinstance(run_timeout, bool)
+            or not isinstance(run_timeout, (int, float))
+            or run_timeout <= 0
+        ):
+            raise LogposeError(
+                f"run_timeout must be a positive number or None; got {run_timeout!r}."
+            )
         if (
             isinstance(max_concurrent_tools, bool)
             or not isinstance(max_concurrent_tools, int)
@@ -509,6 +537,7 @@ class Agent:
         self.max_tokens = max_tokens
         self.retry_policy = retry_policy
         self.provider_turn_timeout = provider_turn_timeout
+        self.run_timeout = run_timeout
         self.max_concurrent_tools = max_concurrent_tools
         self.tool_timeout = tool_timeout
         self.tool_error_mode = tool_error_mode
@@ -752,6 +781,7 @@ class Agent:
         Raises:
             LogposeError: If no model could be resolved for the request.
             MaxIterationsError: If the run exceeds ``max_iterations``.
+            RunTimeoutError: If the run exceeds ``run_timeout``.
             ProviderError: If the provider fails or violates its contract.
         """
         model = self._model()
@@ -759,17 +789,20 @@ class Agent:
             run_id=self._runtime_id("run"), provider=self.provider_name, model=model
         )
         started_at = monotonic()
+        run_deadline = started_at + self.run_timeout if self.run_timeout is not None else None
         self._emit_runtime("run.started", context=run_context)
+        history: list[Message] = conversation.messages if conversation is not None else []
+        iterations = 0
         try:
-            history: list[Message] = conversation.messages if conversation is not None else []
             if prompt is not None:
                 history.append(prompt)
 
             total_usage = Usage()
-            iterations = 0
             last: CompletionDone | None = None
 
             while True:
+                if _remaining(run_deadline) == 0.0:
+                    raise _RunExpired
                 if self.max_iterations is not None and iterations >= self.max_iterations:
                     raise MaxIterationsError(
                         f"Gave up after {iterations} provider iterations without a final answer "
@@ -784,8 +817,9 @@ class Agent:
                     request_id=self._runtime_id("request"),
                 )
                 done: CompletionDone | None = None
-                request = await self._prepare_request(history)
-                turn_stream = self._provider_turn(request, turn_context)
+                async with _run_budget(run_deadline):
+                    request = await self._prepare_request(history)
+                turn_stream = self._provider_turn(request, turn_context, run_deadline)
                 try:
                     async for event in turn_stream:
                         if isinstance(event, ProviderTextDelta):
@@ -837,7 +871,8 @@ class Agent:
                         break
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
-                    results = await self._execute(calls, turn_context)
+                    async with _run_budget(run_deadline):
+                        results = await self._execute(calls, turn_context)
                     for call, tool_result in zip(calls, results, strict=True):
                         yield ToolResult(
                             id=tool_result.tool_use_id,
@@ -872,6 +907,18 @@ class Agent:
                 cache_creation_input_tokens=result.usage.cache_creation_input_tokens,
             )
             yield RunEnd(result=result)
+        except _RunExpired:
+            self._emit_runtime(
+                "run.timed_out",
+                context=run_context,
+                duration_seconds=monotonic() - started_at,
+                iterations=iterations,
+            )
+            raise RunTimeoutError(
+                f"Run exceeded run_timeout={self.run_timeout}s.",
+                list(history),
+                float(self.run_timeout or 0.0),
+            ) from None
         except asyncio.CancelledError:
             self._emit_runtime(
                 "run.cancelled", context=run_context, duration_seconds=monotonic() - started_at
@@ -879,7 +926,10 @@ class Agent:
             raise
 
     async def _provider_turn(
-        self, request: CompletionRequest, turn_context: RuntimeContext
+        self,
+        request: CompletionRequest,
+        turn_context: RuntimeContext,
+        run_deadline: float | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream one provider turn with safe, pre-delta retries.
 
@@ -909,8 +959,13 @@ class Agent:
                 provider_stream = self.provider.stream(request)
             finally:
                 _reset_runtime_context(provider_token)
+            turn_timeout = self._turn_timeout()
+            run_left = _remaining(run_deadline)
+            if run_left == 0.0:
+                raise _RunExpired
+            run_binding = run_left is not None and (turn_timeout is None or run_left < turn_timeout)
             try:
-                async with _deadline(self._turn_timeout()):
+                async with _deadline(run_left if run_binding else turn_timeout):
                     while True:
                         try:
                             event = await _next_with_runtime_context(
@@ -935,6 +990,8 @@ class Agent:
                                 f"of type {type(event).__name__}."
                             )
             except TimeoutError:
+                if run_binding:
+                    raise _RunExpired from None
                 exc = ProviderError(
                     f"Provider {self.provider_name!r} exceeded its complete-turn deadline.",
                     retryable=True,
@@ -967,6 +1024,7 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
+                _check_backoff(delay, run_deadline)
                 await asyncio.sleep(delay)
                 continue
             except ProviderError as exc:
@@ -997,6 +1055,7 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
+                _check_backoff(delay, run_deadline)
                 await asyncio.sleep(delay)
                 continue
             except Exception as exc:
@@ -1496,6 +1555,37 @@ async def _aclose_with_runtime_context(
         await _aclose(iterator)
     finally:
         _reset_runtime_context(token)
+
+
+class _RunExpired(Exception):
+    """Internal signal: the whole-run deadline passed. Becomes RunTimeoutError."""
+
+
+def _remaining(run_deadline: float | None) -> float | None:
+    """Seconds left before ``run_deadline`` (never negative), or ``None`` if unbounded."""
+    if run_deadline is None:
+        return None
+    return max(0.0, run_deadline - monotonic())
+
+
+def _check_backoff(delay: float, run_deadline: float | None) -> None:
+    """Refuse a retry sleep that would outlast the run deadline."""
+    left = _remaining(run_deadline)
+    if left is not None and delay >= left:
+        raise _RunExpired
+
+
+@contextlib.asynccontextmanager
+async def _run_budget(run_deadline: float | None) -> AsyncIterator[None]:
+    """Bound a block by the time left in the run, signalling expiry as _RunExpired."""
+    left = _remaining(run_deadline)
+    if left == 0.0:
+        raise _RunExpired
+    try:
+        async with _deadline(left):
+            yield
+    except TimeoutError:
+        raise _RunExpired from None
 
 
 @contextlib.asynccontextmanager
