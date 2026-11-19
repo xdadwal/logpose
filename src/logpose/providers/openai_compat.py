@@ -67,6 +67,7 @@ from logpose.providers.base import (
 
 __all__ = [
     "AUTO_MODEL",
+    "DEFAULT_HTTP_TIMEOUT",
     "ENV_API_KEY",
     "ENV_BASE_URL",
     "UNPARSED_ARGUMENTS_KEY",
@@ -78,6 +79,10 @@ ENV_BASE_URL = "LOGPOSE_BASE_URL"
 
 ENV_API_KEY = "LOGPOSE_API_KEY"
 """Environment variable read when ``api_key=`` is not passed."""
+
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+"""Web-app safe HTTP timeouts. ``read`` is the longest silence allowed between
+streamed chunks, not a cap on the whole turn."""
 
 AUTO_MODEL = "auto"
 """Sentinel model id meaning "ask the server what it has and use the first one".
@@ -318,7 +323,7 @@ class OpenAICompatProvider:
         base_url: str | None = None,
         api_key: str | None = None,
         max_tokens: int | None = None,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: float | httpx.Timeout | None = DEFAULT_HTTP_TIMEOUT,
         parse_think_tags: bool = True,
         default_headers: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
@@ -337,8 +342,9 @@ class OpenAICompatProvider:
                 env var is set.
             max_tokens: Output-token ceiling for a turn, or ``None`` to let the
                 agent decide.
-            timeout: httpx timeout. ``None`` (the default) disables every
-                HTTP timeout; the application owns deadlines.
+            timeout: httpx timeout. Defaults to :data:`DEFAULT_HTTP_TIMEOUT`
+                (connect 5 s, read 60 s, write 10 s, pool 5 s); ``None`` disables
+                every HTTP timeout.
             parse_think_tags: Split ``<think>`` blocks out of content into
                 reasoning. Harmless for models that do not use them.
             default_headers: Extra headers sent with every request.
@@ -358,7 +364,7 @@ class OpenAICompatProvider:
                 f"{ENV_BASE_URL}."
             )
         if timeout is None:
-            # No implicit deadline: httpx's own 5s default would otherwise apply.
+            # Explicitly unlimited: httpx's own 5s default would otherwise apply.
             timeout = httpx.Timeout(None)
 
         self.base_url = resolved_base.rstrip("/")

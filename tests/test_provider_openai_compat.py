@@ -653,8 +653,13 @@ def test_max_tokens_defaults_to_none() -> None:
     assert OpenAICompatProvider(base_url=BASE).max_tokens is None
 
 
-def test_timeout_none_disables_http_timeouts() -> None:
+def test_default_http_timeout_is_web_app_safe() -> None:
     provider = OpenAICompatProvider(base_url=BASE)
+    assert provider._http().timeout == httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+
+
+def test_timeout_none_disables_http_timeouts() -> None:
+    provider = OpenAICompatProvider(base_url=BASE, timeout=None)
     assert provider._http().timeout == httpx.Timeout(None)
 
 
