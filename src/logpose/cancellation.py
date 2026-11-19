@@ -49,8 +49,9 @@ class ToolDeadlineHandle:
 def current_tool_deadline() -> ToolDeadlineHandle | None:
     """Return the handle for the tool invocation running in this context.
 
-    ``None`` when no deadline is enforced (``tool_timeout=None``) or when
-    called outside a tool invocation. The handle is shared between the event
+    ``None`` when no deadline can stop the tool (both ``tool_timeout`` and
+    ``run_timeout`` are ``None``) or when called outside a tool invocation.
+    Terminators run when either deadline fires. The handle is shared between the event
     loop and the handler thread, so registrations made inside the handler are
     visible to the loop when the deadline fires.
     """

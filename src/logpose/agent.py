@@ -871,8 +871,26 @@ class Agent:
                         break
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
-                    async with _run_budget(run_deadline):
-                        results = await self._execute(calls, turn_context)
+                    try:
+                        async with _run_budget(run_deadline):
+                            results = await self._execute(calls, turn_context)
+                    except _RunExpired:
+                        # Every tool_use needs a tool_result, or the next request
+                        # on this conversation is rejected by the provider.
+                        history.append(
+                            Message(
+                                role="user",
+                                content=[
+                                    ToolResultBlock(
+                                        tool_use_id=call.id,
+                                        content="Run deadline exceeded before this tool finished.",
+                                        is_error=True,
+                                    )
+                                    for call in calls
+                                ],
+                            )
+                        )
+                        raise
                     for call, tool_result in zip(calls, results, strict=True):
                         yield ToolResult(
                             id=tool_result.tool_use_id,
@@ -960,38 +978,35 @@ class Agent:
             finally:
                 _reset_runtime_context(provider_token)
             turn_timeout = self._turn_timeout()
-            run_left = _remaining(run_deadline)
-            if run_left == 0.0:
-                raise _RunExpired
-            run_binding = run_left is not None and (turn_timeout is None or run_left < turn_timeout)
+            turn_deadline = started_at + turn_timeout if turn_timeout is not None else None
             try:
-                async with _deadline(run_left if run_binding else turn_timeout):
-                    while True:
-                        try:
-                            event = await _next_with_runtime_context(
-                                provider_stream, attempt_context
-                            )
-                        except StopAsyncIteration:
-                            break
-                        if done is not None:
-                            raise ProviderError(
-                                f"Provider {self.provider_name!r} yielded "
-                                f"{type(event).__name__} after CompletionDone; a provider stream "
-                                "must end with exactly one CompletionDone.",
-                            )
-                        if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
-                            emitted = True
-                            yield event
-                        elif isinstance(event, CompletionDone):
-                            done = event
-                        else:
-                            raise ProviderError(
-                                f"Provider {self.provider_name!r} yielded an unsupported event "
-                                f"of type {type(event).__name__}."
-                            )
+                # Deadlines are absolute and enforced only around each provider
+                # await, never across a ``yield``: the caller's own code between
+                # events must not be cancelled by logpose.
+                while True:
+                    try:
+                        event = await _next_within(
+                            provider_stream, attempt_context, turn_deadline, run_deadline
+                        )
+                    except StopAsyncIteration:
+                        break
+                    if done is not None:
+                        raise ProviderError(
+                            f"Provider {self.provider_name!r} yielded "
+                            f"{type(event).__name__} after CompletionDone; a provider stream "
+                            "must end with exactly one CompletionDone.",
+                        )
+                    if isinstance(event, (ProviderTextDelta, ProviderThinkingDelta)):
+                        emitted = True
+                        yield event
+                    elif isinstance(event, CompletionDone):
+                        done = event
+                    else:
+                        raise ProviderError(
+                            f"Provider {self.provider_name!r} yielded an unsupported event "
+                            f"of type {type(event).__name__}."
+                        )
             except TimeoutError:
-                if run_binding:
-                    raise _RunExpired from None
                 exc = ProviderError(
                     f"Provider {self.provider_name!r} exceeded its complete-turn deadline.",
                     retryable=True,
@@ -1341,7 +1356,10 @@ class Agent:
         """
         context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
         token = _set_runtime_context(context)
-        deadline = ToolDeadlineHandle() if self.tool_timeout is not None else None
+        # A handle exists whenever any deadline can stop this tool, so a run
+        # deadline can terminate it just like a tool deadline.
+        has_deadline = self.tool_timeout is not None or self.run_timeout is not None
+        deadline = ToolDeadlineHandle() if has_deadline else None
         if deadline is not None:
             # Installed before invoke() so the to_thread copy of this context
             # carries the handle into the handler thread.
@@ -1371,6 +1389,12 @@ class Agent:
                             tool_def.invoke(call.input),
                             timeout=self.tool_timeout,
                         )
+                except asyncio.CancelledError:
+                    # Run deadline or abandoned stream: stop what can be stopped
+                    # before the slot is released.
+                    if deadline is not None:
+                        deadline.terminate()
+                    raise
                 except asyncio.TimeoutError:
                     if deadline is not None:
                         deadline.terminate()
@@ -1573,6 +1597,34 @@ def _check_backoff(delay: float, run_deadline: float | None) -> None:
     left = _remaining(run_deadline)
     if left is not None and delay >= left:
         raise _RunExpired
+
+
+async def _next_within(
+    iterator: AsyncIterator[ProviderEvent],
+    context: RuntimeContext,
+    turn_deadline: float | None,
+    run_deadline: float | None,
+) -> ProviderEvent:
+    """Await the next provider event within whichever deadline comes first.
+
+    Raises ``_RunExpired`` when the run deadline is the one that ran out, and
+    ``TimeoutError`` when the turn deadline did.
+    """
+    run_left = _remaining(run_deadline)
+    turn_left = _remaining(turn_deadline)
+    if run_left == 0.0:
+        raise _RunExpired
+    if turn_left == 0.0:
+        raise TimeoutError
+    run_binding = run_left is not None and (turn_left is None or run_left <= turn_left)
+    budget = run_left if run_binding else turn_left
+    try:
+        async with _deadline(budget):
+            return await _next_with_runtime_context(iterator, context)
+    except TimeoutError:
+        if run_binding:
+            raise _RunExpired from None
+        raise
 
 
 @contextlib.asynccontextmanager

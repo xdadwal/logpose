@@ -1991,3 +1991,79 @@ async def test_run_timed_out_event_is_emitted() -> None:
     with pytest.raises(RunTimeoutError):
         await agent.run("go")
     assert "run.timed_out" in names
+
+
+async def test_run_deadline_never_cancels_the_consumer_between_events() -> None:
+    """A slow consumer (e.g. a websocket send) must get RunTimeoutError, not a
+    CancelledError injected into its own code."""
+    provider = FakeProvider(
+        [ScriptedTurn.text("abc", chunks=["a", "b", "c"])], repeat_last=True
+    )
+    agent = Agent(provider, model="m", run_timeout=0.2)
+    seen: list[str] = []
+    with pytest.raises(RunTimeoutError):
+        async for event in agent.stream("go"):
+            if isinstance(event, TextDelta):
+                seen.append(event.text)
+                await asyncio.sleep(0.3)  # consumer work that outlives the run
+    assert seen == ["a"]
+    task = asyncio.current_task()
+    if task is not None and hasattr(task, "cancelling"):
+        assert task.cancelling() == 0
+
+
+async def test_turn_deadline_never_cancels_the_consumer_between_events() -> None:
+    provider = FakeProvider([ScriptedTurn.text("abc", chunks=["a", "b", "c"])])
+    agent = Agent(provider, model="m", provider_turn_timeout=0.2, run_timeout=None)
+    with pytest.raises(ProviderError) as excinfo:
+        async for event in agent.stream("go"):
+            if isinstance(event, TextDelta):
+                await asyncio.sleep(0.3)
+    assert excinfo.value.error_code == "turn_timeout"
+    assert excinfo.value.partial is True
+
+
+async def test_run_timeout_during_tools_keeps_the_conversation_valid() -> None:
+    @tool
+    async def slow() -> str:
+        """Sleep for a long time."""
+        await asyncio.sleep(5)
+        return "done"
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("slow", {}, id="t1"), tool_call("slow", {}, id="t2"))]
+    )
+    conversation = Conversation()
+    agent = Agent(provider, model="m", tools=[slow], tool_timeout=None, run_timeout=0.2)
+    with pytest.raises(RunTimeoutError) as excinfo:
+        await agent.run("go", conversation=conversation)
+    last = conversation.messages[-1]
+    assert last.role == "user"
+    results = [b for b in last.content if isinstance(b, ToolResultBlock)]
+    assert [r.tool_use_id for r in results] == ["t1", "t2"]
+    assert all(r.is_error for r in results)
+    assert excinfo.value.messages[-1] == last
+
+
+async def test_run_timeout_terminates_running_sync_tools() -> None:
+    import threading
+
+    released = threading.Event()
+    terminated: list[bool] = []
+
+    @tool
+    def blocking() -> str:
+        """Block until terminated."""
+        handle = current_tool_deadline()
+        assert handle is not None
+        handle.register_terminator(lambda: (terminated.append(True), released.set()))
+        released.wait(5)
+        return "done"
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("blocking", {}))])
+    agent = Agent(provider, model="m", tools=[blocking], tool_timeout=None, run_timeout=0.2)
+    started = time.monotonic()
+    with pytest.raises(RunTimeoutError):
+        await agent.run("go")
+    assert terminated == [True]
+    assert time.monotonic() - started < 2

@@ -273,7 +273,12 @@ except RunTimeoutError as exc:
 ```
 
 A run that exceeds `run_timeout` raises `RunTimeoutError` with the partial
-history; it is never retried. A turn timeout before any delta can use the retry
+history; it is never retried. Deadlines are enforced only while logpose waits on
+the provider or on tools, never inside your code between streamed events. If the
+deadline passes while tools run, they are cancelled (registered terminators
+run), and each unfinished call gets an error tool result so the conversation
+stays valid for the next run. Approval gates (`on_tool_call`) count against the
+run deadline too. A turn timeout before any delta can use the retry
 policy; a timeout after output is partial and is not replayed.
 
 ## Defining tools
