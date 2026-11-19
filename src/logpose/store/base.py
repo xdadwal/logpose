@@ -47,7 +47,18 @@ class RunRecord:
 
 
 class SessionHandle:
-    """A leased session: loaded history plus metadata."""
+    """A leased session: loaded history plus metadata.
+
+    Attributes:
+        id: The session ID.
+        conversation: The history loaded on enter; append to it inside the block.
+        metadata: The session metadata after merging any metadata given on enter.
+        created: True if the session was new (or had expired) on enter.
+        lost: True once the lease is known to be lost; the final save is then refused.
+        loaded_count: How many messages were loaded on enter. Messages after this
+            index in ``conversation.messages`` are new and are saved on exit.
+        next_seq: The stored ``seq`` the first new message will get.
+    """
 
     def __init__(
         self,
@@ -56,12 +67,20 @@ class SessionHandle:
         metadata: dict[str, str],
         created: bool,
         lost: bool = False,
+        loaded_count: int = 0,
+        next_seq: int = 0,
     ) -> None:
         self.id = id
         self.conversation = conversation
         self.metadata = metadata
         self.created = created
         self.lost = lost
+        self.loaded_count = loaded_count
+        self.next_seq = next_seq
+
+    def new_messages(self) -> list[Message]:
+        """Return the messages appended to ``conversation`` since it was loaded."""
+        return self.conversation.messages[self.loaded_count :]
 
 
 class SessionStore(Protocol):
