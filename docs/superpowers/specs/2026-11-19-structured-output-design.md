@@ -78,8 +78,18 @@ Structured Outputs mechanism.
   - every object lists all its properties in `required`;
   - every object has `additionalProperties: false`;
   - a field that has a default becomes a nullable union, so the model must send
-    it, possibly as `null`;
-  - nested models stay as `$defs` / `$ref`.
+    it, possibly as `null`. A defaulted single-value `Literal` (a discriminator
+    tag) stays a required constant;
+  - nested models stay as `$defs` / `$ref`, except a `$ref` with sibling keys
+    (e.g. a `description`), which strict mode rejects. Such a `$ref` is inlined
+    with its siblings merged in;
+  - `oneOf` becomes `anyOf` and `discriminator` is dropped, because strict mode
+    allows only `anyOf`. Parsing still validates against the original model;
+  - open-ended mappings (`dict[str, ...]`, `extra="allow"`) and non-object root
+    models (e.g. `RootModel[list[X]]`) cannot be expressed in strict mode. They
+    raise `LogposeError` before any request.
+
+  *(Amended after the final review, 2026-11-19.)*
 - `response_format` goes into `CompletionRequest.extra`. If the caller also set
   `response_format` in `Agent(extra=...)`, raise `LogposeError`: two sources for
   the same field is a configuration mistake. **(Claude's call)** The same applies
