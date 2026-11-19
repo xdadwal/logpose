@@ -12,10 +12,15 @@ output-token ceiling sized for current reasoning models.
 ## Goals
 
 - `openai-compat` is the only built-in provider; `docker` is removed.
-- Provider configuration reads only `LOGPOSE_BASE_URL`, `LOGPOSE_MODEL`,
-  `LOGPOSE_API_KEY` (no `OPENAI_*` / `DOCKER_*`).
-- A missing base URL or model raises `LogposeError` naming the argument and the
-  env var. A missing API key means no auth header (local servers).
+- Amended 2026-11-19: model made mandatory on `Agent` (see below).
+- Provider configuration reads only `LOGPOSE_BASE_URL` and `LOGPOSE_API_KEY`
+  (no `OPENAI_*` / `DOCKER_*`).
+- A missing base URL raises `LogposeError` naming the argument and the env var.
+  A missing API key means no auth header (local servers).
+- `model=` is a required keyword argument of `Agent`; an empty or blank string
+  raises `LogposeError`. The model lives only on the Agent: the provider `model=`
+  argument, `LOGPOSE_MODEL`, and the `Provider.model_default` protocol attribute
+  are removed. Direct provider callers already pass `CompletionRequest.model`.
 - `model="auto"` remains as an explicit opt-in to "use the first listed model".
 - One output ceiling: `Agent` default `max_tokens=32000`. Precedence is unchanged:
   `Agent(max_tokens=)`, then provider `max_tokens=` (now `None` by default), then
@@ -50,8 +55,7 @@ output-token ceiling sized for current reasoning models.
 ## Builder notes
 
 - `ProviderInfo` for `openai-compat`: `env_vars=("LOGPOSE_BASE_URL",
-  "LOGPOSE_MODEL", "LOGPOSE_API_KEY")`, `base_url_env="LOGPOSE_BASE_URL"`.
-  `provider_status()` should also report a missing `LOGPOSE_MODEL` (Claude's call).
+  "LOGPOSE_API_KEY")`, `base_url_env="LOGPOSE_BASE_URL"`.
 - Remove `DEFAULT_CLOUD_TURN_TIMEOUT`, `DEFAULT_LOCAL_TURN_TIMEOUT`,
   `LOCAL_TURN_TIMEOUT_MULTIPLIER`, `DEFAULT_PROVIDER_TURN_TIMEOUT`, provider
   `turn_timeout` recommendations, and `DEFAULT_DOCKER_BASE_URL`.
