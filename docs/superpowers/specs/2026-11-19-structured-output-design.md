@@ -77,20 +77,29 @@ Structured Outputs mechanism.
   `output_type.model_json_schema()`:
   - every object lists all its properties in `required`;
   - every object has `additionalProperties: false`;
-  - a field that is optional or has a default becomes a nullable union, so the
-    model must send it, possibly as `null`, and pydantic then applies the
-    default when the value is `null`;
+  - a field that has a default becomes a nullable union, so the model must send
+    it, possibly as `null`;
   - nested models stay as `$defs` / `$ref`.
-- `response_format` goes into `CompletionRequest.extra`, so providers need no
-  change. If the caller also set `response_format` in `extra`, raise
-  `LogposeError`: two sources for the same field is a configuration mistake.
+- `response_format` goes into `CompletionRequest.extra`. If the caller also set
+  `response_format` in `Agent(extra=...)`, raise `LogposeError`: two sources for
+  the same field is a configuration mistake. **(Claude's call)** The same applies
+  to `OpenAICompatProvider(extra_body=...)`: the provider raises `LogposeError`
+  when both its `extra_body` and the request set `response_format`, so neither
+  silently overwrites the other.
 - Tools keep working. The model can call tools on any turn, and the run's
   final answer (the turn that ends with no tool calls) is the structured output.
 
 ### Validation and correction
 
-- The final answer's text is parsed with
-  `output_type.model_validate_json(text)`.
+- **Null handling (Claude's call).** Pydantic does not turn `null` into a
+  field's default; `x: int = 5` rejects `null`. So logpose parses the JSON, then
+  removes every `null` value whose field's original annotation does not accept
+  `None`. Each such field then takes its default. This happens recursively,
+  through nested models and items of lists or dicts of models. A field whose
+  annotation accepts `None` (`x: int | None = 5`) keeps the `null`: `null` means
+  `None` there. Validation then runs on the cleaned object with
+  `output_type.model_validate`. The cleaning is guided by the model's fields,
+  not by guessing from values.
 - On a `ValidationError` with retries left, logpose appends the invalid
   assistant message plus a user message stating the validation errors (field
   paths and messages only, never echoing values) and asking for a corrected
@@ -99,14 +108,27 @@ Structured Outputs mechanism.
 - When retries are exhausted, it raises `OutputValidationError(LogposeError)`
   with `raw_text`, `errors` (pydantic's error list without input values),
   `messages` (the partial history), and `output_type`.
+- **History (Claude's call).** After a successful correction, the invalid
+  answer(s) and correction message(s) are removed from the history (including a
+  caller's `Conversation`). Only the valid final answer remains, so later runs
+  never replay them. On failure, nothing is removed: `messages` and the
+  `Conversation` keep the full exchange for debugging, still a valid
+  user/assistant alternation.
+- **Precedence (Claude's call).** A correction turn that hits `max_iterations`
+  or `run_timeout` raises `MaxIterationsError` / `RunTimeoutError`. Run-wide
+  limits win over output validation, consistent with how they end any other
+  turn.
 
 ### Special endings (no correction turn)
 
 - **Refusal.** The server sends a `refusal` delta or field, or
   `finish_reason == "content_filter"`. logpose raises
-  `OutputRefusalError(LogposeError)` with the refusal text and `messages`. This
-  requires the OpenAI-compatible provider to collect the `refusal` field from
-  stream deltas, which it does not do today.
+  `OutputRefusalError(LogposeError)` with the refusal text and `messages`.
+  **Carrying it (Claude's call):** the provider collects `refusal` deltas into a
+  new optional `CompletionDone.refusal: str | None`. The `Message` shape and
+  stored history are unchanged, and the refusal turn is stored (or not) by the
+  existing rules. Without `output_type`, the field is populated but otherwise
+  unused, so non-structured runs behave exactly as today.
 - **Cut off.** `finish_reason == "length"` (stop reason `max_tokens`). logpose
   raises `OutputValidationError` with `reason="max_tokens"` and a message telling
   the caller to raise `max_tokens`. No correction turn: the same limit would cut
@@ -115,7 +137,7 @@ Structured Outputs mechanism.
 ### Flagging incompatible providers
 
 - **Rejected at the server.** If a request carrying `response_format` gets an
-  HTTP 400 whose body mentions `response_format`, `json_schema`, `strict` or
+  HTTP 400 or 422 whose body mentions `response_format`, `json_schema`, `strict` or
   `structured`, logpose raises `StructuredOutputUnsupportedError` (a
   `ProviderError` subclass, not retried). Its message says this server/model
   does not support strict `json_schema` structured output, that logpose requires
