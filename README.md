@@ -172,7 +172,15 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 Each turn's output ceiling defaults to 16384 tokens: room for reasoning plus a
 long answer. A reply that long can take longer than the 120-second turn
 deadline on slower models; if your replies run that long, raise
-`provider_turn_timeout` and `run_timeout` as well. Small local models often need it lower; set it with
+`provider_turn_timeout` and `run_timeout` as well.
+
+The ceiling is sent as `max_completion_tokens`, the field OpenAI (and vLLM and
+llama.cpp) now expect; OpenAI's reasoning models reject the older `max_tokens`.
+For a server that only accepts the legacy field, such as some older Ollama or LM
+Studio builds, pass `OpenAICompatProvider(max_tokens_field="max_tokens")`, or
+`Agent("openai-compat", ..., max_tokens_field="max_tokens")`. A server that
+silently ignores the field applies no output cap; the turn and run deadlines
+still bound it. Small local models often need it lower; set it with
 `Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,

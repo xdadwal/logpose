@@ -908,3 +908,34 @@ async def test_non_json_schema_response_format_rejection_is_a_plain_provider_err
     with pytest.raises(ProviderError) as excinfo:
         await drain(provider, req)
     assert type(excinfo.value) is ProviderError
+
+
+# ---------------------------------------------------------------------------
+# output-limit wire field
+# ---------------------------------------------------------------------------
+
+
+async def test_default_sends_max_completion_tokens() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request(max_tokens=128))
+    assert handler.last_body["max_completion_tokens"] == 128
+    assert "max_tokens" not in handler.last_body
+
+
+async def test_max_tokens_field_can_select_legacy() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler, max_tokens_field="max_tokens"), request(max_tokens=128))
+    assert handler.last_body["max_tokens"] == 128
+    assert "max_completion_tokens" not in handler.last_body
+
+
+def test_invalid_max_tokens_field_rejected() -> None:
+    with pytest.raises(LogposeError, match="max_tokens_field"):
+        OpenAICompatProvider(base_url=BASE, max_tokens_field="max_output_tokens")  # type: ignore[arg-type]
+
+
+async def test_extra_body_legacy_field_passes_through() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler, extra_body={"max_tokens": 50}), request(max_tokens=128))
+    assert handler.last_body["max_tokens"] == 50
+    assert handler.last_body["max_completion_tokens"] == 128
