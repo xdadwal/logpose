@@ -42,3 +42,14 @@ def test_invalid_policy_values_fail_at_construction(kwargs: dict[str, float | in
 def test_delay_rejects_an_invalid_attempt_number() -> None:
     with pytest.raises(LogposeError, match="failed_attempt"):
         RetryPolicy().delay(0)
+
+
+def test_default_policy_is_web_app_safe() -> None:
+    assert RetryPolicy() == RetryPolicy(
+        max_attempts=2,
+        initial_delay=0.5,
+        backoff_multiplier=2.0,
+        max_delay=4.0,
+        jitter=0.2,
+        max_retry_after=10.0,
+    )

@@ -90,6 +90,5 @@ jobs:
           /tmp/check/bin/python -c "
           import logpose
           logpose.resolve('openai-compat', base_url='http://localhost:8000/v1')
-          logpose.resolve('docker')
           print('base provider boundaries clean')
           "

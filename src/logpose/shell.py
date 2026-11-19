@@ -21,14 +21,26 @@ import selectors
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 
+from logpose.cancellation import current_tool_deadline
 from logpose.tools import ToolDef, tool
 
-_DEFAULT_CAPTURE_LIMIT = 16 * 1024 * 1024
-_DEFAULT_TIMEOUT = 600.0
-_DEFAULT_OUTPUT_CAP = 100_000
+_DEFAULT_CAPTURE_LIMIT = 1024 * 1024
+_DEFAULT_TIMEOUT = 25.0
+# Shorter than the agent's 30 s tool_timeout, so this timer fires first and the
+# model sees the partial output instead of a bare "exceeded its limit" result.
+_DEFAULT_OUTPUT_CAP = 16_000
+
+
+def _kill_group(pid: int) -> None:
+    """SIGKILL a process group, ignoring one that has already exited."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def bounded_run(
@@ -67,6 +79,17 @@ def bounded_run(
             start_new_session=True,
         )
         assert process.stdout is not None
+        reaped = threading.Event()
+        handle = current_tool_deadline()
+        if handle is not None:
+            # A tool or run deadline in the agent kills the whole group, so no
+            # child outlives the call that started it. Once this process is
+            # reaped its pid may be reused, so the terminator becomes a no-op.
+            def terminate(pid: int = process.pid) -> None:
+                if not reaped.is_set():
+                    _kill_group(pid)
+
+            handle.register_terminator(terminate)
         settled = False
         try:
             os.set_blocking(process.stdout.fileno(), False)
@@ -106,12 +129,10 @@ def bounded_run(
             # Include inherited pipes/children in the deadline and cleanup, even
             # when the shell has exited but a child still holds stdout open.
             if not settled:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                _kill_group(process.pid)
             process.stdout.close()
             process.wait()
+            reaped.set()
 
 
 def make_shell_tool(

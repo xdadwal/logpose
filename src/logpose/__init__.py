@@ -22,7 +22,7 @@ normalized events. Provider-specific behavior stays behind
 
 
     async def main() -> None:
-        agent = Agent("docker", tools=[get_weather], system="Be concise.")
+        agent = Agent("openai-compat", model="gpt-5.1", tools=[get_weather], system="Be concise.")
         result = await agent.run("What's the weather in Pune?")
         print(result.text, result.usage)
 
@@ -57,6 +57,7 @@ from logpose.errors import (
     LogposeError,
     MaxIterationsError,
     ProviderError,
+    RunTimeoutError,
     ToolExecutionError,
     ToolSchemaError,
 )
@@ -167,6 +168,7 @@ __all__ = [
     "AuthError",
     "ProviderError",
     "MaxIterationsError",
+    "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
     # provider seam (for writing your own backend)

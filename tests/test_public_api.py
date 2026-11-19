@@ -83,6 +83,7 @@ EXPECTED_API = {
     "AuthError",
     "ProviderError",
     "MaxIterationsError",
+    "RunTimeoutError",
     "ToolSchemaError",
     "ToolExecutionError",
     # provider seam
@@ -158,6 +159,7 @@ OWNERS = {
     "AuthError": "logpose.errors",
     "ProviderError": "logpose.errors",
     "MaxIterationsError": "logpose.errors",
+    "RunTimeoutError": "logpose.errors",
     "ToolSchemaError": "logpose.errors",
     "ToolExecutionError": "logpose.errors",
     "Provider": "logpose.providers.base",
@@ -334,7 +336,7 @@ def test_importing_logpose_reads_no_credentials_and_opens_no_loop() -> None:
     code = (
         "import asyncio\n"
         "import os\n"
-        "os.environ.pop('OPENAI_API_KEY', None)\n"
+        "os.environ.pop('LOGPOSE_API_KEY', None)\n"
         "import logpose\n"
         "try:\n"
         "    asyncio.get_event_loop_policy().get_event_loop().close()\n"

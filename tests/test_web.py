@@ -68,3 +68,10 @@ def test_search_reports_challenge_without_fake_empty():
     html = '<form id="challenge-form"></form>'
     out = search_duckduckgo("q", post=lambda *a, **k: _FakeStream(html.encode()))
     assert "human verification" in out
+
+
+def test_fetch_output_is_capped_by_default():
+    body = b"<p>" + b"word " * 10000 + b"</p>"
+    out = fetch_readable_text("http://example.test", get=lambda *a, **k: _FakeStream(body))
+    assert out.endswith("...[truncated]")
+    assert len(out) <= 16_000 + 200

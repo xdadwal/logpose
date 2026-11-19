@@ -32,12 +32,12 @@ class RetryPolicy:
             seconds.
     """
 
-    max_attempts: int = 3
+    max_attempts: int = 2
     initial_delay: float = 0.5
     backoff_multiplier: float = 2.0
-    max_delay: float = 8.0
+    max_delay: float = 4.0
     jitter: float = 0.2
-    max_retry_after: float = 60.0
+    max_retry_after: float = 10.0
 
     def __post_init__(self) -> None:
         """Validate policy values at construction time."""

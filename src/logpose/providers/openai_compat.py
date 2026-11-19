@@ -1,4 +1,4 @@
-"""OpenAI-compatible provider, and the Docker Model Runner backend built on it.
+"""OpenAI-compatible Chat Completions provider.
 
 This is the built-in implementation of :class:`~logpose.providers.base.Provider`.
 It depends only on the neutral message model, and nothing above
@@ -57,8 +57,6 @@ from logpose.messages import (
 from logpose.providers._redact import redact, scrub_exception_in_place
 from logpose.providers._toolargs import UNPARSED_ARGUMENTS_KEY, parse_tool_arguments
 from logpose.providers.base import (
-    DEFAULT_CLOUD_TURN_TIMEOUT,
-    DEFAULT_LOCAL_TURN_TIMEOUT,
     CompletionDone,
     CompletionRequest,
     ProviderEvent,
@@ -69,26 +67,27 @@ from logpose.providers.base import (
 
 __all__ = [
     "AUTO_MODEL",
-    "DEFAULT_DOCKER_BASE_URL",
-    "DEFAULT_MAX_TOKENS",
+    "DEFAULT_HTTP_TIMEOUT",
+    "ENV_API_KEY",
+    "ENV_BASE_URL",
     "UNPARSED_ARGUMENTS_KEY",
-    "DockerModelsProvider",
     "OpenAICompatProvider",
 ]
 
-DEFAULT_DOCKER_BASE_URL = "http://localhost:12434/engines/v1"
-"""Docker Model Runner's host-side endpoint, as exposed by Docker Desktop."""
+ENV_BASE_URL = "LOGPOSE_BASE_URL"
+"""Environment variable read when ``base_url=`` is not passed."""
 
-DEFAULT_MAX_TOKENS = 4096
-"""Output ceiling for local models.
+ENV_API_KEY = "LOGPOSE_API_KEY"
+"""Environment variable read when ``api_key=`` is not passed."""
 
-Deliberately roomy: a reasoning model spends this budget on ``reasoning_content``
-before it emits a tool call, so a small ceiling truncates mid-thought and yields
-``finish_reason="length"`` with nothing usable.
-"""
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+"""Web-app safe HTTP timeouts. ``read`` is the longest silence allowed between
+streamed chunks, not a cap on the whole turn."""
 
 AUTO_MODEL = "auto"
 """Sentinel model id meaning "ask the server what it has and use the first one".
+
+Discovery happens only when a request names this model explicitly.
 
 Resolution happens on the first request, not in ``__init__``, so constructing a
 provider never touches the network.
@@ -104,11 +103,7 @@ _FINISH_REASONS: dict[str, StopReason] = {
     "content_filter": "refusal",
 }
 
-_CONNECT_HINT = (
-    "Could not reach the model server at {base_url}. If this is Docker Model Runner, check that "
-    "it is enabled and listening on the host: `docker desktop enable model-runner --tcp 12434`, "
-    "then `docker model ls` to confirm a model is pulled."
-)
+_CONNECT_HINT = "Could not reach the model server at {base_url}. Check that it is running."
 
 
 # ---------------------------------------------------------------------------
@@ -299,85 +294,86 @@ def _status_is_retryable(status_code: int | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _env(name: str) -> str | None:
+    """Read an environment variable, treating blank values as unset."""
+    value = os.environ.get(name, "").strip()
+    return value or None
+
+
 class OpenAICompatProvider:
     """A :class:`~logpose.providers.base.Provider` for any Chat Completions API.
 
     Works against llama.cpp, vLLM, Ollama, LM Studio, OpenAI itself, Kimi, and
     anything else exposing ``POST /chat/completions``. Always streams.
 
+    The model is chosen per request (``CompletionRequest.model``); the provider
+    holds no model of its own.
+
     Attributes:
         name: Provider identifier.
-        model_default: Model used when a request omits one. :data:`AUTO_MODEL`
-            asks the server for its first model on the first request.
-        max_tokens: Output ceiling honoured by an ``Agent`` built without one.
+        max_tokens: Output ceiling honoured by an ``Agent`` built without one,
+            or ``None`` to leave the choice to the agent.
     """
 
     name = "openai-compat"
-    turn_timeout = DEFAULT_CLOUD_TURN_TIMEOUT
-    """Recommended complete-turn deadline in seconds for generic servers."""
 
     def __init__(
         self,
         *,
         base_url: str | None = None,
-        model: str | None = None,
         api_key: str | None = None,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
-        timeout: float | httpx.Timeout | None = None,
+        max_tokens: int | None = None,
+        timeout: float | httpx.Timeout | None = DEFAULT_HTTP_TIMEOUT,
         parse_think_tags: bool = True,
         default_headers: dict[str, str] | None = None,
         client: httpx.AsyncClient | None = None,
         extra_body: dict[str, Any] | None = None,
-        api_key_env: str | None = "OPENAI_API_KEY",
         preserve_reasoning: bool = False,
     ) -> None:
         """Configure the backend.
 
         Args:
             base_url: Root of the OpenAI-compatible API, e.g.
-                ``"http://localhost:12434/engines/v1"``. Falls back to
-                ``$OPENAI_BASE_URL``.
-            model: Default model id, or :data:`AUTO_MODEL` to discover one.
-                Falls back to ``$OPENAI_MODEL``.
+                ``"https://api.openai.com/v1"``. Falls back to
+                ``$LOGPOSE_BASE_URL``.
             api_key: Bearer token. Optional — local servers usually need none.
-                Falls back to ``$OPENAI_API_KEY``.
-            max_tokens: Output-token ceiling for a turn.
-            timeout: httpx timeout. The default is deliberately generous
-                because a quantized local model can take minutes.
+                Falls back to ``$LOGPOSE_API_KEY`` only when omitted; pass
+                ``api_key=""`` to send no ``Authorization`` header even when the
+                env var is set.
+            max_tokens: Output-token ceiling for a turn, or ``None`` to let the
+                agent decide.
+            timeout: httpx timeout. Defaults to :data:`DEFAULT_HTTP_TIMEOUT`
+                (connect 5 s, read 60 s, write 10 s, pool 5 s); ``None`` disables
+                every HTTP timeout.
             parse_think_tags: Split ``<think>`` blocks out of content into
                 reasoning. Harmless for models that do not use them.
             default_headers: Extra headers sent with every request.
             client: Inject a pre-built ``httpx.AsyncClient`` (used by tests).
             extra_body: Fields merged into every request body, e.g.
                 ``{"temperature": 0.2}``.
-            api_key_env: Environment variable consulted when ``api_key`` is not
-                given. ``None`` disables the fallback entirely, which is what a
-                local backend wants: a stray ``$OPENAI_API_KEY`` should never be
-                shipped to a server on localhost.
             preserve_reasoning: Replay thinking blocks as reasoning_content.
                 Enable only for a server that explicitly supports this field.
 
         Raises:
             LogposeError: If no ``base_url`` is available.
         """
-        resolved_base = base_url or os.environ.get("OPENAI_BASE_URL") or ""
+        resolved_base = (base_url or "").strip() or _env(ENV_BASE_URL)
         if not resolved_base:
             raise LogposeError(
                 "No base_url for the OpenAI-compatible provider. Pass base_url=... or set "
-                "OPENAI_BASE_URL."
+                f"{ENV_BASE_URL}."
             )
         if timeout is None:
-            # Generous by default: a quantized local model can spend minutes on
-            # one turn, and httpx's 5s default would abort every request.
-            timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+            # Explicitly unlimited: httpx's own 5s default would otherwise apply.
+            timeout = httpx.Timeout(None)
 
-        env_key = os.environ.get(api_key_env) if api_key_env else None
         self.base_url = resolved_base.rstrip("/")
-        self.model_default = model or os.environ.get("OPENAI_MODEL") or ""
         self.max_tokens = max_tokens
         self.parse_think_tags = parse_think_tags
         self.preserve_reasoning = preserve_reasoning
-        self._api_key = api_key or env_key or None
+        # An explicit api_key always wins, and a blank one means "no auth": it is
+        # the only way to keep an ambient LOGPOSE_API_KEY away from this server.
+        self._api_key = (api_key.strip() or None) if api_key is not None else _env(ENV_API_KEY)
         self._default_headers = dict(default_headers or {})
         self._extra_body = dict(extra_body or {})
         self._client = client
@@ -390,7 +386,7 @@ class OpenAICompatProvider:
         key = redact(self._api_key) if self._api_key else None
         return (
             f"{type(self).__name__}(base_url={self.base_url!r}, "
-            f"model_default={self.model_default!r}, api_key={key!r})"
+            f"api_key={key!r})"
         )
 
     # -- plumbing -----------------------------------------------------------
@@ -439,24 +435,29 @@ class OpenAICompatProvider:
         """Turn a requested model id into a concrete one.
 
         Args:
-            requested: The request's model, possibly empty or :data:`AUTO_MODEL`.
+            requested: The request's model, or :data:`AUTO_MODEL`.
 
         Returns:
             A concrete model id.
 
         Raises:
+            LogposeError: If the request names no model.
             ProviderError: If discovery is needed and the server serves nothing.
         """
-        if requested and requested != AUTO_MODEL:
+        if not requested.strip():
+            raise LogposeError(
+                "No model in the request. Pass model=... to Agent, or model='auto' to pick "
+                "the server's first model."
+            )
+        if requested != AUTO_MODEL:
             return requested
         if self._discovered_model:
             return self._discovered_model
         models = await self.list_models()
         if not models:
             raise ProviderError(
-                f"{self.base_url} reports no available models. Pull one first "
-                "(for Docker Model Runner: `docker model pull <name>`), or pass an explicit "
-                "model=... to the provider.",
+                f"{self.base_url} reports no available models. Load one on the server, "
+                "or pass an explicit model=... to Agent.",
                 status_code=None,
                 retryable=False,
             )
@@ -488,7 +489,7 @@ class OpenAICompatProvider:
             # compatible server can reflect the bearer token in it.
             return AuthError(
                 f"{self.name} authentication failed. Check api_key=... or the "
-                "$OPENAI_API_KEY environment variable if this server requires authentication."
+                f"${ENV_API_KEY} environment variable if this server requires authentication."
             )
         return ProviderError(
             f"{self.name} request failed with status {status}: {self._scrub(body[:2000])}",
@@ -715,57 +716,3 @@ def _map_finish_reason(raw: str | None, saw_tool_calls: bool) -> StopReason:
             return "tool_use"
         return mapped
     return "tool_use" if saw_tool_calls else "end_turn"
-
-
-class DockerModelsProvider(OpenAICompatProvider):
-    """Local models served by Docker Model Runner.
-
-    Docker Desktop exposes an OpenAI-compatible API on the host once the model
-    runner is enabled, so this is :class:`OpenAICompatProvider` with local
-    defaults: Docker's endpoint, no credential, a roomy token ceiling, and
-    model auto-discovery.
-
-    .. code-block:: python
-
-        from logpose import Agent
-
-        agent = Agent("docker")                     # uses the first pulled model
-        agent = Agent("docker", model="gemma4")     # or name one
-
-    Attributes:
-        name: ``"docker"``.
-    """
-
-    name = "docker"
-    turn_timeout = DEFAULT_LOCAL_TURN_TIMEOUT
-    """Recommended complete-turn deadline in seconds for local inference."""
-
-    def __init__(
-        self,
-        *,
-        base_url: str | None = None,
-        model: str | None = None,
-        **kwargs: Any,
-    ) -> None:
-        """Configure the Docker Model Runner backend.
-
-        Args:
-            base_url: Override the endpoint. Falls back to
-                ``$DOCKER_MODEL_RUNNER_URL`` and then
-                :data:`DEFAULT_DOCKER_BASE_URL`. Inside a container use
-                ``http://model-runner.docker.internal/engines/v1``.
-            model: Model id, e.g. ``"gemma4"``. Falls back to ``$DOCKER_MODEL``
-                and then :data:`AUTO_MODEL`, which picks the first model the
-                runner serves.
-            **kwargs: Forwarded to :class:`OpenAICompatProvider`.
-        """
-        # api_key_env is disabled: Docker Model Runner needs no credential, and
-        # a developer's ambient $OPENAI_API_KEY must not be sent to localhost.
-        kwargs.setdefault("api_key_env", None)
-        super().__init__(
-            base_url=(
-                base_url or os.environ.get("DOCKER_MODEL_RUNNER_URL") or DEFAULT_DOCKER_BASE_URL
-            ),
-            model=model or os.environ.get("DOCKER_MODEL") or AUTO_MODEL,
-            **kwargs,
-        )

@@ -48,9 +48,9 @@ handler. Provider-specific behavior belongs behind the provider boundary.
 
 ## Adding a provider
 
-Implement the `Provider` protocol and register it. A provider needs `name`,
-`model_default`, and `stream`; an optional `max_tokens` is honoured by `Agent`
-when it was built without one.
+Implement the `Provider` protocol and register it. A provider needs `name` and
+`stream`; the model arrives on every `CompletionRequest`. An optional
+`max_tokens` is honoured by `Agent` when it was built without one.
 
 ```python
 from logpose import CompletionDone, CompletionRequest, ProviderEvent, register
@@ -58,7 +58,6 @@ from logpose import CompletionDone, CompletionRequest, ProviderEvent, register
 
 class MyProvider:
     name = "mine"
-    model_default = "my-model-1"
 
     async def stream(self, req: CompletionRequest) -> AsyncIterator[ProviderEvent]:
         ...
@@ -86,9 +85,9 @@ provider, or resolving one backend would drag in the other's module.
 
 ## One provider per credential
 
-A provider accepts **exactly one kind of credential**. `docker`, for example, never
-reads `OPENAI_API_KEY`, even though it subclasses `OpenAICompatProvider`, so an
-ambient cloud key cannot leak to a local server.
+A provider accepts **exactly one kind of credential**, and reads only
+provider-neutral configuration (`LOGPOSE_*`), never another vendor's environment
+variables, so an ambient key meant for one service cannot leak to another.
 
 Keep credential types explicit rather than building a provider that changes
 behavior according to whichever credential it finds. The endpoint, headers,
@@ -96,8 +95,8 @@ request fields, and compatibility settings are then known at construction time,
 and each provider can document a simple credential policy.
 
 The pattern to copy: subclass `OpenAICompatProvider`, set the endpoint and
-credential policy, and override only the hooks that genuinely differ.
-`DockerModelsProvider` is the reference example.
+credential policy, and override only the hooks that genuinely differ
+(`_headers`, `_build_body`).
 
 ## Conventions
 

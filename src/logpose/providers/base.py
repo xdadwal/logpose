@@ -18,9 +18,6 @@ from typing import Any, Protocol, Union, runtime_checkable
 from logpose.messages import Message, StopReason, Usage
 
 __all__ = [
-    "DEFAULT_CLOUD_TURN_TIMEOUT",
-    "DEFAULT_LOCAL_TURN_TIMEOUT",
-    "LOCAL_TURN_TIMEOUT_MULTIPLIER",
     "ToolSpec",
     "CompletionRequest",
     "ProviderTextDelta",
@@ -29,16 +26,6 @@ __all__ = [
     "ProviderEvent",
     "Provider",
 ]
-
-DEFAULT_CLOUD_TURN_TIMEOUT = 900.0
-"""Recommended complete-turn deadline, in seconds, for cloud providers."""
-
-LOCAL_TURN_TIMEOUT_MULTIPLIER = 2.0
-"""How much longer a local provider turn may run than a cloud provider turn."""
-
-DEFAULT_LOCAL_TURN_TIMEOUT = DEFAULT_CLOUD_TURN_TIMEOUT * LOCAL_TURN_TIMEOUT_MULTIPLIER
-"""Recommended complete-turn deadline, in seconds, for local providers."""
-
 
 @dataclass(frozen=True)
 class ToolSpec:
@@ -130,11 +117,9 @@ ProviderEvent = Union[  # noqa: UP007 - explicit Union keeps the alias importabl
 class Provider(Protocol):
     """What logpose needs from a model backend.
 
-    Both attributes are part of the contract and are checked by
-    ``isinstance(obj, Provider)``: an :class:`~logpose.agent.Agent` built
-    without an explicit ``model=`` reads ``model_default`` to fill in
-    :attr:`CompletionRequest.model`, and there is no sane value to invent when
-    it is missing.
+    ``name`` and ``stream`` are the contract checked by
+    ``isinstance(obj, Provider)``. The model is not part of it: the caller
+    names one on every :attr:`CompletionRequest.model`.
 
     A provider may also expose an optional ``max_tokens: int`` attribute holding
     its own output-token ceiling. It is *not* part of the protocol — the loop
@@ -143,12 +128,9 @@ class Provider(Protocol):
 
     Attributes:
         name: Short identifier for the provider, e.g. ``"openai-compat"``.
-        model_default: Model identifier used when a request omits one. Must be
-            a non-empty string.
     """
 
     name: str
-    model_default: str
 
     def stream(self, req: CompletionRequest) -> AsyncIterator[ProviderEvent]:
         """Run one turn and stream its events.

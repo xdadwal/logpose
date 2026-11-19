@@ -32,3 +32,10 @@ def test_make_search_tool_empty_and_blank_query():
     search = make_search_tool(backend=lambda q, n: [])
     assert "No web results" in search("q")
     assert "non-empty" in search("   ")
+
+
+def test_search_tool_output_cap_default():
+    search = make_search_tool(backend=lambda q, n: ["x" * 20_000])
+    out = search("q")
+    assert out.endswith("...[truncated]")
+    assert len(out) <= 8_000 + 200

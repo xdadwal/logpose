@@ -9,7 +9,6 @@ them are importable for direct, tool-free use.
 
 from __future__ import annotations
 
-import heapq
 import json
 import os
 import re
@@ -20,7 +19,7 @@ from logpose.tools import ToolDef, tool
 
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules"}
 _MAX_LINE = 200
-_MAX_PAGE_CHARS = 12000
+_MAX_PAGE_CHARS = 16_000
 _TARGETS = ("content", "names", "both")
 
 
@@ -47,13 +46,14 @@ def read_file_page(
     *,
     base_path: Path,
     start_line: int = 1,
-    max_lines: int = 200,
+    max_lines: int | None = None,
     cursor: int = 0,
 ) -> str:
-    """Read a bounded page of a text file. See ``make_read_file_tool``."""
-    if start_line < 1 or not 1 <= max_lines <= 200 or cursor < 0 or (cursor and start_line != 1):
+    """Read a page of a text file, bounded by characters (and optionally lines)."""
+    bad_lines = max_lines is not None and max_lines < 1
+    if start_line < 1 or bad_lines or cursor < 0 or (cursor and start_line != 1):
         return (
-            "Invalid read range: start_line >= 1, 1 <= max_lines <= 200, "
+            "Invalid read range: start_line >= 1, max_lines >= 1 (or omitted), "
             "cursor >= 0; use start_line=1 with a cursor."
         )
     try:
@@ -78,7 +78,9 @@ def read_file_page(
             line += skipped.endswith("\n")
         chunks: list[str] = []
         length = 0
-        for _ in range(max_lines):
+        read = 0
+        while max_lines is None or read < max_lines:
+            read += 1
             chunk = stream.readline(_MAX_PAGE_CHARS - length)
             chunks.append(chunk)
             length += len(chunk)
@@ -89,7 +91,9 @@ def read_file_page(
     if more:
         content += (
             f"\n[More text; continue read_file(path={json.dumps(path)}, "
-            f"cursor={offset + length}, max_lines={max_lines})]"
+            f"cursor={offset + length}"
+            + (f", max_lines={max_lines}" if max_lines is not None else "")
+            + ")]"
         )
     return content
 
@@ -99,24 +103,42 @@ def list_directory(
     *,
     base_path: Path,
     after: str = "",
-    max_entries: int = 100,
+    max_entries: int | None = None,
 ) -> str:
-    """List directory entries (directories suffixed with '/'), paginated."""
-    if not 1 <= max_entries <= 200:
-        return "Invalid page size: 1 <= max_entries <= 200."
+    """List directory entries (directories suffixed with '/'), paginated.
+
+    Pages end at ``max_entries`` entries when given, and always at the character
+    budget; a continuation names the last entry shown.
+    """
+    if max_entries is not None and max_entries < 1:
+        return "Invalid page size: max_entries >= 1 (or omitted)."
     try:
         target = resolve_path(path, base_path)
     except PathOutsideWorkspace as exc:
         return f"Refused: {exc}"
     if not target.is_dir():
         return f"No directory at {path!r}."
-    names = (p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
-    entries = heapq.nsmallest(max_entries + 1, (name for name in names if name > after))
-    content = "\n".join(entries[:max_entries]) if entries else "(empty)"
-    if len(entries) > max_entries:
+    names = sorted(
+        name
+        for name in (p.name + ("/" if p.is_dir() else "") for p in target.iterdir())
+        if name > after
+    )
+    shown: list[str] = []
+    length = 0
+    for name in names:
+        if max_entries is not None and len(shown) == max_entries:
+            break
+        if shown and length + len(name) + 1 > _MAX_PAGE_CHARS:
+            break
+        shown.append(name)
+        length += len(name) + 1
+    content = "\n".join(shown) if shown else "(empty)"
+    if len(shown) < len(names):
         content += (
             f"\n[More entries; continue list_dir(path={json.dumps(path)}, "
-            f"after={json.dumps(entries[max_entries - 1])}, max_entries={max_entries})]"
+            f"after={json.dumps(shown[-1])}"
+            + (f", max_entries={max_entries}" if max_entries is not None else "")
+            + ")]"
         )
     return content
 
@@ -181,7 +203,9 @@ def make_read_file_tool(
     )
 
     @tool
-    def read_file(path: str, start_line: int = 1, max_lines: int = 200, cursor: int = 0) -> str:
+    def read_file(
+        path: str, start_line: int = 1, max_lines: int | None = None, cursor: int = 0
+    ) -> str:
         """Read a page of a text file."""
         return read_file_page(
             path, base_path=root(), start_line=start_line, max_lines=max_lines, cursor=cursor
@@ -204,7 +228,7 @@ def make_list_dir_tool(
     )
 
     @tool
-    def list_dir(path: str = ".", after: str = "", max_entries: int = 100) -> str:
+    def list_dir(path: str = ".", after: str = "", max_entries: int | None = None) -> str:
         """List directory entries, paginated."""
         return list_directory(path, base_path=root(), after=after, max_entries=max_entries)
 
@@ -216,7 +240,7 @@ def make_grep_tool(
     *,
     name: str = "grep",
     description: str | None = None,
-    output_char_cap: int | None = None,
+    output_char_cap: int | None = 16_000,
     on_output: Callable[[str], None] | None = None,
     skip_dirs: set[str] | None = None,
 ) -> ToolDef:

@@ -1,7 +1,7 @@
-"""Tests for the OpenAI-compatible provider and the Docker Model Runner backend.
+"""Tests for the OpenAI-compatible provider.
 
 Everything runs against an ``httpx.MockTransport``; nothing here touches a
-network or a running Docker Model Runner.
+network or a running model server.
 """
 
 from __future__ import annotations
@@ -27,9 +27,7 @@ from logpose.errors import AuthError, LogposeError, ProviderError
 from logpose.providers.base import CompletionRequest, ToolSpec
 from logpose.providers.openai_compat import (
     AUTO_MODEL,
-    DEFAULT_DOCKER_BASE_URL,
     UNPARSED_ARGUMENTS_KEY,
-    DockerModelsProvider,
     OpenAICompatProvider,
     _messages_to_wire,
     _ThinkTagSplitter,
@@ -106,7 +104,6 @@ def make_provider(handler: Recorder, **kwargs: Any) -> OpenAICompatProvider:
     """Build a provider wired to a MockTransport."""
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     kwargs.setdefault("base_url", BASE)
-    kwargs.setdefault("model", "test-model")
     return OpenAICompatProvider(client=client, **kwargs)
 
 
@@ -476,14 +473,14 @@ async def test_think_tag_parsing_can_be_disabled() -> None:
 
 async def test_auto_model_resolves_to_the_first_served_model() -> None:
     handler = Recorder(sse(finish_chunk("stop")), models=["docker.io/ai/gemma4:latest", "other"])
-    provider = make_provider(handler, model=AUTO_MODEL)
+    provider = make_provider(handler)
     await drain(provider, request(model=AUTO_MODEL))
     assert handler.last_body["model"] == "docker.io/ai/gemma4:latest"
 
 
 async def test_auto_model_is_discovered_only_once() -> None:
     handler = Recorder(sse(finish_chunk("stop")), sse(finish_chunk("stop")))
-    provider = make_provider(handler, model=AUTO_MODEL)
+    provider = make_provider(handler)
     await drain(provider, request(model=AUTO_MODEL))
     await drain(provider, request(model=AUTO_MODEL))
     assert handler.model_calls == 1
@@ -491,14 +488,14 @@ async def test_auto_model_is_discovered_only_once() -> None:
 
 async def test_explicit_model_skips_discovery_entirely() -> None:
     handler = Recorder(sse(finish_chunk("stop")))
-    await drain(make_provider(handler, model="pinned"), request(model="pinned"))
+    await drain(make_provider(handler), request(model="pinned"))
     assert handler.model_calls == 0
     assert handler.last_body["model"] == "pinned"
 
 
 async def test_no_served_models_raises_an_actionable_error() -> None:
     handler = Recorder(sse(finish_chunk("stop")), models=[])
-    provider = make_provider(handler, model=AUTO_MODEL)
+    provider = make_provider(handler)
     with pytest.raises(ProviderError, match="no available models"):
         await drain(provider, request(model=AUTO_MODEL))
 
@@ -513,7 +510,7 @@ async def test_client_error_is_not_retryable() -> None:
         return httpx.Response(400, json={"error": {"message": "bad model"}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OpenAICompatProvider(base_url=BASE, model="m", client=client)
+    provider = OpenAICompatProvider(base_url=BASE, client=client)
     with pytest.raises(ProviderError) as excinfo:
         await drain(provider, request())
     assert excinfo.value.status_code == 400
@@ -529,7 +526,7 @@ async def test_http_failure_carries_normalized_retry_metadata() -> None:
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OpenAICompatProvider(base_url=BASE, model="m", client=client)
+    provider = OpenAICompatProvider(base_url=BASE, client=client)
     with pytest.raises(ProviderError) as excinfo:
         await drain(provider, request())
 
@@ -545,22 +542,23 @@ async def test_server_and_rate_limit_errors_are_retryable(status: int) -> None:
         return httpx.Response(status, text="nope")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OpenAICompatProvider(base_url=BASE, model="m", client=client)
+    provider = OpenAICompatProvider(base_url=BASE, client=client)
     with pytest.raises(ProviderError) as excinfo:
         await drain(provider, request())
     assert excinfo.value.retryable is True
 
 
-async def test_connection_failure_explains_how_to_start_docker() -> None:
+async def test_connection_failure_names_the_server_and_is_retryable() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = DockerModelsProvider(model="m", client=client)
+    provider = OpenAICompatProvider(base_url=BASE, client=client)
     with pytest.raises(ProviderError) as excinfo:
         await drain(provider, request())
     message = str(excinfo.value)
-    assert "docker desktop enable model-runner" in message
+    assert BASE in message
+    assert "docker" not in message.lower()
     assert excinfo.value.retryable is True
 
 
@@ -571,23 +569,112 @@ async def test_api_key_never_appears_in_an_error_body() -> None:
         return httpx.Response(401, text=f"bad key {secret}")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OpenAICompatProvider(base_url=BASE, model="m", api_key=secret, client=client)
+    provider = OpenAICompatProvider(base_url=BASE, api_key=secret, client=client)
     with pytest.raises(AuthError) as excinfo:
         await drain(provider, request())
     assert secret not in str(excinfo.value)
-    assert "$OPENAI_API_KEY" in str(excinfo.value)
+    assert "LOGPOSE_API_KEY" in str(excinfo.value)
 
 
 def test_repr_redacts_the_api_key() -> None:
     secret = "sk-super-secret-key-value-123456"
-    provider = OpenAICompatProvider(base_url=BASE, model="m", api_key=secret)
+    provider = OpenAICompatProvider(base_url=BASE, api_key=secret)
     assert secret not in repr(provider)
 
 
-def test_missing_base_url_fails_at_construction(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    with pytest.raises(LogposeError, match="OPENAI_BASE_URL"):
-        OpenAICompatProvider(model="m")
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Clear every env var the provider could read, old and new."""
+    for name in (
+        "LOGPOSE_BASE_URL",
+        "LOGPOSE_API_KEY",
+        "LOGPOSE_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def test_missing_base_url_names_argument_and_env(clean_env: pytest.MonkeyPatch) -> None:
+    with pytest.raises(LogposeError, match=r"base_url=.*LOGPOSE_BASE_URL"):
+        OpenAICompatProvider()
+
+
+def test_base_url_falls_back_to_logpose_env(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("LOGPOSE_BASE_URL", "http://env.test/v1/")
+    assert OpenAICompatProvider().base_url == "http://env.test/v1"
+
+
+async def test_whitespace_env_values_count_as_missing(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("LOGPOSE_BASE_URL", "   ")
+    with pytest.raises(LogposeError, match="LOGPOSE_BASE_URL"):
+        OpenAICompatProvider()
+    clean_env.setenv("LOGPOSE_API_KEY", " ")
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request())
+    assert "authorization" not in handler.requests[-1].headers
+
+
+async def test_openai_env_vars_are_ignored(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("OPENAI_BASE_URL", "http://openai-env.test/v1")
+    clean_env.setenv("OPENAI_API_KEY", "sk-ambient")
+    with pytest.raises(LogposeError):
+        OpenAICompatProvider()
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request())
+    assert "authorization" not in handler.requests[-1].headers
+
+
+async def test_api_key_falls_back_to_logpose_env(clean_env: pytest.MonkeyPatch) -> None:
+    clean_env.setenv("LOGPOSE_API_KEY", "k1")
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request())
+    assert handler.requests[-1].headers["authorization"] == "Bearer k1"
+
+
+@pytest.mark.parametrize("explicit", ["", "   "])
+async def test_explicit_blank_api_key_opts_out_of_the_env_key(
+    clean_env: pytest.MonkeyPatch, explicit: str
+) -> None:
+    """A cloud key in the env must not reach a server told to use no key."""
+    clean_env.setenv("LOGPOSE_API_KEY", "sk-cloud")
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler, api_key=explicit), request())
+    assert "authorization" not in handler.requests[-1].headers
+
+
+def test_provider_has_no_model_attribute() -> None:
+    assert not hasattr(OpenAICompatProvider(base_url=BASE), "model_default")
+
+
+def test_max_tokens_defaults_to_none() -> None:
+    assert OpenAICompatProvider(base_url=BASE).max_tokens is None
+
+
+def test_default_http_timeout_is_web_app_safe() -> None:
+    provider = OpenAICompatProvider(base_url=BASE)
+    assert provider._http().timeout == httpx.Timeout(connect=5.0, read=60.0, write=10.0, pool=5.0)
+
+
+def test_timeout_none_disables_http_timeouts() -> None:
+    provider = OpenAICompatProvider(base_url=BASE, timeout=None)
+    assert provider._http().timeout == httpx.Timeout(None)
+
+
+async def test_empty_request_model_raises_instead_of_discovering() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    with pytest.raises(LogposeError, match="model"):
+        await drain(make_provider(handler), request(model=""))
+    assert handler.model_calls == 0
+
+
+async def test_auto_model_still_discovers() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request(model="auto"))
+    assert handler.last_body["model"] == "m-first"
+    assert handler.model_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -602,54 +689,9 @@ async def test_bearer_header_is_sent_when_a_key_is_configured() -> None:
     assert handler.requests[-1].headers["authorization"] == "Bearer sk-abc"
 
 
-async def test_docker_ignores_an_ambient_openai_api_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A developer's OpenAI key must never be shipped to a server on localhost."""
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-should-not-leak")
-    handler = Recorder(sse(finish_chunk("stop")))
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = DockerModelsProvider(model="m", client=client)
-    await drain(provider, request())
-    assert "authorization" not in handler.requests[-1].headers
-
-
-async def test_generic_provider_does_read_openai_api_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key")
-    handler = Recorder(sse(finish_chunk("stop")))
-    provider = make_provider(handler)
-    await drain(provider, request())
-    assert handler.requests[-1].headers["authorization"] == "Bearer sk-env-key"
-
-
-# ---------------------------------------------------------------------------
-# docker defaults and registration
-# ---------------------------------------------------------------------------
-
-
-def test_docker_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("DOCKER_MODEL_RUNNER_URL", raising=False)
-    monkeypatch.delenv("DOCKER_MODEL", raising=False)
-    provider = DockerModelsProvider()
-    assert provider.base_url == DEFAULT_DOCKER_BASE_URL
-    assert provider.model_default == AUTO_MODEL
-    assert provider.name == "docker"
-
-
-def test_docker_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DOCKER_MODEL_RUNNER_URL", "http://elsewhere:9000/engines/v1")
-    monkeypatch.setenv("DOCKER_MODEL", "qwen3")
-    provider = DockerModelsProvider()
-    assert provider.base_url == "http://elsewhere:9000/engines/v1"
-    assert provider.model_default == "qwen3"
-
-
-def test_providers_are_registered_under_their_names() -> None:
-    for name in ("docker", "docker-models", "openai-compat"):
-        assert name in known_providers()
-    assert isinstance(resolve("docker", model="m"), DockerModelsProvider)
+def test_only_openai_compat_is_registered() -> None:
+    assert known_providers() == ["openai-compat"]
+    assert isinstance(resolve("openai-compat", base_url=BASE), OpenAICompatProvider)
 
 
 def test_importing_logpose_does_not_import_httpx() -> None:
@@ -698,7 +740,7 @@ async def test_agent_drives_a_full_tool_round_trip() -> None:
     handler = Recorder(turn1, turn2)
     provider = make_provider(handler)
 
-    agent = Agent(provider, tools=[add], system="be terse")
+    agent = Agent(provider, model="test-model", tools=[add], system="be terse")
     result = await agent.run("what is 2+3?")
 
     assert result.text == "The answer is 5."
@@ -737,7 +779,7 @@ async def test_agent_reports_a_failed_tool_back_to_the_model() -> None:
     )
     turn2 = sse(delta_chunk(content="Sorry, that failed."), finish_chunk("stop"))
     handler = Recorder(turn1, turn2)
-    agent = Agent(make_provider(handler), tools=[explode])
+    agent = Agent(make_provider(handler), model="test-model", tools=[explode])
 
     result = await agent.run("go")
     assert result.stop_reason == "end_turn"

@@ -33,8 +33,8 @@ _HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 _SEARCH_URL = "https://html.duckduckgo.com/html/"
-_REQUEST_TIMEOUT = 15
-_SEARCH_TIMEOUT = 15
+_REQUEST_TIMEOUT = 10
+_SEARCH_TIMEOUT = 10
 
 
 class SearchFailure(ValueError):
@@ -51,8 +51,8 @@ def fetch_readable_text(
     *,
     get: Callable[..., requests.Response] | None = None,
     timeout: float = _REQUEST_TIMEOUT,
-    max_bytes: int = 2 * 1024 * 1024,
-    output_char_cap: int | None = None,
+    max_bytes: int = 1024 * 1024,
+    output_char_cap: int | None = 16_000,
     on_output: Callable[[str, bool], None] | None = None,
 ) -> str:
     """Fetch ``url`` and return its readable text, scripts/styles stripped.
@@ -269,7 +269,7 @@ def make_search_tool(
     backend: Callable[[str, int], list[str]],
     name: str = "web_search",
     description: str | None = None,
-    output_char_cap: int | Callable[[], int | None] | None = None,
+    output_char_cap: int | Callable[[], int | None] | None = 8_000,
     on_output: Callable[[str], None] | None = None,
 ) -> ToolDef:
     """Build a web-search ToolDef bound to a backend entry provider.

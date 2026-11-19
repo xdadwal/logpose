@@ -34,7 +34,7 @@ async def test_runtime_context_reaches_async_and_sync_tools_and_is_restored() ->
     )
 
     assert current_runtime_context() is None
-    await Agent(provider, tools=[async_context, sync_context]).run("run prompt")
+    await Agent(provider, model="test-model", tools=[async_context, sync_context]).run("run prompt")
     assert current_runtime_context() is None
     assert len(seen) == 2
     assert all(context is not None for context in seen)
@@ -43,7 +43,7 @@ async def test_runtime_context_reaches_async_and_sync_tools_and_is_restored() ->
     assert {context.tool_call_id for context in contexts} == {"a", "s"}
     assert len({context.run_id for context in contexts}) == 1
     assert len({context.turn_id for context in contexts}) == 1
-    assert all(context.provider == "fake" and context.model == "fake-model" for context in contexts)
+    assert all(context.provider == "fake" and context.model == "test-model" for context in contexts)
 
 
 async def test_runtime_context_is_isolated_between_concurrent_runs() -> None:
@@ -59,6 +59,7 @@ async def test_runtime_context_is_isolated_between_concurrent_runs() -> None:
     def make_agent() -> Agent:
         return Agent(
             FakeProvider([ScriptedTurn.tool_use(tool_call("capture")), ScriptedTurn.text("done")]),
+            model="test-model",
             tools=[capture],
         )
 
@@ -98,7 +99,9 @@ async def test_observers_receive_ordered_safe_events_and_are_isolated() -> None:
             ScriptedTurn.text("final secret response"),
         ]
     )
-    result = await Agent(provider, tools=[reveal], observers=[first, broken, final]).run(secret)
+    result = await Agent(
+        provider, model="test-model", tools=[reveal], observers=[first, broken, final]
+    ).run(secret)
 
     assert result.text == "final secret response"
     names = [event.name for event in received]
@@ -120,7 +123,9 @@ async def test_runtime_records_are_published_through_standard_logging(
 ) -> None:
     secret = "DO_NOT_LOG_THIS"
     with caplog.at_level(logging.DEBUG, logger="logpose.runtime"):  # type: ignore[attr-defined]
-        await Agent(FakeProvider([ScriptedTurn.text("model " + secret)])).run("prompt " + secret)
+        await Agent(FakeProvider([ScriptedTurn.text("model " + secret)]), model="test-model").run(
+            "prompt " + secret
+        )
 
     records = [
         record
@@ -150,7 +155,9 @@ async def test_broken_logging_handlers_are_isolated() -> None:
     handler = BrokenHandler()
     logger.addHandler(handler)
     try:
-        result = await Agent(FakeProvider([ScriptedTurn.text("still succeeds")])).run("go")
+        result = await Agent(
+            FakeProvider([ScriptedTurn.text("still succeeds")]), model="test-model"
+        ).run("go")
     finally:
         logger.removeHandler(handler)
 

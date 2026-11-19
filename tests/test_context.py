@@ -18,7 +18,9 @@ async def test_async_policy_changes_request_without_mutating_canonical_history()
 
     history = Conversation([Message(role="user", content=[TextBlock(text="original")])])
     provider = FakeProvider([ScriptedTurn.text("answer")])
-    result = await Agent(provider, context_policy=policy).run(conversation=history)
+    result = await Agent(provider, model="test-model", context_policy=policy).run(
+        conversation=history
+    )
     assert provider.requests[0].messages[0].content[0].text == "selected"
     assert history.messages[0].content[0].text == "original"
     assert result.messages[0].content[0].text == "original"
@@ -33,7 +35,7 @@ async def test_preparation_failure_never_requests_provider():
 
     provider = FakeProvider([ScriptedTurn.text("must not run")])
     with pytest.raises(ContextPreparationError):
-        await Agent(provider, context_policy=broken).run("request")
+        await Agent(provider, model="test-model", context_policy=broken).run("request")
     assert provider.call_count == 0
 
 
@@ -63,7 +65,12 @@ async def test_sync_policy_runs_each_iteration_and_preserves_opaque_blocks():
         [ScriptedTurn.tool_use(tool_call("inspect", {})), ScriptedTurn.text("done")]
     )
     agent = Agent(
-        provider, tools=[inspect], context_policy=policy, system="instructions", max_tokens=42
+        provider,
+        model="test-model",
+        tools=[inspect],
+        context_policy=policy,
+        system="instructions",
+        max_tokens=42,
     )
     await agent.run("request", conversation=history)
     assert len(seen) == 2
@@ -80,7 +87,9 @@ async def test_invalid_policy_return_stops_before_provider():
 
     provider = FakeProvider([ScriptedTurn.text("must not run")])
     with pytest.raises(ContextPreparationError):
-        await Agent(provider, context_policy=lambda context: None).run("request")
+        await Agent(provider, model="test-model", context_policy=lambda context: None).run(
+            "request"
+        )
     assert provider.call_count == 0
 
 
@@ -93,7 +102,9 @@ async def test_cancellation_during_preparation_propagates_without_inference():
         await asyncio.Event().wait()
 
     provider = FakeProvider([ScriptedTurn.text("must not run")])
-    task = asyncio.create_task(Agent(provider, context_policy=policy).run("request"))
+    task = asyncio.create_task(
+        Agent(provider, model="test-model", context_policy=policy).run("request")
+    )
     await entered.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
