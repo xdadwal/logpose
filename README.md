@@ -515,6 +515,12 @@ result = await agent.run("Invoice Acme for two widgets at 10 each.", output_type
 invoice: Invoice | None = result.output
 ```
 
+`output_type` must be an object model (not a `RootModel` or list) and cannot
+contain open-ended `dict` fields such as `dict[str, int]`: strict mode cannot
+express arbitrary keys, so use a nested model with named fields instead. Such
+models raise `LogposeError`, naming the field, when `output_type` is set and
+before any request is sent.
+
 `output_type` can be set per call or as an `Agent` default. Passing
 `output_type=None` on a call disables an agent default for that call. Runs
 without `output_type` are unchanged, apart from `result.output` being `None`.
@@ -528,7 +534,7 @@ default, while `X | None` fields keep `None`.
 | --- | --- |
 | `OutputValidationError` | The reply is not valid for the model after the retry budget, including `reason="max_tokens"` when output was cut off. |
 | `OutputRefusalError` | The model refused. There is no correction turn. |
-| `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (HTTP 400/422). Not retried. |
+| `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (HTTP 400/422). The message includes the provider's reason when it gave one. Not retried. |
 
 ### Provider compatibility (as of 2026-11)
 

@@ -106,6 +106,25 @@ _FINISH_REASONS: dict[str, StopReason] = {
 
 _STRUCTURED_REJECTION_MARKERS = ("response_format", "json_schema", "strict", "structured")
 
+_PROVIDER_REASON_LIMIT = 500
+
+
+def _is_strict_json_schema_request(body: Mapping[str, Any]) -> bool:
+    """Return whether ``body`` asks for ``json_schema`` structured output."""
+    response_format = body.get("response_format")
+    return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+
+def _provider_error_message_from_body(body: str) -> str | None:
+    """Return ``error.message`` from a JSON error body, or ``None``."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    return message.strip() or None if isinstance(message, str) else None
+
 _CONNECT_HINT = "Could not reach the model server at {base_url}. Check that it is running."
 
 
@@ -502,6 +521,32 @@ class OpenAICompatProvider:
             **_provider_metadata_from_headers(headers),
         )
 
+    def _structured_unsupported_error(
+        self, status: int, body: str, headers: Mapping[str, str]
+    ) -> StructuredOutputUnsupportedError:
+        """Build the error for a server rejecting a strict ``json_schema`` request.
+
+        Only the provider's parsed ``error.message`` is included (scrubbed and
+        truncated), never the raw body.
+        """
+        message = (
+            f"{self.base_url} does not support strict json_schema structured output for "
+            "this model (the server rejected the response_format). logpose requires it "
+            "for output_type; use a compatible server or model."
+        )
+        reason = _provider_error_message_from_body(body)
+        if reason:
+            reason = self._scrub(reason)
+            if len(reason) > _PROVIDER_REASON_LIMIT:
+                reason = reason[:_PROVIDER_REASON_LIMIT] + "…"
+            message += f" Provider said: {reason}"
+        return StructuredOutputUnsupportedError(
+            message,
+            status_code=status,
+            error_code=_provider_error_code_from_body(body),
+            **_provider_metadata_from_headers(headers),
+        )
+
     def _transport_error(self, exc: httpx.HTTPError) -> ProviderError:
         """Build a :class:`~logpose.errors.ProviderError` from a transport failure."""
         scrub_exception_in_place(exc, self._secrets())
@@ -575,17 +620,12 @@ class OpenAICompatProvider:
                     raw = await response.aread()
                     text = raw.decode("utf-8", "replace")
                     if (
-                        "response_format" in body
+                        _is_strict_json_schema_request(body)
                         and response.status_code in (400, 422)
                         and any(m in text.lower() for m in _STRUCTURED_REJECTION_MARKERS)
                     ):
-                        raise StructuredOutputUnsupportedError(
-                            f"{self.base_url} does not support strict json_schema structured "
-                            "output (the server rejected the response_format). Use a model/server "
-                            "that supports it, or run without output_type.",
-                            status_code=response.status_code,
-                            error_code=_provider_error_code_from_body(text),
-                            **_provider_metadata_from_headers(response.headers),
+                        raise self._structured_unsupported_error(
+                            response.status_code, text, response.headers
                         )
                     raise self._status_error(response.status_code, text, response.headers)
                 async for line in response.aiter_lines():

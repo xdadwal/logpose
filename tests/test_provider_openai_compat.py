@@ -840,7 +840,11 @@ async def test_rejected_response_format_is_flagged(status: int) -> None:
     message = str(excinfo.value)
     assert "does not support strict json_schema structured output" in message
     assert BASE in message
-    assert "is not supported" not in message
+    assert "requires it for output_type" in message
+    assert "compatible server or model" in message
+    assert "without output_type" not in message
+    # The provider's own reason is carried through.
+    assert "response_format json_schema is not supported" in message
 
 
 async def test_400_without_response_format_is_a_plain_provider_error() -> None:
@@ -857,3 +861,50 @@ async def test_extra_body_and_request_response_format_conflict() -> None:
     req = request(extra={"response_format": _RESPONSE_FORMAT})
     with pytest.raises(LogposeError, match="response_format"):
         await drain(provider, req)
+
+
+async def test_unsupported_error_includes_scrubbed_truncated_provider_reason() -> None:
+    secret = "sk-secret-value-1234567890"
+    reason = f"Invalid schema for response_format 'out': strict mode key {secret} " + "x" * 2000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": reason}})
+
+    provider = make_provider(handler, api_key=secret)
+    req = request(extra={"response_format": _RESPONSE_FORMAT})
+    with pytest.raises(StructuredOutputUnsupportedError) as excinfo:
+        await drain(provider, req)
+    message = str(excinfo.value)
+    assert "Invalid schema for response_format 'out'" in message
+    assert secret not in message
+    assert "x" * 600 not in message
+
+
+async def test_unsupported_error_never_includes_a_raw_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text="strict json_schema unsupported RAWBODYMARKER")
+
+    provider = make_provider(handler)
+    req = request(extra={"response_format": _RESPONSE_FORMAT})
+    with pytest.raises(StructuredOutputUnsupportedError) as excinfo:
+        await drain(provider, req)
+    assert "RAWBODYMARKER" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "response_format",
+    [{"type": "json_object"}, {"type": "text"}, "json_schema"],
+)
+async def test_non_json_schema_response_format_rejection_is_a_plain_provider_error(
+    response_format: Any,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"message": "structured output is not supported (strict)"}}
+        )
+
+    provider = make_provider(handler)
+    req = request(extra={"response_format": response_format})
+    with pytest.raises(ProviderError) as excinfo:
+        await drain(provider, req)
+    assert type(excinfo.value) is ProviderError
