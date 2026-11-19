@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol, and `DEFAULT_PROVIDER_TURN_TIMEOUT`, `DEFAULT_CLOUD_TURN_TIMEOUT`,
   `DEFAULT_LOCAL_TURN_TIMEOUT`, and `LOCAL_TURN_TIMEOUT_MULTIPLIER` are removed.
 - **Breaking:** logpose now ships only OpenAI-compatible Chat Completions
-  backends: `openai-compat` and `docker`. Removed the `anthropic`, `claude-code`,
+  backends (`openai-compat`; `docker` was removed later, see above). Removed the `anthropic`, `claude-code`,
   `openai` (Responses API), `codex`, and `zai` providers, the Z.ai MCP web-search
   backend (`logpose.web.search_zai`), the `logpose.auth` package, the
   `logpose[anthropic]` extra, and `examples/codex.py`. OpenAI models remain

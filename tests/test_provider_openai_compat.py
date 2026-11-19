@@ -634,6 +634,17 @@ async def test_api_key_falls_back_to_logpose_env(clean_env: pytest.MonkeyPatch) 
     assert handler.requests[-1].headers["authorization"] == "Bearer k1"
 
 
+@pytest.mark.parametrize("explicit", ["", "   "])
+async def test_explicit_blank_api_key_opts_out_of_the_env_key(
+    clean_env: pytest.MonkeyPatch, explicit: str
+) -> None:
+    """A cloud key in the env must not reach a server told to use no key."""
+    clean_env.setenv("LOGPOSE_API_KEY", "sk-cloud")
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler, api_key=explicit), request())
+    assert "authorization" not in handler.requests[-1].headers
+
+
 def test_provider_has_no_model_attribute() -> None:
     assert not hasattr(OpenAICompatProvider(base_url=BASE), "model_default")
 

@@ -332,8 +332,9 @@ class OpenAICompatProvider:
                 ``"https://api.openai.com/v1"``. Falls back to
                 ``$LOGPOSE_BASE_URL``.
             api_key: Bearer token. Optional — local servers usually need none.
-                Falls back to ``$LOGPOSE_API_KEY``; with neither, no
-                ``Authorization`` header is sent.
+                Falls back to ``$LOGPOSE_API_KEY`` only when omitted; pass
+                ``api_key=""`` to send no ``Authorization`` header even when the
+                env var is set.
             max_tokens: Output-token ceiling for a turn, or ``None`` to let the
                 agent decide.
             timeout: httpx timeout. ``None`` (the default) disables every
@@ -364,7 +365,9 @@ class OpenAICompatProvider:
         self.max_tokens = max_tokens
         self.parse_think_tags = parse_think_tags
         self.preserve_reasoning = preserve_reasoning
-        self._api_key = api_key or _env(ENV_API_KEY)
+        # An explicit api_key always wins, and a blank one means "no auth": it is
+        # the only way to keep an ambient LOGPOSE_API_KEY away from this server.
+        self._api_key = (api_key.strip() or None) if api_key is not None else _env(ENV_API_KEY)
         self._default_headers = dict(default_headers or {})
         self._extra_body = dict(extra_body or {})
         self._client = client
