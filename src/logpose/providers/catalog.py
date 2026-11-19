@@ -7,17 +7,16 @@ to answer three questions, and they have very different costs:
    :func:`logpose.provider_catalog`. Pure data, no I/O, no credentials, safe to call
    in a render loop.
 2. *Which ones can I actually use right now?* — :class:`ProviderStatus`, via
-   :func:`logpose.provider_status`. Reads credential stores, so it is async and
-   opt-in.
+   :func:`logpose.provider_status`. Reads the environment, so it is opt-in.
 3. *What models does this backend serve?* — ``provider.list_models()``, which every
    built-in backend implements. Authoritative, so it needs the network.
 
 Keeping the first one free of I/O is the reason this module holds only dataclasses
 and the metadata declarations live in :mod:`logpose.providers` beside
 ``register()``. Reading them off the provider classes instead would mean importing
-every provider module — and with the Anthropic pair, the ``anthropic`` SDK — just to
-ask what the options are. ``tests/test_provider_catalog.py`` pins each declaration
-against the class it describes so the two cannot drift.
+every provider module just to ask what the options are.
+``tests/test_provider_catalog.py`` pins each declaration against the class it
+describes so the two cannot drift.
 """
 
 from __future__ import annotations
@@ -32,20 +31,20 @@ __all__ = [
     "WireApi",
 ]
 
-CredentialKind = Literal["api_key", "subscription", "none", "optional"]
+CredentialKind = Literal["api_key", "none", "optional"]
 """What a provider needs to authenticate.
 
 ``"none"`` is a local backend that needs nothing; ``"optional"`` is a generic
 backend whose server may or may not want a key.
 """
 
-WireApi = Literal["messages", "responses", "chat-completions"]
+WireApi = Literal["chat-completions"]
 """Which wire protocol a provider speaks.
 
-Worth surfacing because reasoning preservation differs across protocols and
-providers. Generic Chat Completions drops reasoning; specific extensions such as
-Z.ai can opt into replay. Consult ProviderInfo.preserves_reasoning rather than
-inferring this capability from the protocol alone.
+Every built-in backend speaks Chat Completions. Reasoning preservation still
+differs between servers: generic Chat Completions drops reasoning, while a
+server-specific extension can opt into replay. Consult
+ProviderInfo.preserves_reasoning rather than inferring it from the protocol.
 """
 
 
@@ -66,18 +65,6 @@ class ProviderInfo:
             backend. Every built-in provider does; a third-party one may not.
         env_vars: Environment variables that configure the backend, credential
             first. Presented in the order a user would set them.
-        officially_supported: ``False`` for the two experimental subscription
-            backends, which depend on unstable CLI authentication details and may
-            break without notice. A UI offering these should label them
-            experimental.
-        credential_module: Dotted path of the :mod:`logpose.auth` module that
-            resolves this backend's credential, or ``None`` when it needs none.
-            Imported lazily, and only by :func:`logpose.provider_status`.
-        credential_kind: The ``require_kind`` value passed to that module's
-            ``resolve_credential``.
-        credential_verify: Name of an extra check in that module to call with the
-            resolved credential, if the backend needs more than a token — Codex
-            also requires the credential to name a ChatGPT account.
         base_url_env: Environment variable that must be set (or ``base_url=``
             passed) before the backend can be reached at all.
         reasoning_replay: Chat Completions extension that preserves reasoning.
@@ -91,10 +78,6 @@ class ProviderInfo:
     supports_model_discovery: bool = True
     aliases: tuple[str, ...] = ()
     env_vars: tuple[str, ...] = ()
-    officially_supported: bool = True
-    credential_module: str | None = None
-    credential_kind: Literal["api_key", "oauth"] | None = None
-    credential_verify: str | None = None
     base_url_env: str | None = None
     reasoning_replay: bool = False
 
@@ -110,7 +93,7 @@ class ProviderInfo:
         Returns:
             Whether this backend replays reasoning in its supported wire format.
         """
-        return self.api != "chat-completions" or self.reasoning_replay
+        return self.reasoning_replay
 
 
 @dataclass(frozen=True)
@@ -128,7 +111,7 @@ class ProviderStatus:
     name: str
     ready: bool
     detail: str = ""
-    credential: Literal["api_key", "oauth", "none"] | None = None
+    credential: Literal["api_key", "none"] | None = None
 
     def __bool__(self) -> bool:
         """Report readiness, so a status can be tested directly."""

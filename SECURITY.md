@@ -37,8 +37,6 @@ Concrete examples that would qualify:
   ambient `$OPENAI_API_KEY` reaching a `localhost` model server.
 - Two conflicting auth headers being sent at once, leaking one credential to a
   provider that has no business seeing it.
-- logpose writing to the Claude Code credential store. Discovery is strictly
-  read-only by design; a write is a bug, and a potentially destructive one.
 
 **Tool execution boundary.** logpose ships no built-in shell, file, or network
 tools — it runs exactly the functions you hand it. `discover_tools` is one of the
@@ -55,8 +53,5 @@ arguments that bypassed schema validation, is in scope.
   logpose deliberately does not sandbox your tools. If a tool is dangerous when
   called with attacker-influenced arguments, that gate belongs in the tool.
   Design guidance is in the README.
-- **Breakage of the experimental `claude-code` or `codex` subscription auth
-  paths.** These integrations depend on unstable CLI details and may break as
-  those clients evolve. Report compatibility problems as ordinary bugs.
-- Vulnerabilities in `anthropic`, `httpx`, `pydantic`, or a model server —
+- Vulnerabilities in `httpx`, `pydantic`, or a model server —
   report those upstream.

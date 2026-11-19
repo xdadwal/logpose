@@ -72,7 +72,7 @@ jobs:
       - name: Build wheel and sdist
         run: uv build
 
-      # Guards the promise that `import logpose` pulls in no provider SDK,
+      # Guards the promise that `import logpose` pulls in no provider module,
       # reads no credential, and makes no network call.
       - name: Install the wheel standalone and check import purity
         run: |
@@ -80,24 +80,16 @@ jobs:
           VIRTUAL_ENV=/tmp/check uv pip install dist/*.whl
           /tmp/check/bin/python -c "
           import sys, logpose
-          assert 'anthropic' not in sys.modules, 'anthropic must not be imported eagerly'
+          assert 'logpose.providers.openai_compat' not in sys.modules, 'providers must load lazily'
           assert 'httpx' not in sys.modules, 'httpx must not be imported eagerly'
           print('logpose', logpose.__version__, 'imports clean')
           "
 
-      - name: Check base install provider boundaries
+      - name: Check every built-in provider resolves from the base install
         run: |
           /tmp/check/bin/python -c "
           import logpose
-          from logpose.errors import LogposeError
-          logpose.resolve('openai', api_key='not-a-real-key')
-          logpose.resolve('codex', auth_token='not-a-real-token', account_id='account')
+          logpose.resolve('openai-compat', base_url='http://localhost:8000/v1')
           logpose.resolve('docker')
-          try:
-              logpose.resolve('anthropic', api_key='not-a-real-key')
-          except LogposeError as exc:
-              assert 'logpose[anthropic]' in str(exc)
-          else:
-              raise AssertionError('Anthropic resolved without its optional extra')
           print('base provider boundaries clean')
           "

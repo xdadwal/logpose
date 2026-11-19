@@ -1,9 +1,7 @@
 """Credential redaction shared by every provider.
 
-Lives in its own module so a provider can redact without importing a sibling
-provider's SDK: ``from logpose.providers.anthropic import redact`` would drag the
-``anthropic`` package into any backend that borrowed it, breaking the promise
-that ``import logpose`` pulls in no vendor SDK.
+Lives in its own module so every provider (built-in or third-party) can redact
+without importing another provider's module.
 """
 
 from __future__ import annotations
@@ -19,7 +17,7 @@ def redact(secret: str) -> str:
 
     Returns:
         A short prefix (only for values long enough that a prefix is not the
-        whole secret) plus the length, e.g. ``"<redacted sk-ant… len=64>"``.
+        whole secret) plus the length, e.g. ``"<redacted sk-pro… len=64>"``.
     """
     prefix = f"{secret[:6]}… " if len(secret) > 12 else ""
     return f"<redacted {prefix}len={len(secret)}>"

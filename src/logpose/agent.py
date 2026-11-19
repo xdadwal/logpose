@@ -19,7 +19,7 @@ streams normalized :data:`~logpose.events.Event` values.
         return f"22C and sunny in {city}"
 
 
-    agent = Agent("anthropic", tools=[get_weather], system="Be concise.")
+    agent = Agent("docker", tools=[get_weather], system="Be concise.")
     result = await agent.run("What's the weather in Pune?")
     print(result.text, result.usage)
 
@@ -351,7 +351,7 @@ class Agent:
 
     def __init__(
         self,
-        provider: Provider | str = "anthropic",
+        provider: Provider | str,
         *,
         model: str | None = None,
         system: str | None = None,
@@ -387,7 +387,7 @@ class Agent:
             max_tokens: Output-token ceiling for each turn. Defaults to the
                 provider's own ``max_tokens`` when it has one, and to
                 :data:`DEFAULT_MAX_TOKENS` otherwise — so
-                ``Agent(AnthropicProvider(max_tokens=2048))`` is honoured rather
+                ``Agent(OpenAICompatProvider(max_tokens=2048))`` is honoured rather
                 than silently overridden.
             retry_policy: Provider retry timing. Retryable failures are replayed
                 only before a text or reasoning delta reaches the caller;
@@ -427,7 +427,7 @@ class Agent:
                 every provider iteration on detached data; never rewrites history.
                 Applications own selection and summaries. Failure stops the run.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
-                ``Agent("anthropic", api_key=...)``. Only valid when ``provider``
+                ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
 
         Raises:

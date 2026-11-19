@@ -57,26 +57,21 @@ or:
 python -m pip install "git+https://github.com/xdadwal/logpose.git"
 ```
 
-The base install supports OpenAI, Codex, Docker Model Runner, and
-OpenAI-compatible providers. To use the Anthropic API or the experimental Claude
-Code integration, add the Anthropic extra:
-
-```bash
-python -m pip install "logpose[anthropic] @ git+https://github.com/xdadwal/logpose.git"
-```
-
 > The `logpose` name on PyPI currently belongs to an unrelated project. Until a
 > distribution name is announced here, use the Git URL above.
 
-Base runtime dependencies are `pydantic` and `httpx`. Docker Model Runner and
-OpenAI-compatible servers require no additional Python packages.
+Runtime dependencies are `pydantic` and `httpx`. Every built-in provider speaks
+the OpenAI Chat Completions API, so no vendor SDK is needed.
 
 ## Quickstart
 
-Set an API key:
+Point logpose at any Chat Completions server, such as OpenAI, vLLM, Ollama, LM
+Studio, llama.cpp, or OpenRouter:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-api03-...
+export OPENAI_BASE_URL=https://api.openai.com/v1
+export OPENAI_MODEL=gpt-5.1
+export OPENAI_API_KEY=sk-...   # omit for a local server that needs no key
 ```
 
 Then create a tool and run an agent:
@@ -101,7 +96,7 @@ def get_weather(city: str, unit: Literal["c", "f"] = "c") -> str:
 
 async def main() -> None:
     agent = Agent(
-        "anthropic",
+        "openai-compat",
         tools=[get_weather],
         system="Answer in one concise sentence.",
     )
@@ -127,42 +122,15 @@ A runnable streaming version is available in
 
 Each provider name selects an explicit backend and credential type.
 
+Every built-in provider speaks the OpenAI Chat Completions API.
+
 | Provider | Use case | Authentication |
 | --- | --- | --- |
-| `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` or `api_key=` |
-| `openai` | OpenAI Responses API | `OPENAI_API_KEY` or `api_key=` |
+| `openai-compat` | Any Chat Completions server, local or hosted (including OpenAI) | Optional, server-dependent |
 | `docker` | Models hosted locally by Docker Model Runner | None |
-| `openai-compat` | A configured Chat Completions-compatible server | Optional, server-dependent |
-| `zai` | Z.ai GLM Coding Plan with preserved reasoning | `ZAI_KEY` or `api_key=` |
-| `claude-code` | Claude Code subscription session | Local CLI login or OAuth token; experimental |
-| `codex` | Codex subscription session | Local CLI login; experimental |
 
 Credentials may be passed directly to `Agent`, which takes precedence over the
-corresponding environment variable. Credential stores are read-only; refreshed
-subscription credentials are kept in memory and are not written back to disk.
-
-### Anthropic API key
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-api03-...
-```
-
-```python
-agent = Agent("anthropic")
-```
-
-### OpenAI API key
-
-```bash
-export OPENAI_API_KEY=sk-proj-...
-```
-
-```python
-agent = Agent("openai")
-```
-
-The OpenAI provider uses the Responses API. Select a model with `model=` or
-`OPENAI_RESPONSES_MODEL` when you do not want the provider default.
+corresponding environment variable.
 
 ### Docker Model Runner
 
@@ -184,8 +152,8 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 
 ### OpenAI-compatible servers
 
-Use `openai-compat` for servers exposing `POST /chat/completions`, including local
-or hosted deployments:
+Use `openai-compat` for servers exposing `POST /chat/completions`, including
+OpenAI itself and local or hosted deployments:
 
 ```python
 agent = Agent(
@@ -201,51 +169,10 @@ The same values can be set with `OPENAI_BASE_URL`, `OPENAI_MODEL`, and
 `OPENAI_API_KEY`. The `docker` provider intentionally does not read
 `OPENAI_API_KEY`.
 
-### Z.ai Coding Plan
-
-```python
-agent = Agent("zai", model="glm-5.3-flash", tools=[get_weather],
-              extra={"reasoning_effort": "low"})
-```
-
-Set `ZAI_KEY` in the environment. This backend uses the Coding Plan endpoint
-`https://api.z.ai/api/coding/paas/v4`, defaults to `glm-5.3-flash` with low effort,
-and does not inherit `OPENAI_API_KEY`, `OPENAI_BASE_URL`, or `OPENAI_MODEL`.
-Supported effort levels are `low`, `high`, and `max`; thinking must stay enabled.
-Original `reasoning_content` is replayed unchanged across tool calls, with preserved
-thinking enabled. Generic Chat Completions keeps its existing reasoning-dropping
-behavior unless explicitly constructed with `preserve_reasoning=True`.
-
-### Experimental: Claude Code subscription
-
-```bash
-claude setup-token
-export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
-```
-
-```python
-agent = Agent("claude-code")
-```
-
-If Claude Code is already logged in, logpose can read its local credential store
-without the export. This integration relies on unstable CLI authentication details
-and may stop working without notice. Use it for experimentation, not workloads
-that require a stable authentication path.
-
-### Experimental: Codex subscription
-
-```bash
-codex login
-```
-
-```python
-agent = Agent("codex")
-```
-
-logpose reads `~/.codex/auth.json`, or `$CODEX_HOME/auth.json`, without modifying
-it. This integration relies on unstable CLI authentication details and may stop
-working without notice. A complete example is in
-[`examples/codex.py`](examples/codex.py).
+Chat Completions has no standard field for a reasoning model's chain of thought,
+so by default reasoning is not sent back on later turns. For servers that accept
+it as `reasoning_content`, pass `preserve_reasoning=True` to replay it unchanged
+across tool calls.
 
 ## Streaming
 
@@ -288,7 +215,7 @@ uses bounded exponential backoff with jitter, and honors a provider's
 from logpose import Agent, RetryPolicy
 
 agent = Agent(
-    "anthropic",
+    "openai-compat",
     retry_policy=RetryPolicy(max_attempts=3),
 )
 ```
@@ -317,12 +244,12 @@ Override the selected provider's recommendation, or disable the complete-turn
 deadline explicitly:
 
 ```python
-agent = Agent("anthropic", provider_turn_timeout=600)
+agent = Agent("openai-compat", provider_turn_timeout=600)
 agent = Agent("docker", provider_turn_timeout=None)
 ```
 
-HTTPX-backed providers also accept `timeout=` for connection, pool, write, and
-idle-read settings. Anthropic providers accept a transport timeout in seconds.
+Providers also accept `timeout=` for connection, pool, write, and idle-read
+settings.
 
 ## Defining tools
 
@@ -366,7 +293,7 @@ tools:
 from logpose import Agent, discover_tools
 
 tools = discover_tools("myapp.tools", "myapp.integrations")
-agent = Agent("anthropic", tools=tools)
+agent = Agent("openai-compat", tools=tools)
 ```
 
 It deduplicates re-exported tools and reports conflicting names. Because discovery
@@ -385,7 +312,7 @@ def approve(call):
     return None
 
 
-agent = Agent("anthropic", tools=[...], on_tool_call=approve)
+agent = Agent("openai-compat", tools=[...], on_tool_call=approve)
 ```
 
 The gate sees calls in wire order before any tool in that turn starts. Return
@@ -403,7 +330,7 @@ acquires a slot:
 
 ```python
 agent = Agent(
-    "anthropic",
+    "openai-compat",
     tools=[get_weather],
     max_concurrent_tools=8,
     tool_timeout=300,
@@ -426,7 +353,7 @@ Use `tool_error_mode="message"` or `tool_error_mode="traceback"` only when the
 model is allowed to see that diagnostic detail:
 
 ```python
-agent = Agent("anthropic", tools=[get_weather], tool_error_mode="message")
+agent = Agent("openai-compat", tools=[get_weather], tool_error_mode="message")
 ```
 
 For application-specific redaction, supply a formatter. It receives raw failure
@@ -441,7 +368,7 @@ def tool_error(context: ToolErrorContext) -> str:
     return f"{context.tool_name} failed; reference {context.error_id}."
 
 
-agent = Agent("anthropic", tools=[get_weather], tool_error_formatter=tool_error)
+agent = Agent("openai-compat", tools=[get_weather], tool_error_formatter=tool_error)
 ```
 
 ## Runtime observability
@@ -497,7 +424,7 @@ def lookup_customer(customer_id: str) -> str:
     return "..."
 
 
-agent = Agent("anthropic", tools=[lookup_customer], observers=[metrics])
+agent = Agent("openai-compat", tools=[lookup_customer], observers=[metrics])
 ```
 
 `current_runtime_context()` returns `None` outside runtime execution. Within a
@@ -511,7 +438,7 @@ Pass a `Conversation` to retain history across calls:
 ```python
 from logpose import Agent, Conversation
 
-agent = Agent("anthropic", tools=[get_weather])
+agent = Agent("openai-compat", tools=[get_weather])
 conversation = Conversation()
 
 await agent.run("My name is Ada.", conversation=conversation)
@@ -529,7 +456,7 @@ state in the history.
 ```python
 from logpose import Agent, SyncAgent
 
-with SyncAgent(Agent("anthropic", tools=[get_weather])) as agent:
+with SyncAgent(Agent("openai-compat", tools=[get_weather])) as agent:
     result = agent.run("What is the weather in Pune?")
     print(result.text)
 ```
@@ -551,38 +478,26 @@ for info in provider_catalog():
 for status in await provider_status():
     print(status.name, status.ready, status.detail)
 
-models = await resolve("anthropic").list_models()
+models = await resolve("openai-compat").list_models()
 ```
 
 - `provider_catalog()` returns static metadata without reading credentials or
-  importing provider SDKs.
+  importing provider modules.
 - `provider_status()` checks local configuration without making a network request.
 - `provider.list_models()` asks the selected backend for its current model list.
-
-The experimental Codex model catalog is client-version-gated. Its discovery
-request declares `0.159.0` by default; pass `resolve("codex", client_version="...")`
-to override it. Updating this declaration changes discovery, not the default
-inference model or your account's model access.
-
-The experimental subscription providers have `officially_supported=False` in
-their catalog metadata so applications can label them appropriately.
 
 ## Configuration reference
 
 | Provider | Model | Endpoint | Other |
 | --- | --- | --- | --- |
-| `anthropic` | `model=` | provider default | `ANTHROPIC_API_KEY` |
-| `openai` | `OPENAI_RESPONSES_MODEL` | `OPENAI_RESPONSES_BASE_URL` | `OPENAI_API_KEY` |
-| `docker` | `DOCKER_MODEL` | `DOCKER_MODEL_RUNNER_URL` | no credential |
 | `openai-compat` | `OPENAI_MODEL` | `OPENAI_BASE_URL` | optional `OPENAI_API_KEY` |
-| `claude-code` | `model=` | provider default | `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` |
-| `codex` | `CODEX_MODEL` | `CODEX_BASE_URL` | `CODEX_HOME`, `CHATGPT_ACCOUNT_ID` |
+| `docker` | `DOCKER_MODEL` | `DOCKER_MODEL_RUNNER_URL` | no credential |
 
 Provider-specific request fields that logpose does not model can be passed with
 `extra=`:
 
 ```python
-agent = Agent("anthropic", extra={"tool_choice": {"type": "any"}})
+agent = Agent("openai-compat", extra={"tool_choice": "required"})
 ```
 
 ## Errors
@@ -591,7 +506,7 @@ All library-defined errors inherit from `LogposeError`.
 
 | Error | Meaning |
 | --- | --- |
-| `AuthError` | A credential could not be resolved, refreshed, or was rejected; its message names the recovery step. |
+| `AuthError` | A credential was missing or rejected; its message names the setting to check. |
 | `ProviderError` | The upstream provider failed; includes status and retryability when known. |
 | `MaxIterationsError` | The run reached its iteration limit; includes partial messages. |
 | `ToolSchemaError` | A tool signature could not be represented as JSON Schema. |
@@ -602,10 +517,8 @@ results rather than raised from the run. Configure `tool_error_mode` or
 `tool_error_formatter` only when exposing additional diagnostic detail is
 appropriate for that model-facing context.
 
-An HTTP authentication rejection is never retried automatically. For API-key
-providers, `AuthError` tells you which key setting to check. For the experimental
-subscription integrations, sign in again with `claude login` or `codex login` as
-the error directs, then start a new run.
+An HTTP authentication rejection is never retried automatically. `AuthError`
+tells you which key setting to check.
 
 ## Extending logpose
 

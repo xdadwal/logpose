@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Breaking:** logpose now ships only OpenAI-compatible Chat Completions
+  backends: `openai-compat` and `docker`. Removed the `anthropic`, `claude-code`,
+  `openai` (Responses API), `codex`, and `zai` providers, the Z.ai MCP web-search
+  backend (`logpose.web.search_zai`), the `logpose.auth` package, the
+  `logpose[anthropic]` extra, and `examples/codex.py`. OpenAI models remain
+  reachable through `openai-compat`. The previous multi-provider codebase is
+  preserved on the `archive/multi-provider` branch.
+- **Breaking:** `Agent` no longer defaults to a provider; pass one explicitly.
+- **Breaking:** `ProviderInfo` drops `officially_supported`, `credential_module`,
+  `credential_kind`, and `credential_verify`. `CredentialKind` drops
+  `"subscription"`, `WireApi` is now only `"chat-completions"`, and
+  `ProviderStatus.credential` no longer reports `"oauth"`.
+
 ### Added
 
 - Optional sync/async request context policies operating on detached inputs,

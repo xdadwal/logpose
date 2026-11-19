@@ -70,44 +70,34 @@ register("mine", lambda **kwargs: MyProvider(**kwargs))
 
 Register it lazily in `logpose/providers/__init__.py` — importing the module
 inside the factory, not at the top of the file — so `import logpose` continues
-to pull in no vendor SDK. There is a test that enforces this.
+to load no provider module. There is a test that enforces this.
 
 The stream must end with exactly one `CompletionDone` whose `message` is the
-assembled assistant turn, blocks in wire order. Two existing backends document
-their own divergences from logpose's model in their module docstrings, and between
-them cover most of what a new one will hit:
-
-- `logpose/providers/openai_compat.py` — a message-shaped wire format (Chat
-  Completions): tool-result fan-out, string tool arguments streamed in fragments,
-  reasoning with no signature to preserve.
-- `logpose/providers/codex.py` — an *item*-shaped wire format (Responses), where a
-  turn is a flat list of siblings rather than a message with content blocks, and
-  where opaque reasoning has to survive a round trip in order. If your backend
-  returns anything logpose does not model, `RawBlock` is how it goes back
-  verbatim.
+assembled assistant turn, blocks in wire order.
+`logpose/providers/openai_compat.py` documents its divergences from logpose's model
+in its module docstring (tool-result fan-out, string tool arguments streamed in
+fragments, reasoning with no signature to preserve), which covers most of what a
+new backend will hit. If your backend returns anything logpose does not model,
+`RawBlock` is how it goes back verbatim.
 
 Anything shared between backends goes in a private helper module —
 `providers/_redact.py`, `providers/_toolargs.py` — never imported from a sibling
-provider, or resolving one backend would drag in the other's SDK. The same rule
-applies under `auth/`: `auth/_common.py` holds the backend-neutral credential
-core, and each vendor module owns only its own store, endpoint, and error strings.
+provider, or resolving one backend would drag in the other's module.
 
 ## One provider per credential
 
-A provider accepts **exactly one kind of credential**, and where a vendor supports
-both an API key and a subscription token that means two registered providers over a
-shared private base: `anthropic`/`claude-code` over `_anthropic_base.py`,
-`openai`/`codex` over `_responses.py`.
+A provider accepts **exactly one kind of credential**. `docker`, for example, never
+reads `OPENAI_API_KEY`, even though it subclasses `OpenAICompatProvider`, so an
+ambient cloud key cannot leak to a local server.
 
 Keep credential types explicit rather than building a provider that changes
 behavior according to whichever credential it finds. The endpoint, headers,
 request fields, and compatibility settings are then known at construction time,
 and each provider can document a simple credential policy.
 
-The pattern to copy: subclass the shared base, set the class variables that name
-your credential kind and endpoint, and override only the hooks that genuinely
-differ. `DockerModelsProvider` is the same shape applied to a policy difference
-rather than a credential one.
+The pattern to copy: subclass `OpenAICompatProvider`, set the endpoint and
+credential policy, and override only the hooks that genuinely differ.
+`DockerModelsProvider` is the reference example.
 
 ## Conventions
 
