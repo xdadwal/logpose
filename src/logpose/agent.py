@@ -76,6 +76,7 @@ import contextlib
 import copy
 import enum
 import inspect
+import json
 import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
@@ -300,6 +301,9 @@ If it raises or returns a non-string, logpose falls back to its safe message.
 """
 
 
+_CONVERSATION_JSON_VERSION = 1
+
+
 class Conversation:
     """A mutable multi-turn message history.
 
@@ -350,6 +354,35 @@ class Conversation:
     def clear(self) -> None:
         """Drop every turn, keeping the same object usable."""
         self.messages.clear()
+
+    def to_json(self) -> str:
+        """Serialize the history to a versioned JSON document.
+
+        Returns:
+            ``{"version": 1, "messages": [...]}`` as a JSON string; lossless for
+            every content block type.
+        """
+        messages = [m.model_dump() for m in self.messages]
+        return json.dumps({"version": _CONVERSATION_JSON_VERSION, "messages": messages})
+
+    @classmethod
+    def from_json(cls, text: str) -> Conversation:
+        """Rebuild a conversation from :meth:`to_json` output.
+
+        Args:
+            text: The JSON document.
+
+        Returns:
+            A new :class:`Conversation`.
+
+        Raises:
+            LogposeError: If the document's ``version`` is not supported.
+        """
+        data = json.loads(text)
+        version = data.get("version") if isinstance(data, dict) else None
+        if version != _CONVERSATION_JSON_VERSION:
+            raise LogposeError(f"unsupported conversation JSON version: {version!r}")
+        return cls(Message.model_validate(m) for m in data["messages"])
 
     @property
     def text(self) -> str:
