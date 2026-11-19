@@ -21,15 +21,17 @@ per-session token usage).
 
 - `SessionStore`: an async interface through which all database work happens.
   No SQL outside the store module.
-- `SQLiteStore`: the default implementation, on `aiosqlite`, shipped as the
-  optional extra `logpose[sqlite]`.
+- `SQLiteStore`: the implementation, on `aiosqlite`. **logpose creates and
+  manages it automatically (owner's decision, 2026-11-20): apps never construct
+  or pass a store.** `SessionStore` stays an internal seam so MySQL and Postgres
+  can be added later.
 - Store sessions, their full message history (all content blocks, losslessly),
   and one record per run (usage, outcome).
 - A per-session lease so two requests never run on one session at once, across
   worker processes on one host.
-- Agent integration: `Agent(store=...)` plus `run`/`stream(..., session_id=...)`
-  loads history, runs, persists new messages and the run record, then
-  releases. Without `session_id`, behaviour is unchanged.
+- Agent integration: `run`/`stream(..., session_id=...)` (or `agent.session(...)`)
+  loads history, runs, persists new messages and the run record, then releases.
+  Without session use, behaviour is unchanged and nothing touches disk.
 - Schema versioning and migrations from day one.
 - Expiry and purge of idle sessions.
 
@@ -48,7 +50,8 @@ per-session token usage).
 ## Anti-goals
 
 - Blocking the event loop on database I/O.
-- Silently creating a database file: the app must pass a store explicitly.
+- Touching disk for runs that don't use sessions. The database is created
+  lazily, on first session use only.
 - A stored history that can't be replayed to the model exactly as it was
   produced: tool calls and results, reasoning and signatures, and raw blocks
   must round-trip.
@@ -56,8 +59,9 @@ per-session token usage).
 
 ## Constraints
 
-- Python 3.10+. Core dependencies stay `pydantic` and `httpx`; `aiosqlite` only
-  in the `sqlite` extra. Importing `logpose` must not import `aiosqlite`.
+- Python 3.10+. `aiosqlite` becomes a **core dependency** (the store is automatic,
+  so it can't be an optional extra). Importing `logpose` still must not import
+  `aiosqlite`; it is imported lazily on first session use.
 - Portable schema: only TEXT, INTEGER (64-bit) and NULL column types; JSON stored
   as TEXT; timestamps as integer Unix milliseconds (UTC); no SQLite-only
   features in the table definitions (no `WITHOUT ROWID`, no `AUTOINCREMENT`
@@ -67,8 +71,8 @@ per-session token usage).
 
 ## Approaches
 
-- **Stdlib-style SQL on `aiosqlite` behind a `SessionStore` interface
-  (chosen).** Simple, one small dependency, async-native, with portability kept
+- **Stdlib-style SQL on `aiosqlite` behind a `SessionStore` interface, managed
+  automatically by logpose (chosen).** Simple, one small dependency, async-native, with portability kept
   by the interface and a portable schema.
 - Blocking `sqlite3` on the event loop: rejected. Lock waits and slow fsyncs
   would freeze every stream in the worker.
@@ -164,6 +168,25 @@ handle lost, and the final save is refused as below.
   runs) and returns the number of sessions purged. logpose never purges on its
   own; the app calls it, for example on a schedule.
 
+### Automatic management (Claude's calls, following the owner's decision)
+
+- **Location:** the database path comes from `LOGPOSE_DB_PATH`. Default:
+  `logpose.db` in the process's working directory. Blank counts as unset,
+  matching the other `LOGPOSE_*` variables. The parent directory is created if
+  missing.
+- **Lifecycle:** one store per path per process, created and opened (schema
+  migrated) lazily on first session use, and shared by every `Agent` in that
+  process. Closed at `Agent.aclose()` of the last agent using it, or at
+  interpreter exit; best effort.
+- **No public store parameter.** `Agent` has no `store=` argument. Tests point
+  `LOGPOSE_DB_PATH` at a temporary file. A private constructor hook for
+  injecting a store may exist for tests only.
+- **Maintenance surface:** `await agent.purge_expired_sessions() -> int` and
+  `await agent.delete_session(session_id)`. Apps call these; logpose never
+  purges on its own.
+- **Settings:** the idle TTL (30 days) and lease TTL (60 s) are fixed defaults
+  for now. Exposing them is a later change.
+
 ### SQLite specifics (`logpose/store/sqlite.py`)
 
 - `SQLiteStore(path: str | os.PathLike, *, idle_ttl: float = 30 * 86400,
@@ -174,11 +197,12 @@ handle lost, and the final save is refused as below.
   schema version than the code supports raises `LogposeError`.
 - One `aiosqlite` connection per store, serialized internally. This is
   sufficient for the target scale; a pool is left for later.
-- Async context manager support: `async with SQLiteStore(...) as store:`.
+- Async context manager support, used internally.
 
 ### Agent integration
 
-- `Agent(..., store: SessionStore | None = None, session_wait: float = 0.0)`.
+- `Agent(..., session_wait: float = 0.0)`. There is no store argument; the store
+  is automatic (see above).
 - **Explicit form (Claude's call), for streaming web apps:**
   `async with agent.session(session_id, metadata=...) as handle:` takes the
   lease and loads history, so `SessionBusyError` is raised before any HTTP
@@ -191,8 +215,8 @@ handle lost, and the final save is refused as below.
   wrapping one call in `agent.session(...)`. For `stream`, the lease is taken
   when iteration starts, so a busy session surfaces as `SessionBusyError` from
   the first `__anext__`; streaming apps that need a 409 use the explicit form.
-- `session_id` or `agent.session(...)` without a store raises `LogposeError`.
-  So does combining any two of `session_id=`, `session=` and `conversation=`.
+- Combining any two of `session_id=`, `session=` and `conversation=` raises
+  `LogposeError`.
 - With `session_id`, the run:
   1. opens `store.session(session_id)`, using `conversation` from the handle;
   2. runs as today;
