@@ -26,9 +26,9 @@ from collections.abc import Callable
 
 from logpose.tools import ToolDef, tool
 
-_DEFAULT_CAPTURE_LIMIT = 16 * 1024 * 1024
-_DEFAULT_TIMEOUT = 600.0
-_DEFAULT_OUTPUT_CAP = 100_000
+_DEFAULT_CAPTURE_LIMIT = 1024 * 1024
+_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_OUTPUT_CAP = 16_000
 
 
 def bounded_run(

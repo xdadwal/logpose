@@ -69,3 +69,10 @@ def test_make_shell_tool_reports_timeout(tmp_path):
 def test_make_shell_tool_resolves_callable_cwd(tmp_path):
     shell = make_shell_tool(cwd=lambda: str(tmp_path), timeout=10)
     assert shell(f"ls {tmp_path}").startswith("[exit 0]")
+
+
+def test_shell_defaults_are_web_app_safe(tmp_path):
+    shell = make_shell_tool(cwd=str(tmp_path))
+    out = shell("yes x | head -c 20000")
+    assert out.endswith("...[truncated]")
+    assert len(out) <= 16_000 + 20
