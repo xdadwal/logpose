@@ -12,7 +12,7 @@ import dataclasses
 import json
 from collections.abc import Callable, Sequence
 
-from logpose.messages import ContentBlock, Message, ToolResultBlock
+from logpose.messages import ContentBlock, Message, ToolResultBlock, ToolUseBlock
 from logpose.providers.base import ToolSpec
 from logpose.tools import ToolDef, tool
 
@@ -66,9 +66,12 @@ def apply_pointers(
 ) -> tuple[list[Message], int]:
     """Replace long tool outputs from earlier runs with short pointers.
 
-    Only :class:`~logpose.messages.ToolResultBlock` values before
-    ``current_start`` whose content is longer than ``min_chars`` change. Each
-    keeps its ``tool_use_id`` and ``is_error``, so tool pairing stays valid.
+    A :class:`~logpose.messages.ToolResultBlock` becomes a pointer only when it
+    is longer than ``min_chars``, comes before ``current_start``, and the model
+    has already answered it (an assistant message follows it before
+    ``current_start``). Results a resumed run has not shown the model yet, and
+    results of ``recall_tool_output`` itself, stay in full. Each pointer keeps
+    its ``tool_use_id`` and ``is_error``, so tool pairing stays valid.
 
     Args:
         messages: The request's messages. Never mutated.
@@ -79,18 +82,35 @@ def apply_pointers(
     Returns:
         New message copies and the number of pointers applied.
     """
+    # Only results already followed by an assistant message may be pointed at.
+    boundary = 0
+    for index in range(min(current_start, len(messages)) - 1, -1, -1):
+        if messages[index].role == "assistant":
+            boundary = index + 1
+            break
+    recall_ids = {
+        block.id
+        for message in messages[:boundary]
+        for block in message.content
+        if isinstance(block, ToolUseBlock) and block.name == RECALL_TOOL_NAME
+    }
+
+    def pointed(block: object) -> bool:
+        return (
+            isinstance(block, ToolResultBlock)
+            and len(block.content) > min_chars
+            and block.tool_use_id not in recall_ids
+        )
+
     out: list[Message] = []
     applied = 0
     for index, message in enumerate(messages):
-        if index >= current_start or not any(
-            isinstance(block, ToolResultBlock) and len(block.content) > min_chars
-            for block in message.content
-        ):
+        if index >= boundary or not any(pointed(block) for block in message.content):
             out.append(message.model_copy(deep=True))
             continue
         blocks: list[ContentBlock] = []
         for block in message.content:
-            if isinstance(block, ToolResultBlock) and len(block.content) > min_chars:
+            if isinstance(block, ToolResultBlock) and pointed(block):
                 blocks.append(
                     block.model_copy(
                         update={"content": _pointer_text(block.tool_use_id, len(block.content))}

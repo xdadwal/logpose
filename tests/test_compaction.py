@@ -138,18 +138,22 @@ def test_apply_pointers_never_mutates_input() -> None:
         Message(role="user", content=[TextBlock(text="q")]),
         Message(role="assistant", content=[ToolUseBlock(id="x", name="big", input={})]),
         Message(role="user", content=[ToolResultBlock(tool_use_id="x", content="z" * 2000)]),
+        Message(role="assistant", content=[TextBlock(text="answer")]),
         Message(role="user", content=[TextBlock(text="next")]),
     ]
     before = [m.model_dump() for m in messages]
-    out, applied = apply_pointers(messages, current_start=3, min_chars=1000)
+    out, applied = apply_pointers(messages, current_start=4, min_chars=1000)
     assert applied == 1
     assert out[2].content[0].content == pointer("x", 2000)
     assert [m.model_dump() for m in messages] == before
     # Boundary: exactly min_chars stays inline; current-run outputs stay inline.
-    _, none_applied = apply_pointers(messages, current_start=3, min_chars=2000)
+    _, none_applied = apply_pointers(messages, current_start=4, min_chars=2000)
     assert none_applied == 0
     _, current = apply_pointers(messages, current_start=2, min_chars=1000)
     assert current == 0
+    # Before the model answered it (no assistant message after it), it stays full.
+    _, unanswered = apply_pointers(messages, current_start=3, min_chars=1000)
+    assert unanswered == 0
 
 
 def test_estimate_tokens_counts_all_pieces() -> None:
@@ -290,3 +294,38 @@ def test_input_budget_validation() -> None:
 def test_invalid_settings_rejected(kwargs: dict[str, object]) -> None:
     with pytest.raises(LogposeError):
         Agent(FakeProvider([]), model="test-model", **kwargs)  # type: ignore[arg-type]
+
+
+async def test_unanswered_results_stay_full_until_the_model_answers() -> None:
+    conv = Conversation(
+        [
+            Message(role="user", content=[TextBlock(text="go")]),
+            Message(role="assistant", content=[ToolUseBlock(id="t1", name="big", input={"n": 1})]),
+            Message(role="user", content=[ToolResultBlock(tool_use_id="t1", content="1" * 5000)]),
+        ]
+    )
+    provider = FakeProvider([ScriptedTurn.text("seen it"), ScriptedTurn.text("next")])
+    agent = Agent(provider, model="test-model", tools=[big])
+    await agent.run(conversation=conv)
+    assert results_by_id(provider.requests[0])["t1"].content == "1" * 5000
+    await agent.run("again", conversation=conv)
+    assert results_by_id(provider.requests[1])["t1"].content == pointer("t1", 5000)
+
+
+async def test_recall_results_are_never_pointed() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("big", {"n": 7}, id="t1")),
+            ScriptedTurn.text("one"),
+            ScriptedTurn.tool_use(tool_call(RECALL, {"call_id": "t1"}, id="r1")),
+            ScriptedTurn.text("two"),
+            ScriptedTurn.text("three"),
+        ]
+    )
+    agent = Agent(provider, model="test-model", tools=[big])
+    conv = Conversation()
+    for prompt in ("first", "second", "third"):
+        await agent.run(prompt, conversation=conv)
+    third = results_by_id(provider.requests[4])
+    assert third["t1"].content == pointer("t1", 5000)
+    assert third["r1"].content == "7" * 5000
