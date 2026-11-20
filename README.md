@@ -435,7 +435,8 @@ failures raise `ContextPreparationError` before that iteration's inference; ther
 is no fallback that silently drops history. Cancellation propagates normally.
 Synchronous policies must avoid blocking I/O; async policies own their I/O deadlines.
 `Agent.last_context_diagnostics` holds the most recently prepared metadata and is
-not automatically logged. With no policy, full-history behavior is unchanged.
+not automatically logged. Without a custom policy, the built-in compaction described
+in [Long conversations](#long-conversations) applies; `context_policy=None` sends full history.
 
 For durable application journals, pass an async `tool_observer=` callback. It
 receives `ToolObservation` values containing detached approved call data and
@@ -592,6 +593,65 @@ Known limits:
 - Abandoned streams release the lease when they are closed. Wrap them to make that
   prompt: `async with contextlib.aclosing(agent.stream(..., session_id=sid)) as events:`.
 
+## Long conversations
+
+By default logpose keeps long conversations inside the model's context window.
+Only the request that is sent is changed. The `Conversation`, the session store and
+`RunResult.messages` always keep the full, original history.
+
+**Tool-output pointers.** A tool result longer than `pointer_min_chars` (default
+1,000) that the model has already answered, in an earlier run, is sent as a short
+pointer instead of its text:
+
+```text
+[tool output stored: <id>, <N> chars. Call recall_tool_output("<id>") to read it.]
+```
+
+Results the model has not yet seen (trailing results of a resumed run) and results
+of `recall_tool_output` itself are never pointed. When the agent has tools, logpose
+adds a `recall_tool_output(call_id, offset=0)` tool that returns the stored text in
+pages of 8,000 characters. The tool passes through `on_tool_call` and
+`tool_observer` like any app tool, so allow it in gates. An app tool may not use
+that name.
+
+**Summaries.** The input budget is
+`min(context_window - max_tokens, context_budget)`. Defaults: `context_window`
+128,000, `context_budget` 32,000 (`None` removes the cap), with `max_tokens`
+resolved as in [Output limit](#output-limit). Input size is estimated as
+characters / 4, multiplied by a calibration ratio learned from the usage the
+provider reports (smoothed, clamped to [0.5, 2.0]). When the estimate reaches 85%
+of the budget (`compaction_threshold`), older turns are summarized down to about
+60% (`compaction_target`): one extra model call (2,048 output tokens max, no tools,
+counted in the run's usage) whose result is inserted as an assistant message after
+the first user turn, which stays pinned. Recent turns, and everything from the
+current run, are sent verbatim. The summary is cached and reused until the
+threshold is reached again. With sessions it is persisted (schema v2, migrated
+automatically) and reused across requests.
+
+If the summary call fails, the request is sent uncompacted when it fits the window
+(`context_window - max_tokens`); otherwise the run raises `ContextOverflowError`.
+A failed summary is not retried again within the same run. If the provider rejects
+a request with a 400 context-length error, logpose forces one summary and retries
+once.
+
+```python
+agent = Agent(
+    "openai-compat", model="gpt-5.1", tools=[get_weather],
+    context_window=200_000, context_budget=64_000,
+    compaction_threshold=0.85, compaction_target=0.6, pointer_min_chars=1_000,
+)
+```
+
+**Observing it.** Each prepared request that applied pointers or attempted a
+summary publishes a metadata-only `context.compacted` runtime event (pointer count,
+whether a summary is in use, estimated tokens before and after, input budget).
+`agent.last_context_diagnostics` holds the same numbers for the latest request.
+
+**Opting out.** `context_policy=None` disables all of this and sends full history.
+A custom `context_policy` function (see
+[Runtime observability](#runtime-observability)) replaces all of it: no pointers,
+recall tool, summary, retry, or event.
+
 ## Structured output
 
 Pass a pydantic model as `output_type` and the run returns a validated instance
@@ -636,6 +696,7 @@ default, while `X | None` fields keep `None`.
 
 | Error | Raised when |
 | --- | --- |
+| `ContextOverflowError` | The request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). |
 | `OutputValidationError` | The reply is not valid for the model after the retry budget, including `reason="max_tokens"` when output was cut off. |
 | `OutputRefusalError` | The model refused. There is no correction turn. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (HTTP 400/422). The message includes the provider's reason when it gave one. Not retried. |
