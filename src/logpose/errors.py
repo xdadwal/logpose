@@ -17,6 +17,7 @@ from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance only
+    from logpose.guardrails import GuardrailResult
     from logpose.messages import Message
 
 __all__ = [
@@ -32,11 +33,24 @@ __all__ = [
     "OutputRefusalError",
     "SessionBusyError",
     "ContextOverflowError",
+    "GuardrailTripped",
 ]
 
 
 class LogposeError(Exception):
     """Base class for every error raised by logpose."""
+
+
+class GuardrailTripped(LogposeError):
+    """Raised when an input guardrail blocks a run that needs structured output.
+
+    Attributes:
+        result: The guard name, category, reason and scores of the block.
+    """
+
+    def __init__(self, result: GuardrailResult) -> None:
+        super().__init__(f"input guardrail {result.guard!r} blocked the run ({result.category})")
+        self.result = result
 
 
 class SessionBusyError(LogposeError):
