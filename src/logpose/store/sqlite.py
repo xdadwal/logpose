@@ -23,6 +23,7 @@ from logpose.agent import Conversation
 from logpose.errors import LogposeError, SessionBusyError
 from logpose.messages import Message
 from logpose.store.base import RunRecord, SessionHandle, validate_session_id
+from logpose.tracing.spans import SpanRecord
 
 if TYPE_CHECKING:  # pragma: no cover
     import aiosqlite
@@ -51,6 +52,17 @@ _MIGRATIONS: list[list[str]] = [
         "CREATE TABLE logpose_summaries ("
         "session_id TEXT, upto_seq INTEGER, text TEXT, created_at INTEGER, "
         "PRIMARY KEY (session_id, upto_seq))",
+    ],
+    [
+        "ALTER TABLE logpose_runs ADD COLUMN metadata TEXT NULL",
+        "CREATE TABLE logpose_spans ("
+        "trace_id TEXT, span_id TEXT, parent_span_id TEXT NULL, run_id TEXT, "
+        "session_id TEXT NULL, name TEXT, kind INTEGER, start_ns INTEGER, end_ns INTEGER, "
+        "status_code INTEGER, status_message TEXT NULL, attributes TEXT, events TEXT, "
+        "PRIMARY KEY (trace_id, span_id))",
+        "CREATE INDEX logpose_spans_run ON logpose_spans (run_id)",
+        "CREATE INDEX logpose_spans_session ON logpose_spans (session_id)",
+        "CREATE INDEX logpose_spans_start ON logpose_spans (start_ns)",
     ],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -358,6 +370,7 @@ class SQLiteStore:
                     "DELETE FROM logpose_messages WHERE session_id = ?",
                     "DELETE FROM logpose_runs WHERE session_id = ?",
                     "DELETE FROM logpose_summaries WHERE session_id = ?",
+                    "DELETE FROM logpose_spans WHERE session_id = ?",
                     "DELETE FROM logpose_sessions WHERE id = ?",
                 ):
                     await db.execute(sql, (session_id,))
@@ -512,7 +525,7 @@ class SQLiteStore:
                     "INSERT INTO logpose_runs (run_id, session_id, model, provider, "
                     "started_at, ended_at, outcome, iterations, input_tokens, output_tokens, "
                     "reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, "
-                    "error_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "error_type, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         record.run_id,
                         record.session_id,
@@ -528,6 +541,7 @@ class SQLiteStore:
                         record.cache_read_input_tokens,
                         record.cache_creation_input_tokens,
                         record.error_type,
+                        None if record.metadata is None else json.dumps(dict(record.metadata)),
                     ),
                 )
             ]
@@ -540,6 +554,7 @@ class SQLiteStore:
                 ("DELETE FROM logpose_messages WHERE session_id = ?", (session_id,)),
                 ("DELETE FROM logpose_runs WHERE session_id = ?", (session_id,)),
                 ("DELETE FROM logpose_summaries WHERE session_id = ?", (session_id,)),
+                ("DELETE FROM logpose_spans WHERE session_id = ?", (session_id,)),
                 ("DELETE FROM logpose_sessions WHERE id = ?", (session_id,)),
             ]
         )
@@ -552,7 +567,111 @@ class SQLiteStore:
                 (f"DELETE FROM logpose_messages WHERE session_id IN ({expired})", (now,)),
                 (f"DELETE FROM logpose_runs WHERE session_id IN ({expired})", (now,)),
                 (f"DELETE FROM logpose_summaries WHERE session_id IN ({expired})", (now,)),
+                (f"DELETE FROM logpose_spans WHERE session_id IN ({expired})", (now,)),
                 ("DELETE FROM logpose_sessions WHERE expires_at < ?", (now,)),
             ]
         )
-        return counts[3]
+        return counts[4]
+
+    # --- spans ----------------------------------------------------------------------------
+
+    async def write_spans(self, spans: Sequence[SpanRecord]) -> None:
+        """Store spans in one transaction; a repeated ``(trace_id, span_id)`` is replaced."""
+        if not spans:
+            return
+        await self._write(
+            [
+                (
+                    "INSERT OR REPLACE INTO logpose_spans (trace_id, span_id, parent_span_id, "
+                    "run_id, session_id, name, kind, start_ns, end_ns, status_code, "
+                    "status_message, attributes, events) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        sp.trace_id,
+                        sp.span_id,
+                        sp.parent_span_id,
+                        sp.run_id,
+                        sp.session_id,
+                        sp.name,
+                        sp.kind,
+                        sp.start_ns,
+                        sp.end_ns,
+                        sp.status_code,
+                        sp.status_message,
+                        json.dumps(sp.attributes),
+                        json.dumps(sp.events),
+                    ),
+                )
+                for sp in spans
+            ]
+        )
+
+    async def read_spans(
+        self,
+        *,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
+        session_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> AsyncIterator[SpanRecord]:
+        """Stream spans ordered by ``start_ns``; ``since_ns``/``until_ns`` are inclusive."""
+        where: list[str] = []
+        params: list[Any] = []
+        for clause, value in (
+            ("start_ns >= ?", since_ns),
+            ("start_ns <= ?", until_ns),
+            ("session_id = ?", session_id),
+            ("trace_id = ?", trace_id),
+        ):
+            if value is not None:
+                where.append(clause)
+                params.append(value)
+        sql = (
+            "SELECT trace_id, span_id, parent_span_id, run_id, session_id, name, kind, "
+            "start_ns, end_ns, status_code, status_message, attributes, events "
+            "FROM logpose_spans"
+            + (" WHERE " + " AND ".join(where) if where else "")
+            + " ORDER BY start_ns, span_id"
+        )
+        # Hold the store lock while the cursor is open (one connection), but fetch in
+        # batches so a large trace set is never loaded at once.
+        async with self._lock:
+            async with self._conn().execute(sql, params) as cur:
+                while True:
+                    rows = await cur.fetchmany(200)
+                    if not rows:
+                        break
+                    for r in rows:
+                        yield SpanRecord(
+                            trace_id=r[0],
+                            span_id=r[1],
+                            parent_span_id=r[2],
+                            run_id=r[3],
+                            session_id=r[4],
+                            name=r[5],
+                            kind=int(r[6]),
+                            start_ns=int(r[7]),
+                            end_ns=int(r[8]),
+                            status_code=int(r[9]),
+                            status_message=r[10],
+                            attributes=json.loads(r[11]),
+                            events=json.loads(r[12]),
+                        )
+
+    async def purge_spans(self, older_than_ms: int) -> int:
+        """Delete spans that started before the Unix-millisecond cutoff; return the count."""
+        counts = await self._write(
+            [("DELETE FROM logpose_spans WHERE start_ns < ?", (older_than_ms * 1_000_000,))]
+        )
+        return counts[0]
+
+    async def run_id_exists(self, run_id: str) -> bool:
+        async with self._lock:
+            db = self._conn()
+            for table in ("logpose_runs", "logpose_spans"):
+                async with db.execute(
+                    f"SELECT 1 FROM {table} WHERE run_id = ? LIMIT 1", (run_id,)
+                ) as cur:
+                    if await cur.fetchone() is not None:
+                        return True
+        return False

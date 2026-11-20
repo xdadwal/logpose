@@ -53,11 +53,11 @@ async def _scalar(path: Path, sql: str, *params: object) -> object:
         return row[0] if row else None
 
 
-async def test_open_creates_schema_version_2(tmp_path: Path) -> None:
+async def test_open_creates_schema_version_3(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     async with SQLiteStore(p):
         pass
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 3
     for t in ("sessions", "messages", "runs", "schema", "summaries"):
         assert (
             await _scalar(p, "SELECT count(*) FROM sqlite_master WHERE name = ?", f"logpose_{t}")
@@ -71,7 +71,7 @@ async def test_open_is_idempotent(tmp_path: Path) -> None:
         pass
     async with SQLiteStore(p) as s:
         await s.open()
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 3
     assert await _scalar(p, "SELECT count(*) FROM logpose_schema") == 1
 
 
@@ -82,7 +82,7 @@ async def test_newer_schema_version_is_refused(tmp_path: Path) -> None:
     async with aiosqlite.connect(p) as db:
         await db.execute("UPDATE logpose_schema SET version = 99")
         await db.commit()
-    with pytest.raises(LogposeError, match=r"(?s)99.*2"):
+    with pytest.raises(LogposeError, match=r"(?s)99.*3"):
         await SQLiteStore(p).open()
 
 
@@ -153,6 +153,7 @@ async def test_record_run_persists_all_fields(tmp_path: Path) -> None:
         44,
         55,
         "ProviderError",
+        None,
     )
     assert cols[:4] == ["run_id", "session_id", "model", "provider"]
 
@@ -576,7 +577,7 @@ async def test_newer_schema_refusal_leaves_journal_mode_untouched(tmp_path: Path
     with sqlite3.connect(p) as conn:
         conn.execute("CREATE TABLE logpose_schema (version INTEGER NOT NULL)")
         conn.execute("INSERT INTO logpose_schema (version) VALUES (99)")
-    with pytest.raises(LogposeError, match=r"(?s)99.*2"):
+    with pytest.raises(LogposeError, match=r"(?s)99.*3"):
         await SQLiteStore(p).open()
     with sqlite3.connect(p) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
@@ -598,7 +599,7 @@ async def test_wal_switch_waits_for_a_writer_instead_of_failing(tmp_path: Path) 
     await opening
     await store.close()
     assert await _scalar(p, "PRAGMA journal_mode") == "wal"
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 3
 
 
 async def test_wal_switch_gives_up_with_logpose_error(tmp_path: Path) -> None:
@@ -651,7 +652,7 @@ def test_processes_racing_on_a_fresh_file_all_open(tmp_path: Path) -> None:
         assert errors == []
         with sqlite3.connect(p) as conn:
             assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-            assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(2,)]
+            assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(3,)]
 
 
 # --- schema version 2: persisted summaries ------------------------------------------------
@@ -681,7 +682,7 @@ def _make_v1_database(path: Path) -> None:
         conn.close()
 
 
-async def test_schema_migrates_v1_to_v2(tmp_path: Path) -> None:
+async def test_schema_migrates_v1_to_v3(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     _make_v1_database(p)
     async with SQLiteStore(p) as s:
@@ -689,7 +690,7 @@ async def test_schema_migrates_v1_to_v2(tmp_path: Path) -> None:
         assert await s.load_summary("s1") is None
         await s.save_summary("s1", 1, "S")
         assert await s.load_summary("s1") == (1, "S")
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 3
     assert await _scalar(p, "SELECT count(*) FROM logpose_schema") == 1
     assert await _scalar(p, "SELECT metadata FROM logpose_sessions WHERE id = 's1'") == (
         '{"k": "v"}'
@@ -699,7 +700,7 @@ async def test_schema_migrates_v1_to_v2(tmp_path: Path) -> None:
     async with SQLiteStore(p) as s:
         assert await s.load_summary("s1") == (1, "S")
         assert _texts(await s.load_messages("s1")) == ["one", "two"]
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 3
 
 
 async def test_load_summary_returns_latest(tmp_path: Path) -> None:
