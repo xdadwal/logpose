@@ -115,7 +115,7 @@ def estimate_tokens(
     Returns:
         The estimated token count, rounded up.
     """
-    chars = len(json.dumps([message.model_dump(mode="json") for message in messages]))
+    chars = len(_dumps([message.model_dump(mode="json") for message in messages]))
     return tokens_for(chars + overhead_chars(system, tools))
 
 
@@ -123,8 +123,17 @@ def overhead_chars(system: str | None, tools: Sequence[ToolSpec]) -> int:
     """Characters the system prompt and tool schemas add to an estimate."""
     chars = len(system) if system else 0
     if tools:
-        chars += len(json.dumps([dataclasses.asdict(spec) for spec in tools]))
+        chars += len(_dumps([dataclasses.asdict(spec) for spec in tools]))
     return chars
+
+
+def _dumps(value: object) -> str:
+    """JSON text an estimate counts: non-ASCII kept as-is, not ``\\uXXXX`` escaped.
+
+    An escape is six characters for one code point, which would inflate the
+    estimate for CJK or emoji text about sixfold.
+    """
+    return json.dumps(value, ensure_ascii=False)
 
 
 def tokens_for(chars: int) -> int:
@@ -296,7 +305,7 @@ def summary_message(summary: str) -> Message:
 
 def message_chars(message: Message) -> int:
     """Characters ``message`` adds to :func:`estimate_tokens`'s JSON list."""
-    return len(json.dumps(message.model_dump(mode="json")))
+    return len(_dumps(message.model_dump(mode="json")))
 
 
 def choose_cut(
@@ -327,7 +336,7 @@ def choose_cut(
     sizes = [message_chars(message) for message in messages]
     suffix = [0] * (len(sizes) + 1)
     for index in range(len(sizes) - 1, -1, -1):
-        # ", " separates list items in json.dumps output.
+        # ", " separates list items in _dumps output.
         suffix[index] = suffix[index + 1] + sizes[index] + 2
     for cut in candidates:
         if tokens_for(fixed_chars + suffix[cut]) * ratio <= target_tokens:

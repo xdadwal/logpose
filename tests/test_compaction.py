@@ -349,6 +349,30 @@ async def test_recall_results_are_never_pointed() -> None:
 SUMMARY_PREFIX = "[Summary of earlier conversation]\n"
 
 
+@pytest.mark.parametrize("char", ["\u4e2d", "\U0001f600", "\u00e9"])
+def test_estimate_tokens_counts_non_ascii_as_characters(char: str) -> None:
+    text = char * 100_000
+    messages = [Message(role="user", content=[TextBlock(text=text)])]
+    estimate = estimate_tokens(messages, None, [])
+    # About len/4, not the 6-12x a \\uXXXX escape per character would give.
+    assert 25_000 <= estimate <= 25_100
+
+
+def test_message_chars_matches_estimate_for_non_ascii() -> None:
+    from logpose.compaction import message_chars
+
+    message = Message(role="user", content=[TextBlock(text="\u4e2d" * 1_000)])
+    assert message_chars(message) < 1_100
+
+
+async def test_large_cjk_prompt_is_not_refused_preflight() -> None:
+    provider = FakeProvider([ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model")
+    result = await agent.run("\u4e2d" * 80_000)
+    assert result.text == "ok"
+    assert provider.call_count == 1
+
+
 def chat_history(turns: int, chars: int = 400, tag: str = "") -> list[Message]:
     """``turns`` finished user/assistant exchanges, each message ~``chars`` long."""
     history: list[Message] = []
