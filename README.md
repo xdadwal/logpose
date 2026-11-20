@@ -495,6 +495,60 @@ A run without a conversation is independent. A conversation should remain on the
 backend that produced it because some providers include backend-specific reasoning
 state in the history.
 
+## Sessions
+
+Pass a `session_id` and logpose keeps the conversation in a local SQLite database:
+history is loaded before the run, new messages and a run record are saved after it,
+and a per-session lease stops two requests from running on one session at once.
+
+```python
+async with agent.session("chat-42") as handle:
+    async for event in agent.stream("hi", session=handle):
+        ...
+```
+
+Entering the block takes the lease and loads the history, so a busy session raises
+`SessionBusyError` before anything is streamed. That makes a clean HTTP answer
+possible:
+
+```python
+@app.post("/chat/{sid}")
+async def chat(sid: str, body: ChatIn):
+    try:
+        async with agent.session(sid) as handle:
+            result = await agent.run(body.text, session=handle)
+    except SessionBusyError:
+        raise HTTPException(status_code=409, detail="session is busy")
+    return {"text": result.text}
+```
+
+For a single call, the convenience form does the same in one step:
+
+```python
+result = await agent.run("hi", session_id="chat-42", session_metadata={"user": "ada"})
+```
+
+Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
+`stream_sync` and `SyncAgent` accept `session_id`, `session_metadata` and `session`.
+
+- **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
+  The file is created on first session use; runs without a session never touch disk.
+- **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
+- **Expiry:** idle sessions expire; call `await agent.purge_expired_sessions()` to
+  delete them, or `await agent.delete_session(sid)` to remove one.
+- **Run records:** each run writes a row to `logpose_runs`. Token counts cover
+  completed turns only.
+
+Known limits:
+
+- Sessions are single-host. SQLite in WAL mode supports several worker processes on
+  one machine; several hosts need a networked database (MySQL or Postgres support is
+  planned).
+- A run cancelled after its lease was lost surfaces the cancellation; the failed save
+  is logged.
+- Abandoned streams release the lease when they are closed. Wrap them to make that
+  prompt: `async with contextlib.aclosing(agent.stream(..., session_id=sid)) as events:`.
+
 ## Structured output
 
 Pass a pydantic model as `output_type` and the run returns a validated instance
@@ -574,7 +628,7 @@ with SyncAgent(Agent("openai-compat", model="gpt-5.1", tools=[get_weather])) as 
 ```
 
 For one-off calls, `run_sync()` and `stream_sync()` are also available. All of them accept
-`output_type` and `output_retries`. Do not use
+`output_type`, `output_retries` and the session arguments. Do not use
 the synchronous API from a thread already running an event loop; use `await` and
 `async for` there.
 

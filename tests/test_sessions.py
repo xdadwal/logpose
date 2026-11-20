@@ -491,11 +491,7 @@ def test_sync_facade_uses_its_own_loop_store(db: Path) -> None:
 
     asyncio.run(outer())
     with SyncAgent(Agent(FakeProvider([ScriptedTurn.text("b")]), model="m")) as sync_agent:
-        msgs = sync_agent.agent  # the sync facade drives Agent.run on its private loop
-        from logpose.sync import _runner_for
-
-        runner = _runner_for(msgs)
-        result = runner.run(msgs.run("again", session_id="s1"))
+        result = sync_agent.run("again", session_id="s1")
         assert result.text == "b"
     assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(4,)]
     assert manager._open_count() == 0

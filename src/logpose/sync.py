@@ -54,8 +54,9 @@ import asyncio
 import contextlib
 import threading
 import weakref
-from collections.abc import AsyncIterator, Coroutine, Iterator
-from typing import Any, TypeVar
+from collections.abc import AsyncIterator, Coroutine, Iterator, Mapping
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -63,6 +64,11 @@ from logpose.agent import _UNSET, Agent, Conversation, _Unset
 from logpose.errors import LogposeError
 from logpose.events import Event, RunResult
 from logpose.messages import Message
+
+if TYPE_CHECKING:
+    from contextlib import AbstractAsyncContextManager
+
+    from logpose.store.base import SessionHandle
 
 __all__ = ["SyncAgent", "close_sync", "run_sync", "stream_sync"]
 
@@ -331,6 +337,22 @@ def _output_kwargs(
     return kwargs
 
 
+def _session_kwargs(
+    session_id: str | None,
+    session_metadata: Mapping[str, str] | None,
+    session: SessionHandle | None,
+) -> dict[str, Any]:
+    """Collect only the session keywords the caller actually passed."""
+    kwargs: dict[str, Any] = {}
+    if session_id is not None:
+        kwargs["session_id"] = session_id
+    if session_metadata is not None:
+        kwargs["session_metadata"] = session_metadata
+    if session is not None:
+        kwargs["session"] = session
+    return kwargs
+
+
 def run_sync(
     agent: Agent,
     prompt: str | Message | None = None,
@@ -338,6 +360,9 @@ def run_sync(
     conversation: Conversation | None = None,
     output_type: type[BaseModel] | None | _Unset = _UNSET,
     output_retries: int | _Unset = _UNSET,
+    session_id: str | None = None,
+    session_metadata: Mapping[str, str] | None = None,
+    session: SessionHandle | None = None,
 ) -> RunResult[Any]:
     """Run ``agent`` to completion, blocking until it finishes.
 
@@ -353,6 +378,9 @@ def run_sync(
         output_type: Per-call structured output model; omit to use the agent
             default, ``None`` to disable it for this call.
         output_retries: Per-call correction-turn budget; omit for the agent default.
+        session_id: Persist this run in the named stored session.
+        session_metadata: String metadata merged into the session's metadata.
+        session: An already-leased handle from :meth:`SyncAgent.session`.
 
     Returns:
         The completed :class:`~logpose.events.RunResult`.
@@ -366,6 +394,7 @@ def run_sync(
     _reject_running_loop("run_sync()")
     runner = _runner_for(agent)
     kwargs = _output_kwargs(output_type, output_retries)
+    kwargs.update(_session_kwargs(session_id, session_metadata, session))
     return runner.run(agent.run(prompt, conversation=conversation, **kwargs))
 
 
@@ -376,6 +405,9 @@ def stream_sync(
     conversation: Conversation | None = None,
     output_type: type[BaseModel] | None | _Unset = _UNSET,
     output_retries: int | _Unset = _UNSET,
+    session_id: str | None = None,
+    session_metadata: Mapping[str, str] | None = None,
+    session: SessionHandle | None = None,
 ) -> Iterator[Event]:
     """Run ``agent``, yielding events as they happen.
 
@@ -398,6 +430,9 @@ def stream_sync(
         output_type: Per-call structured output model; omit for the agent
             default, ``None`` to disable.
         output_retries: Per-call correction-turn budget; omit for the agent default.
+        session_id: Persist this run in the named stored session.
+        session_metadata: String metadata merged into the session's metadata.
+        session: An already-leased handle from :meth:`SyncAgent.session`.
 
     Returns:
         An iterator of :data:`~logpose.events.Event` values, ending with
@@ -413,6 +448,7 @@ def stream_sync(
     # Eager: Agent.stream validates its arguments at call time, and those errors
     # should surface here rather than at the first `next()`.
     kwargs = _output_kwargs(output_type, output_retries)
+    kwargs.update(_session_kwargs(session_id, session_metadata, session))
     events = agent.stream(prompt, conversation=conversation, **kwargs)
     return _drive(runner, events)
 
@@ -439,6 +475,27 @@ def close_sync(agent: Agent) -> None:
         runner.run(agent.aclose())
     finally:
         runner.close()
+
+
+class _SyncSession:
+    """A sync ``with`` block over an agent's async session context manager."""
+
+    def __init__(self, runner: _LoopRunner, cm: AbstractAsyncContextManager[SessionHandle]) -> None:
+        self._runner = runner
+        self._cm = cm
+
+    def __enter__(self) -> SessionHandle:
+        """Take the lease on the private loop and return the handle."""
+        return self._runner.run(self._cm.__aenter__())
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None:
+        """Save and release on the private loop; never suppress by itself."""
+        return self._runner.run(self._cm.__aexit__(exc_type, exc, tb))
 
 
 class SyncAgent:
@@ -485,6 +542,9 @@ class SyncAgent:
         conversation: Conversation | None = None,
         output_type: type[BaseModel] | None | _Unset = _UNSET,
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> RunResult[Any]:
         """Run to completion, blocking until it finishes.
 
@@ -495,6 +555,9 @@ class SyncAgent:
             output_type: Per-call structured output model; omit for the agent
                 default, ``None`` to disable.
             output_retries: Per-call correction-turn budget; omit for the default.
+            session_id: Persist this run in the named stored session.
+            session_metadata: String metadata merged into the session's metadata.
+            session: An already-leased handle from :meth:`session`.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -511,6 +574,9 @@ class SyncAgent:
             conversation=conversation,
             output_type=output_type,
             output_retries=output_retries,
+            session_id=session_id,
+            session_metadata=session_metadata,
+            session=session,
         )
 
     def stream(
@@ -520,6 +586,9 @@ class SyncAgent:
         conversation: Conversation | None = None,
         output_type: type[BaseModel] | None | _Unset = _UNSET,
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> Iterator[Event]:
         """Run, yielding events as they happen.
 
@@ -530,6 +599,9 @@ class SyncAgent:
             output_type: Per-call structured output model; omit for the agent
                 default, ``None`` to disable.
             output_retries: Per-call correction-turn budget; omit for the default.
+            session_id: Persist this run in the named stored session.
+            session_metadata: String metadata merged into the session's metadata.
+            session: An already-leased handle from :meth:`session`.
 
         Returns:
             An iterator of :data:`~logpose.events.Event` values, ending with
@@ -545,7 +617,37 @@ class SyncAgent:
             conversation=conversation,
             output_type=output_type,
             output_retries=output_retries,
+            session_id=session_id,
+            session_metadata=session_metadata,
+            session=session,
         )
+
+    def session(
+        self, session_id: str, *, metadata: Mapping[str, str] | None = None
+    ) -> _SyncSession:
+        """Lease a stored session for the duration of a ``with`` block.
+
+        The blocking twin of :meth:`~logpose.agent.Agent.session`, driven on the
+        agent's private loop::
+
+            with sync_agent.session("chat-42") as handle:
+                result = sync_agent.run("hi", session=handle)
+
+        Args:
+            session_id: The session to lease; ``[A-Za-z0-9._-]{1,128}``.
+            metadata: String metadata merged into the session's metadata.
+
+        Returns:
+            A context manager yielding the :class:`~logpose.store.base.SessionHandle`.
+
+        Raises:
+            LogposeError: If called from a thread with a running event loop, or
+                if ``session_id`` or ``metadata`` is invalid.
+            SessionBusyError: On enter, if the session stays leased elsewhere.
+        """
+        _reject_running_loop("SyncAgent.session()")
+        runner = _runner_for(self.agent)
+        return _SyncSession(runner, self.agent.session(session_id, metadata=metadata))
 
     def close(self) -> None:
         """Close the provider and stop the private loop. Idempotent."""
