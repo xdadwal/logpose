@@ -334,21 +334,31 @@ class _SpanBuilder:
             text = text.replace(secret, redact(secret))
         return text
 
-    def _content(self, span: _OpenSpan, key: str, text: str) -> None:
-        """Set a content attribute: scrubbed, then capped keeping the end."""
+    def _capped(self, span: _OpenSpan, text: str) -> str:
+        """Scrub ``text`` and cap it at ``content_max_chars``, keeping the end.
+
+        The one truncation rule for every content value: the result starts with
+        ``…[truncated N chars]`` when shortened (N counts every character left
+        out), marks the span ``logpose.content.truncated``, and never exceeds
+        the cap, even when the cap is shorter than the marker itself.
+        """
         text = self._scrub(text)
         cap = self._tracing.content_max_chars
-        if len(text) > cap:
-            dropped = len(text) - cap
-            for _ in range(4):  # the marker's own length depends on N
-                marker = f"…[truncated {dropped} chars]"
-                keep = max(cap - len(marker), 0)
-                dropped = len(text) - keep
-            marker = f"…[truncated {dropped} chars]"
+        if len(text) <= cap:
+            return text
+        span.attributes[sc.LOGPOSE_CONTENT_TRUNCATED] = True
+        keep = 0
+        for _ in range(4):  # the marker's own length depends on N
+            marker = f"…[truncated {len(text) - keep} chars]"
             keep = max(cap - len(marker), 0)
-            text = marker + (text[-keep:] if keep else "")
-            span.attributes[sc.LOGPOSE_CONTENT_TRUNCATED] = True
-        span.attributes[key] = text
+        marker = f"…[truncated {len(text) - keep} chars]"
+        if keep == 0:
+            return marker[:cap]
+        return marker + text[-keep:]
+
+    def _content(self, span: _OpenSpan, key: str, text: str) -> None:
+        """Set a content attribute through :meth:`_capped`."""
+        span.attributes[key] = self._capped(span, text)
 
     def _open_span(
         self, name: str, kind: int, *, start_ns: int | None = None, parent: _OpenSpan | None = None
@@ -371,7 +381,7 @@ class _SpanBuilder:
         span.status_code = STATUS_ERROR
         span.attributes[sc.ERROR_TYPE] = _error_type(error)
         if self._capture:
-            span.status_message = self._scrub(str(error))[: self._tracing.content_max_chars]
+            span.status_message = self._capped(span, str(error))
 
     def _event(self, span: _OpenSpan, name: str, attributes: Mapping[str, Any]) -> None:
         span.events.append(
@@ -632,9 +642,7 @@ class _SpanBuilder:
         span = self._tool_span(call)
         attributes: dict[str, Any] = {sc.LOGPOSE_GATE_IS_ERROR: result.is_error}
         if self._capture:
-            attributes[sc.LOGPOSE_GATE_REPLACEMENT] = self._scrub(result.content)[
-                -self._tracing.content_max_chars :
-            ]
+            attributes[sc.LOGPOSE_GATE_REPLACEMENT] = self._capped(span, result.content)
         self._event(span, sc.EVENT_GATE_BLOCKED, attributes)
         span.attributes[sc.LOGPOSE_TOOL_IS_ERROR] = result.is_error
         span.attributes[sc.LOGPOSE_TOOL_TIMED_OUT] = False

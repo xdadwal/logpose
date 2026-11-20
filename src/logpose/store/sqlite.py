@@ -536,6 +536,18 @@ class SQLiteStore:
 
     async def record_run(self, record: RunRecord) -> None:
         validate_session_id(record.session_id)
+        try:
+            await self._insert_run(record)
+        except sqlite3.IntegrityError as exc:
+            # Cross-process backstop: the in-process claim cannot see other
+            # processes writing to the same database.
+            if "logpose_runs.run_id" not in str(exc):
+                raise
+            raise LogposeError(
+                f"run_id {record.run_id!r} already exists; every run needs a fresh run_id."
+            ) from None
+
+    async def _insert_run(self, record: RunRecord) -> None:
         await self._write(
             [
                 (

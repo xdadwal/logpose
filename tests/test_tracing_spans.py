@@ -675,3 +675,164 @@ def test_message_conversion_shapes() -> None:
             "parts": [{"type": "tool_call_response", "id": "t", "response": "2"}],
         },
     ]
+
+
+# -- fix round 1 ------------------------------------------------------------
+
+
+async def test_concurrent_duplicate_run_id_runs_once(db: Path) -> None:
+    provider = FakeProvider(ScriptedTurn.text("ok", delay=0.05), repeat_last=True)
+    agent = Agent(provider, model="m", tracing=None)
+    outcomes = await asyncio.gather(
+        agent.run("a", session_id="s1", run_id="dup"),
+        agent.run("b", session_id="s2", run_id="dup"),
+        return_exceptions=True,
+    )
+    kinds = sorted(type(o).__name__ for o in outcomes)
+    assert kinds == ["LogposeError", "RunResult"]
+    assert provider.call_count == 1
+    # Completed IDs stay rejected.
+    with pytest.raises(LogposeError, match="run_id"):
+        await agent.run("c", session_id="s3", run_id="dup")
+    assert provider.call_count == 1
+    await agent.aclose()
+
+
+async def test_concurrent_duplicate_run_id_rejected_with_tracing_only() -> None:
+    provider = FakeProvider(ScriptedTurn.text("ok", delay=0.05), repeat_last=True)
+    agent = Agent(provider, model="m", tracing=Tracing())
+    other = Agent(provider, model="m", tracing=Tracing())
+    outcomes = await asyncio.gather(
+        agent.run("a", run_id="dup-t"), other.run("b", run_id="dup-t"), return_exceptions=True
+    )
+    assert sorted(type(o).__name__ for o in outcomes) == ["LogposeError", "RunResult"]
+    assert provider.call_count == 1
+
+
+async def test_run_id_reservation_released_when_run_fails_early(db: Path) -> None:
+    provider = FakeProvider([ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="m", tracing=Tracing())
+    with pytest.raises(LogposeError, match="Nothing to send"):
+        await agent.run(session_id="empty", run_id="never-ran")
+    from logpose.agent import _ACTIVE_RUN_IDS
+
+    assert "never-ran" not in _ACTIVE_RUN_IDS
+    await agent.run("go", session_id="s1", run_id="never-ran")
+    assert "never-ran" not in _ACTIVE_RUN_IDS
+    await agent.aclose()
+
+
+async def test_record_run_duplicate_maps_to_logpose_error(tmp_path: Path) -> None:
+    from logpose.store.base import RunRecord
+    from logpose.store.sqlite import SQLiteStore
+
+    record = RunRecord(
+        run_id="r1",
+        session_id="s1",
+        model="m",
+        provider="p",
+        started_at_ms=1,
+        ended_at_ms=2,
+        outcome="completed",
+        iterations=1,
+        input_tokens=0,
+        output_tokens=0,
+        reasoning_tokens=0,
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=0,
+    )
+    async with SQLiteStore(tmp_path / "r.db") as store:
+        async with store.session("s1"):
+            pass
+        await store.record_run(record)
+        with pytest.raises(LogposeError, match="run_id"):
+            await store.record_run(record)
+
+
+async def test_all_content_shares_one_truncation_rule() -> None:
+    cap = 60
+    provider = FakeProvider(ScriptedTurn.failure(ProviderError("E" * 500 + "TAIL")))
+    agent = Agent(provider, model="m", tracing=Tracing(capture_content=True, content_max_chars=cap))
+    with pytest.raises(ProviderError):
+        await agent.run("hi")
+    (chat,) = by_op(spans_of(agent), "chat")
+    assert chat.status_message is not None
+    assert len(chat.status_message) <= cap
+    assert chat.status_message.startswith("…[truncated ")
+    assert chat.status_message.endswith("TAIL")
+    assert chat.attributes[sc.LOGPOSE_CONTENT_TRUNCATED] is True
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}, id="c1")), ScriptedTurn.text("x")]
+    )
+    agent = Agent(
+        provider,
+        model="m",
+        tools=[add],
+        on_tool_call=lambda call: "D" * 500 + "GATE-END",
+        tracing=Tracing(capture_content=True, content_max_chars=cap),
+    )
+    await agent.run("go")
+    (gated,) = by_op(spans_of(agent), "execute_tool")
+    replacement = gated.events[0]["attributes"][sc.LOGPOSE_GATE_REPLACEMENT]
+    assert len(replacement) <= cap
+    assert replacement.startswith("…[truncated ")
+    assert replacement.endswith("GATE-END")
+    assert gated.attributes[sc.LOGPOSE_CONTENT_TRUNCATED] is True
+
+
+async def test_cap_smaller_than_marker_never_exceeds_cap() -> None:
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("y" * 500)),
+        model="m",
+        tracing=Tracing(capture_content=True, content_max_chars=5),
+    )
+    await agent.run("a much longer prompt")
+    for span in spans_of(agent):
+        for key in (sc.GEN_AI_INPUT_MESSAGES, sc.GEN_AI_OUTPUT_MESSAGES):
+            if key in span.attributes:
+                assert len(span.attributes[key]) <= 5
+
+
+async def test_tool_span_errors_when_observer_intent_fails() -> None:
+    async def observer(observation: Any) -> None:
+        raise RuntimeError("journal down")
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 1}, id="c1")), ScriptedTurn.text("x")]
+    )
+    agent = Agent(provider, model="m", tools=[add], tool_observer=observer, tracing=Tracing())
+    with pytest.raises(LogposeError):
+        await agent.run("go")
+    (tool_span,) = by_op(spans_of(agent), "execute_tool")
+    assert tool_span.status_code == ERROR
+    assert tool_span.attributes[sc.ERROR_TYPE] == "ToolObservationError"
+
+
+def test_run_metadata_is_bounded() -> None:
+    agent = Agent(FakeProvider(), model="m")
+    for meta in (
+        {f"k{i}": i for i in range(65)},
+        {"k" * 129: 1},
+        {"k": "v" * 1025},
+        {"k": float("nan")},
+        {"k": float("inf")},
+    ):
+        with pytest.raises(LogposeError):
+            agent.stream("hi", metadata=meta)
+    agent.stream("hi", metadata={f"k{i}": "v" * 1024 for i in range(64)})
+    agent.stream("hi", metadata={"k" * 128: 1.5})
+
+
+async def test_model_error_is_not_logged_as_tracing_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class NoModel(Agent):
+        def _model(self) -> str:
+            raise LogposeError("no model could be resolved")
+
+    agent = NoModel(FakeProvider(ScriptedTurn.text("x")), model="m", tracing=Tracing())
+    with caplog.at_level(logging.WARNING, logger="logpose.trace"):
+        with pytest.raises(LogposeError, match="no model"):
+            await agent.run("hi")
+    assert not [r for r in caplog.records if r.name == "logpose.trace"]

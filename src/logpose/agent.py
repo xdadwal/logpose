@@ -279,6 +279,15 @@ _TRACE_LOGGER = logging.getLogger("logpose.trace")
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
+_ACTIVE_RUN_IDS: set[str] = set()
+"""Caller-supplied run IDs of runs in flight in this process, across all agents
+(stores are shared between agents). Claimed synchronously before any await, so
+two concurrent runs can never both pass the duplicate check."""
+
+_METADATA_MAX_KEYS = 64
+_METADATA_MAX_KEY_CHARS = 128
+_METADATA_MAX_VALUE_CHARS = 1024
+
 RunMetadata = Mapping[str, Union[str, int, float, bool]]  # noqa: UP007
 """App-supplied labels for one run (``run(..., metadata=...)``)."""
 
@@ -1231,14 +1240,49 @@ class Agent:
         ``RunEnd`` is yielded only after the run is recorded (and, with
         ``session_id``, saved), so a lost lease raises instead of ending normally.
         """
+        store = await self._store() if handle is None else self._active_store(handle)
+        # Before the lease: a duplicate run ID touches nothing. Released only
+        # after the run record is written, so a concurrent duplicate cannot
+        # slip in between the run ending and its record existing.
+        reserved = await self._reserve_run_id(run_id, store)
+        inner = self._session_run(
+            first,
+            output_type,
+            output_retries,
+            store,
+            session_id=session_id,
+            metadata=metadata,
+            handle=handle,
+            run_id=run_id,
+            run_metadata=run_metadata,
+        )
+        try:
+            async for event in inner:
+                yield event
+        finally:
+            await _aclose(inner)
+            if reserved:
+                _release_run_id(run_id)
+
+    async def _session_run(
+        self,
+        first: Message | None,
+        output_type: type[BaseModel] | None,
+        output_retries: int,
+        store: SessionStore,
+        *,
+        session_id: str | None,
+        metadata: dict[str, str] | None,
+        handle: SessionHandle | None,
+        run_id: str | None,
+        run_metadata: dict[str, str | int | float | bool] | None,
+    ) -> AsyncIterator[Event]:
+        """The body of :meth:`_session_loop`, once the run ID is claimed."""
         from logpose.store import manager
 
         cm: AbstractAsyncContextManager[SessionHandle] | None = None
         if handle is None:
             assert session_id is not None
-            store = await self._store()
-            # Before the lease: a duplicate run ID touches nothing.
-            await self._reject_duplicate_run_id(run_id, store)
             cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
             handle = await cm.__aenter__()
             manager._ACTIVE_HANDLES[handle] = store
@@ -1247,13 +1291,8 @@ class Agent:
                 await _finish_session(_exit_session(handle, cm, error), error)
                 raise error
         else:
-            store = self._active_store(handle)
-            manager._RUNNING.add(handle)
-            try:
-                await self._reject_duplicate_run_id(run_id, store)
-            except BaseException:
-                manager._RUNNING.discard(handle)
-                raise
+            # Checked again: another run may have started on it meanwhile.
+            self._active_store(handle)
         manager._RUNNING.add(handle)
         stats = _RunStats(metadata=run_metadata)
         started_ms = _now_ms()
@@ -1455,26 +1494,41 @@ class Agent:
 
     # -- tracing ------------------------------------------------------------
 
-    async def _reject_duplicate_run_id(
-        self, run_id: str | None, store: SessionStore | None
-    ) -> None:
-        """Raise if a caller-supplied ``run_id`` was already recorded.
+    async def _reserve_run_id(self, run_id: str | None, store: SessionStore | None) -> bool:
+        """Claim a caller-supplied ``run_id`` for this run, or raise if it is taken.
 
-        Checked only with a session store or tracing; generated IDs are unique.
-        A tracing sink that cannot answer is logged and treated as "unknown".
+        The in-process claim is checked and taken synchronously, before the
+        first await, so concurrent runs cannot both pass; then the store and
+        the tracing sink are asked about finished runs. Checked only with a
+        session store or tracing; generated IDs are unique. A tracing sink that
+        cannot answer is logged and treated as "not found".
+
+        Returns:
+            ``True`` if this call claimed the ID: the caller must release it
+            with :func:`_release_run_id` once the run is recorded.
         """
         if run_id is None:
-            return
-        exists = await store.run_id_exists(run_id) if store is not None else False
-        if not exists and self._trace_sink is not None:
-            try:
-                exists = await self._trace_sink.run_id_exists(run_id)
-            except Exception as exc:  # noqa: BLE001 - tracing never fails a run
-                _TRACE_LOGGER.warning(
-                    "could not check run_id against stored traces: %s", type(exc).__name__
+            return False
+        if run_id in _ACTIVE_RUN_IDS:
+            raise LogposeError(f"run_id {run_id!r} is already in use by a running run.")
+        _ACTIVE_RUN_IDS.add(run_id)
+        try:
+            exists = await store.run_id_exists(run_id) if store is not None else False
+            if not exists and self._trace_sink is not None:
+                try:
+                    exists = await self._trace_sink.run_id_exists(run_id)
+                except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+                    _TRACE_LOGGER.warning(
+                        "could not check run_id against stored traces: %s", type(exc).__name__
+                    )
+            if exists:
+                raise LogposeError(
+                    f"run_id {run_id!r} already exists; every run needs a fresh run_id."
                 )
-        if exists:
-            raise LogposeError(f"run_id {run_id!r} already exists; every run needs a fresh run_id.")
+        except BaseException:
+            _ACTIVE_RUN_IDS.discard(run_id)
+            raise
+        return True
 
     def _trace_secrets(self) -> tuple[str, ...]:
         """Configured credentials to scrub from captured content."""
@@ -1523,6 +1577,7 @@ class Agent:
         run_id: str,
         session_id: str | None,
         metadata: Mapping[str, str | int | float | bool] | None,
+        model: str,
     ) -> _SpanBuilder:
         """A span builder for one run, or the do-nothing one when tracing is off."""
         if self.tracing is None or self._trace_sink is None:
@@ -1534,7 +1589,7 @@ class Agent:
                 run_id=run_id,
                 session_id=session_id,
                 provider=self.provider_name,
-                model=self._model(),
+                model=model,
                 metadata=metadata,
                 config=self._trace_config(),
                 system=self.system,
@@ -1567,13 +1622,50 @@ class Agent:
         path already did), opens the span before anything else happens, and
         closes it with the run's outcome however the run ends.
         """
-        if not run_id_checked:
-            await self._reject_duplicate_run_id(run_id, None)
+        reserved = False
+        if not run_id_checked and self._trace_sink is not None:
+            reserved = await self._reserve_run_id(run_id, None)
+        inner = self._traced_loop(
+            prompt,
+            conversation,
+            output_type,
+            output_retries,
+            stats,
+            guard_metadata=guard_metadata,
+            run_id=run_id,
+            run_metadata=run_metadata,
+            session_id=session_id,
+        )
+        try:
+            async for event in inner:
+                yield event
+        finally:
+            # Closed explicitly so the span closes when the caller walks away.
+            await _aclose(inner)
+            if reserved:
+                _release_run_id(run_id)
+
+    async def _traced_loop(
+        self,
+        prompt: Message | None,
+        conversation: Conversation | None,
+        output_type: type[BaseModel] | None,
+        output_retries: int,
+        stats: _RunStats | None,
+        *,
+        guard_metadata: Mapping[str, str] | None,
+        run_id: str | None,
+        run_metadata: Mapping[str, str | int | float | bool] | None,
+        session_id: str | None,
+    ) -> AsyncIterator[Event]:
+        """Open the ``invoke_agent`` span, drive :meth:`_loop_body`, close it."""
         resolved_id = run_id or self._runtime_id("run")
         if stats is None:
             stats = _RunStats()
         run_stats = stats
-        trace = self._new_trace(resolved_id, session_id, run_metadata)
+        # Resolved first: a model error is the run's own error, not a tracing one.
+        model = self._model()
+        trace = self._new_trace(resolved_id, session_id, run_metadata, model)
         trace.start_run()
         body = self._loop_body(
             prompt,
@@ -3026,10 +3118,13 @@ class Agent:
         context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
         try:
             await self.tool_observer(ToolObservation("intent", context, call.model_copy(deep=True)))
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            trace.end_tool(span, None, error=exc)
             raise
         except Exception as exc:
-            raise ToolObservationError("intent") from exc
+            failure = ToolObservationError("intent")
+            trace.end_tool(span, None, error=failure)
+            raise failure from exc
         try:
             result = await self._invoke_handler(call, queued_at, turn_context, span, trace)
         except asyncio.CancelledError:
@@ -3414,16 +3509,32 @@ def _check_run_metadata(
         return None
     if not isinstance(metadata, Mapping):
         raise LogposeError(f"metadata must be a mapping, got {type(metadata).__name__}.")
+    if len(metadata) > _METADATA_MAX_KEYS:
+        raise LogposeError(f"metadata may have at most {_METADATA_MAX_KEYS} keys.")
     checked: dict[str, str | int | float | bool] = {}
     for key, value in metadata.items():
         if not isinstance(key, str):
             raise LogposeError(f"metadata keys must be str, got {type(key).__name__}.")
+        if len(key) > _METADATA_MAX_KEY_CHARS:
+            raise LogposeError(f"metadata keys may be at most {_METADATA_MAX_KEY_CHARS} chars.")
         if not isinstance(value, (str, int, float, bool)):
             raise LogposeError(
                 f"metadata[{key!r}] must be str, int, float or bool, got {type(value).__name__}."
             )
+        if isinstance(value, str) and len(value) > _METADATA_MAX_VALUE_CHARS:
+            raise LogposeError(
+                f"metadata[{key!r}] may be at most {_METADATA_MAX_VALUE_CHARS} chars."
+            )
+        if isinstance(value, float) and not math.isfinite(value):
+            raise LogposeError(f"metadata[{key!r}] must be a finite number.")
         checked[key] = value
     return checked
+
+
+def _release_run_id(run_id: str | None) -> None:
+    """Release a run ID claimed by :meth:`Agent._reserve_run_id`."""
+    if run_id is not None:
+        _ACTIVE_RUN_IDS.discard(run_id)
 
 
 def _check_run_id(run_id: str | None) -> None:
