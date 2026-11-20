@@ -165,6 +165,8 @@ class _SpanSink(Protocol):
 
     async def flush(self, run_id: str | None, timeout: float) -> bool: ...
 
+    def pending_for(self, run_id: str) -> int: ...
+
 
 # -- content helpers -----------------------------------------------------------
 

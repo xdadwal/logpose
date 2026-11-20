@@ -57,6 +57,9 @@ class _MemorySink:
     async def flush(self, run_id: str | None, timeout: float) -> bool:
         return True
 
+    def pending_for(self, run_id: str) -> int:
+        return 0
+
 
 @pytest.fixture(autouse=True)
 def _memory_sink(monkeypatch: pytest.MonkeyPatch) -> None:

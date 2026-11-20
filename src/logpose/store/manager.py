@@ -25,6 +25,7 @@ import os
 import threading
 import warnings
 import weakref
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -144,13 +145,14 @@ def span_writer(store: SessionStore) -> SpanWriter | None:
     return entry.writer if entry is not None else None
 
 
-async def release_stores(owner: object) -> None:
+async def release_stores(owner: object, run_ids: Iterable[str] = ()) -> None:
     """Drop ``owner`` from every store it used; close stores left with no owner.
 
     A store bound to the current loop is closed here, after its span writer has
     written what is queued (bounded by the writer's close timeout). A store
-    still shared with other owners on this loop has its writer flushed, bounded
-    the same way. One bound to a loop that is running elsewhere is closed on
+    still shared with other owners on this loop waits, bounded the same way,
+    only for the spans of ``run_ids`` (the owner's own runs), never for other
+    owners' spans. One bound to a loop that is running elsewhere is closed on
     that loop without waiting; one bound to a loop that is stopped or closed has
     its connection thread stopped directly and its leftover spans written
     without a loop.
@@ -173,8 +175,10 @@ async def release_stores(owner: object) -> None:
                     orphaned.append(entry)
                 elif entry.loop is current:
                     shared.append(entry)
+    mine = list(run_ids)
     for entry in shared:
-        await entry.writer.flush(None, CLOSE_TIMEOUT)
+        if mine:
+            await entry.writer.flush_runs(mine, CLOSE_TIMEOUT)
     for entry in orphaned:
         if entry.loop is current:
             await _close(entry)
@@ -274,19 +278,25 @@ def _shutdown() -> None:
     with _GUARD:
         entries = list(_OPEN.values())
     for entry in entries:
-        loop = entry.loop
-        if loop.is_closed() or not loop.is_running():
-            continue
-        try:
-            if asyncio.get_running_loop() is loop:  # pragma: no cover - not from exit hook
-                continue
-        except RuntimeError:
-            pass
-        with contextlib.suppress(Exception):
-            future = asyncio.run_coroutine_threadsafe(entry.writer.close(_EXIT_FLUSH_TIMEOUT), loop)
-            future.result(_EXIT_FLUSH_TIMEOUT + 0.5)
+        with contextlib.suppress(BaseException):
+            _flush_on_own_loop(entry)
     for entry in entries:
-        _abandon(entry)
+        with contextlib.suppress(BaseException):
+            _abandon(entry)
+
+
+def _flush_on_own_loop(entry: _Entry) -> None:
+    """Close ``entry``'s writer on its loop, if that loop is running in another thread."""
+    loop = entry.loop
+    if loop.is_closed() or not loop.is_running():
+        return
+    try:
+        if asyncio.get_running_loop() is loop:  # pragma: no cover - not from exit hook
+            return
+    except RuntimeError:
+        pass
+    future = asyncio.run_coroutine_threadsafe(entry.writer.close(_EXIT_FLUSH_TIMEOUT), loop)
+    future.result(_EXIT_FLUSH_TIMEOUT + 0.5)
 
 
 def _install_exit_hook() -> None:

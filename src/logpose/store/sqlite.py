@@ -658,7 +658,13 @@ class SQLiteStore:
         """Store spans in one transaction; a repeated ``(trace_id, span_id)`` is replaced."""
         if not spans:
             return
-        await self._write([(_SPAN_INSERT, _span_row(sp)) for sp in spans])
+        rows = [_span_row(sp) for sp in spans]
+
+        async def run(db: aiosqlite.Connection) -> None:
+            cur = await db.executemany(_SPAN_INSERT, rows)
+            await cur.close()
+
+        await self._transaction(run)
 
     async def read_spans(
         self,

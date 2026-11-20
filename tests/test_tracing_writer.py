@@ -319,17 +319,19 @@ async def test_session_run_spans_are_persisted(db: Path) -> None:
 
 async def test_aclose_flushes_pending_spans(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = SQLiteStore.write_spans
+    gate = asyncio.Event()
 
-    async def slow(self: SQLiteStore, spans: Sequence[SpanRecord]) -> None:
-        await asyncio.sleep(0.3)
+    async def gated(self: SQLiteStore, spans: Sequence[SpanRecord]) -> None:
+        await gate.wait()
         await original(self, spans)
 
-    monkeypatch.setattr(SQLiteStore, "write_spans", slow)
+    monkeypatch.setattr(SQLiteStore, "write_spans", gated)
     agent = Agent(
         FakeProvider(ScriptedTurn.text("ok")), model="m", tracing=Tracing(flush_timeout=0)
     )
     await agent.run("a", run_id="late-1")
     assert _rows(db, "SELECT COUNT(*) FROM logpose_spans") == [(0,)]
+    gate.set()
     await agent.aclose()
     assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'late-1'") == [(2,)]
     assert manager._open_count() == 0
@@ -387,9 +389,12 @@ def test_sync_facade_tracing(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = SQLiteStore.write_spans
     loops: list[asyncio.AbstractEventLoop] = []
 
+    gate = threading.Event()  # set from the test thread; polled on the private loop
+
     async def slow(self: SQLiteStore, spans: Sequence[SpanRecord]) -> None:
         loops.append(asyncio.get_running_loop())
-        await asyncio.sleep(0.3)
+        while not gate.is_set():
+            await asyncio.sleep(0.01)
         await original(self, spans)
 
     monkeypatch.setattr(SQLiteStore, "write_spans", slow)
@@ -410,6 +415,7 @@ def test_sync_facade_tracing(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     assert threading.current_thread() is threading.main_thread()
     assert len(store_loops) == 1
     (private_loop,) = store_loops
+    gate.set()
     sync_agent.close()
     assert loops and all(loop is private_loop for loop in loops)
     rows = _rows(
@@ -423,3 +429,151 @@ def test_sync_facade_tracing(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ):
         assert f'"logpose.metadata.via": "{label}"' in via
     assert manager._open_count() == 0
+
+
+# -- fix round 1 -------------------------------------------------------------------
+
+
+async def test_aclose_waits_only_for_its_own_runs(
+    db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = SQLiteStore.write_spans
+    gate = asyncio.Event()
+    gate.set()
+
+    async def gated(self: SQLiteStore, spans: Sequence[SpanRecord]) -> None:
+        await gate.wait()
+        await original(self, spans)
+
+    monkeypatch.setattr(SQLiteStore, "write_spans", gated)
+    provider = FakeProvider(ScriptedTurn.text("ok"), repeat_last=True)
+    long_lived = Agent(provider, model="m", tracing=Tracing(flush_timeout=0.1))
+    per_request = Agent(provider, model="m", tracing=Tracing())
+    await long_lived.run("warm up")
+    await per_request.run("request", run_id="req-1")  # written: nothing left pending
+    gate.clear()
+    store = await manager.get_store()
+    writer = manager.span_writer(store)
+    assert writer is not None
+    writer.submit(_span("someone-else"))  # another agent's span, stuck behind the gate
+    caplog.set_level(logging.WARNING)
+    began = time.monotonic()
+    await per_request.aclose()
+    assert time.monotonic() - began < 0.5
+    assert _warnings(caplog) == []
+    # The run-end warning was not used up by the close.
+    await long_lived.run("later")
+    assert [r.name for r in _warnings(caplog)] == ["logpose.trace"]
+    assert "flush" in _warnings(caplog)[0].getMessage()
+    gate.set()
+    await long_lived.aclose()
+
+
+async def test_aclose_flushes_its_own_runs_on_a_shared_store(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = SQLiteStore.write_spans
+    gate = asyncio.Event()
+
+    async def gated(self: SQLiteStore, spans: Sequence[SpanRecord]) -> None:
+        await gate.wait()
+        await original(self, spans)
+
+    monkeypatch.setattr(SQLiteStore, "write_spans", gated)
+    provider = FakeProvider(ScriptedTurn.text("ok"), repeat_last=True)
+    keeper = Agent(provider, model="m", tracing=None)
+    await manager.get_store(owner=keeper)  # keeps the store shared and open
+    agent = Agent(provider, model="m", tracing=Tracing(flush_timeout=0))
+    await agent.run("a", run_id="mine-1")
+    asyncio.get_running_loop().call_later(0.1, gate.set)
+    await agent.aclose()
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'mine-1'") == [(2,)]
+    await keeper.aclose()
+
+
+def _big_span(run_id: str, n: int, chars: int) -> SpanRecord:
+    span = _span(run_id, n)
+    span.attributes["gen_ai.input.messages"] = "x" * chars
+    return span
+
+
+async def test_queue_bounded_by_bytes(caplog: pytest.LogCaptureFixture) -> None:
+    store = _GatedStore()
+    writer = SpanWriter(store, queue_max_bytes=10_000)  # type: ignore[arg-type]
+    caplog.set_level(logging.WARNING)
+    for n in range(5):
+        writer.submit(_big_span("r", n, 4_000))
+    (warning,) = _warnings(caplog)
+    assert "full" in warning.getMessage()
+    store.gate.set()
+    assert await writer.flush("r", 5.0) is True
+    assert [s.start_ns for s in store.written] == [0, 1]
+    writer.submit(_big_span("r", 9, 4_000))  # bytes were released: accepted
+    assert await writer.flush("r", 5.0) is True
+    assert len(store.written) == 3
+    assert len(_warnings(caplog)) == 1
+    await writer.close()
+
+
+async def test_batches_bounded_by_bytes() -> None:
+    calls: list[int] = []
+
+    class Counting(_GatedStore):
+        async def write_spans(self, spans: Sequence[SpanRecord]) -> None:
+            calls.append(len(spans))
+            await super().write_spans(spans)
+
+    store = Counting()
+    store.gate.set()
+    writer = SpanWriter(store)  # type: ignore[arg-type]
+    for n in range(10):
+        writer.submit(_big_span("r", n, 1024 * 1024))
+    assert await writer.flush(None, 5.0) is True
+    assert sum(calls) == 10
+    assert max(calls) <= 4
+    await writer.close()
+
+
+async def test_store_open_failure_backs_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    attempts: list[int] = []
+
+    async def broken(*, owner: object | None = None) -> Any:
+        attempts.append(1)
+        raise LogposeError("cannot open")
+
+    monkeypatch.setattr(manager, "get_store", broken)
+    caplog.set_level(logging.WARNING)
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("ok"), repeat_last=True), model="m", tracing=Tracing()
+    )
+    await agent.run("a")
+    await agent.run("b")
+    assert len(attempts) == 1  # the second run did not touch the store
+    agent._trace_open_retry_at = 0.0  # the back-off has expired
+    await agent.run("c")
+    assert len(attempts) == 2
+    assert len(_warnings(caplog)) == 1
+
+
+def test_exit_hook_never_raises(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = Agent(FakeProvider(ScriptedTurn.text("ok")), model="m", tracing=Tracing())
+    asyncio.run(agent.run("a"))
+    assert manager._open_count() == 1
+
+    def boom(entry: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(manager, "_abandon", boom)
+    manager._shutdown()  # must not raise
+    monkeypatch.undo()
+    manager.reset_stores_for_tests()
+
+
+def test_submit_without_a_loop_counts_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    writer = SpanWriter(_GatedStore())  # type: ignore[arg-type]
+    caplog.set_level(logging.WARNING)
+    writer.submit(_span("r"))  # no running loop: dropped, never raised
+    assert writer.pending == 0
+    assert len(_warnings(caplog)) == 1

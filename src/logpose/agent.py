@@ -270,6 +270,9 @@ Providers reject empty content blocks, so a tool that returns ``""`` would
 otherwise fail the *next* request rather than its own.
 """
 
+TRACE_STORE_RETRY_SECONDS = 60.0
+"""Seconds after a failed trace-store open before a run tries to open it again."""
+
 SESSION_EXIT_TIMEOUT = 5.0
 """Seconds a session run's exit (record the run, save, release) may take once shielded."""
 
@@ -860,6 +863,10 @@ class Agent:
         self._uses_store = False
         self.tracing: Tracing | None = resolved_tracing
         self._trace_open_warned = False
+        self._trace_open_retry_at = 0.0  # monotonic; no store attempt before then
+        # Run IDs this agent traced whose spans may still be queued; aclose
+        # waits for these only, never for other agents' spans.
+        self._trace_run_ids: set[str] = set()
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -1394,7 +1401,8 @@ class Agent:
             from logpose.store import manager
 
             self._uses_store = False
-            await manager.release_stores(self)
+            run_ids, self._trace_run_ids = self._trace_run_ids, set()
+            await manager.release_stores(self, run_ids)
         if not self._owns_provider:
             return
         closer = getattr(self.provider, "aclose", None)
@@ -1591,9 +1599,11 @@ class Agent:
 
         Opens the store (shared with sessions, one per database path and event
         loop) on first use. If it cannot be opened the run proceeds untraced;
-        the first such failure per agent logs one WARNING to ``logpose.trace``.
+        the first such failure per agent logs one WARNING to ``logpose.trace``,
+        and runs within :data:`TRACE_STORE_RETRY_SECONDS` of a failure do not
+        try again (they stay untraced without touching disk).
         """
-        if self.tracing is None:
+        if self.tracing is None or monotonic() < self._trace_open_retry_at:
             return None
         from logpose.store import manager
 
@@ -1602,6 +1612,7 @@ class Agent:
             if writer is None:  # pragma: no cover - closed by a concurrent aclose
                 raise LogposeError("the trace store was closed")
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+            self._trace_open_retry_at = monotonic() + TRACE_STORE_RETRY_SECONDS
             if not self._trace_open_warned:
                 self._trace_open_warned = True
                 _TRACE_LOGGER.warning(
@@ -1617,9 +1628,18 @@ class Agent:
         if sink is None or self.tracing is None:
             return
         try:
-            await sink.flush(run_id, self.tracing.flush_timeout)
+            if await sink.flush(run_id, self.tracing.flush_timeout):
+                self._trace_run_ids.discard(run_id)
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
             _TRACE_LOGGER.warning("span flush failed for run %s: %s", run_id, type(exc).__name__)
+
+    def _track_trace_run(self, sink: _SpanSink, run_id: str) -> None:
+        """Remember ``run_id`` for :meth:`aclose`; forget runs already written."""
+        try:
+            self._trace_run_ids = {r for r in self._trace_run_ids if sink.pending_for(r) > 0}
+        except Exception:  # noqa: BLE001 - tracing never fails a run  # pragma: no cover
+            pass
+        self._trace_run_ids.add(run_id)
 
     def _new_trace(
         self,
@@ -1726,6 +1746,8 @@ class Agent:
         # Resolved first: a model error is the run's own error, not a tracing one.
         model = self._model()
         trace = self._new_trace(resolved_id, session_id, run_metadata, model, sink)
+        if sink is not None:
+            self._track_trace_run(sink, resolved_id)
         trace.start_run()
         body = self._loop_body(
             prompt,
