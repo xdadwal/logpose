@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -174,8 +175,8 @@ async def test_decision_usage_mapped() -> None:
         "total_tokens": 123,
     }
     g = _guard(lambda r: httpx.Response(200, json=_answers(0.9, 0.1, usage)))
-    await g(_inp())
-    assert g.last_usage == Usage(
+    v = await g(_inp())
+    assert v.usage == Usage(
         input_tokens=100, cache_read_input_tokens=20, output_tokens=3, reasoning_tokens=2
     )
 
@@ -223,3 +224,51 @@ async def test_missing_api_key_applies_on_error(monkeypatch: pytest.MonkeyPatch)
     assert not v.allowed and v.category == "error" and not calls
     monkeypatch.setenv("LOGPOSE_API_KEY", "   ")
     assert (await g(_inp())).category == "error"
+
+
+async def test_concurrent_calls_keep_their_own_usage() -> None:
+    gate = asyncio.Event()
+    arrived = 0
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        nonlocal arrived
+        text = json.loads(req.content)["input"][-1]["content"][0]["text"]
+        arrived += 1
+        if arrived == 2:
+            gate.set()
+        await gate.wait()
+        n = 10 if text == "a" else 20
+        usage = {"input_tokens": n, "output_tokens": n + 1}
+        return httpx.Response(200, json=_answers(0.9, 0.1, usage))
+
+    g = _guard(handler)
+    va, vb = await asyncio.gather(g(_inp("a")), g(_inp("b")))
+    assert va.usage == Usage(input_tokens=10, output_tokens=11)
+    assert vb.usage == Usage(input_tokens=20, output_tokens=21)
+
+
+async def test_blank_api_key_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOGPOSE_API_KEY", "env-key")
+    seen: dict[str, str] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["auth"] = req.headers["authorization"]
+        return httpx.Response(200, json=_answers(0.9, 0.1))
+
+    assert (await _guard(handler, api_key="   ")(_inp())).allowed
+    assert seen["auth"] == "Bearer env-key"
+
+
+@pytest.mark.parametrize("p", [float("nan"), float("inf"), 1.5, -0.1, True])
+async def test_bad_probability_is_malformed(p: Any) -> None:
+    body = _answers(0.9, 0.1)
+    body["answers"][0]["probability"] = p
+    v = await _guard(lambda r: httpx.Response(200, content=json.dumps(body)))(_inp())
+    assert not v.allowed and v.category == "error" and v.reason == "malformed_response"
+
+
+def test_invalid_regex_and_on_error_validated() -> None:
+    with pytest.raises(LogposeError):
+        pattern_guard(block_patterns=["("], reply="x")
+    with pytest.raises(LogposeError):
+        openai_decision_guard("d", replies=REPLIES, on_error="nope")  # type: ignore[arg-type]

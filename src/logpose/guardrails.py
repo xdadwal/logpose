@@ -8,6 +8,7 @@ or response bodies.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -61,6 +62,7 @@ class GuardrailVerdict:
         reply: Placeholder shown to the user when blocked.
         reason: For logs only, never shown to the user.
         scores: Named scores, e.g. probabilities.
+        usage: Model usage the guard itself spent, if any.
     """
 
     allowed: bool
@@ -68,11 +70,12 @@ class GuardrailVerdict:
     reply: str | None = None
     reason: str | None = None
     scores: Mapping[str, float] = field(default_factory=dict)
+    usage: Usage | None = None
 
     @classmethod
-    def allow(cls, **scores: float) -> GuardrailVerdict:
-        """Build an allowing verdict carrying optional scores."""
-        return cls(allowed=True, scores=dict(scores))
+    def allow(cls, *, usage: Usage | None = None, **scores: float) -> GuardrailVerdict:
+        """Build an allowing verdict carrying optional scores and usage."""
+        return cls(allowed=True, scores=dict(scores), usage=usage)
 
     @classmethod
     def block(
@@ -82,6 +85,7 @@ class GuardrailVerdict:
         *,
         reason: str | None = None,
         scores: Mapping[str, float] | None = None,
+        usage: Usage | None = None,
     ) -> GuardrailVerdict:
         """Build a blocking verdict."""
         return cls(
@@ -90,6 +94,7 @@ class GuardrailVerdict:
             reply=reply,
             reason=reason,
             scores=dict(scores or {}),
+            usage=usage,
         )
 
 
@@ -133,7 +138,10 @@ def pattern_guard(
         reply: Placeholder shown when blocked.
         category: Category for pattern hits.
     """
-    compiled = [re.compile(p, re.IGNORECASE) for p in block_patterns]
+    try:
+        compiled = [re.compile(p, re.IGNORECASE) for p in block_patterns]
+    except re.error as exc:
+        raise LogposeError(f"invalid block pattern: {exc}") from exc
 
     def pattern_guard(inp: GuardrailInput) -> GuardrailVerdict:
         text = guard_text(inp.message)
@@ -194,7 +202,7 @@ def openai_decision_guard(
     Blocks ``"unsafe"`` if ``p(unsafe) > unsafe_max`` (checked first), else
     ``"off_topic"`` if ``p(on_topic) < on_topic_min``. A refusal on ``unsafe``
     blocks as unsafe; any other failure applies ``on_error``. The guard's
-    ``last_usage`` holds the usage of its most recent call.
+    Verdicts carry the call's usage in ``usage``.
 
     Raises:
         LogposeError: At construction, if ``replies`` lacks a key or a threshold is
@@ -203,6 +211,8 @@ def openai_decision_guard(
     missing = {"off_topic", "unsafe"} - set(replies)
     if missing:
         raise LogposeError(f"replies is missing required keys: {sorted(missing)}")
+    if on_error not in ("allow", "block"):
+        raise LogposeError(f"on_error must be 'allow' or 'block', got {on_error!r}")
     _check_unit("on_topic_min", on_topic_min)
     _check_unit("unsafe_max", unsafe_max)
     replies = dict(replies)
@@ -212,15 +222,17 @@ def openai_decision_guard(
         {"name": "unsafe", "type": "predicate", "instructions": _UNSAFE},
     ]
 
-    def _failed(reason: str) -> GuardrailVerdict:
+    def _failed(reason: str, usage: Usage | None = None) -> GuardrailVerdict:
         if on_error == "allow":
-            return GuardrailVerdict.allow()
-        return GuardrailVerdict.block("error", replies[_ERROR_REPLY_KEY], reason=reason)
+            return GuardrailVerdict.allow(usage=usage)
+        return GuardrailVerdict.block(
+            "error", replies[_ERROR_REPLY_KEY], reason=reason, usage=usage
+        )
 
     async def _call(inp: GuardrailInput) -> dict[str, Any]:
         import httpx
 
-        key = (api_key or os.environ.get("LOGPOSE_API_KEY") or "").strip()
+        key = (api_key or "").strip() or os.environ.get("LOGPOSE_API_KEY", "").strip()
         if not key:
             raise _GuardFailure("missing_api_key")
         prior = [m for m in (_text_message(x) for x in inp.recent) if m is not None]
@@ -276,10 +288,10 @@ def openai_decision_guard(
             return Usage()
 
     async def openai_decision_guard(inp: GuardrailInput) -> GuardrailVerdict:
-        guard.last_usage = Usage()  # type: ignore[attr-defined]
+        usage: Usage | None = None
         try:
             data = await _call(inp)
-            guard.last_usage = _usage(data)  # type: ignore[attr-defined]
+            usage = _usage(data)
             answers = data.get("answers")
             if not isinstance(answers, list):
                 raise _GuardFailure("malformed_response")
@@ -290,25 +302,35 @@ def openai_decision_guard(
                     continue
                 if a.get("type") == "refusal":
                     refused.add(a["name"])
-                elif isinstance(a.get("probability"), (int, float)):
-                    scores[a["name"]] = float(a["probability"])
+                else:
+                    p = a.get("probability")
+                    if isinstance(p, bool) or not isinstance(p, (int, float)):
+                        raise _GuardFailure("malformed_response")
+                    if not math.isfinite(p) or not 0.0 <= p <= 1.0:
+                        raise _GuardFailure("malformed_response")
+                    scores[a["name"]] = float(p)
             if "unsafe" in refused:
                 return GuardrailVerdict.block(
-                    "unsafe", replies["unsafe"], reason="refusal on unsafe", scores=scores
+                    "unsafe",
+                    replies["unsafe"],
+                    reason="refusal on unsafe",
+                    scores=scores,
+                    usage=usage,
                 )
             if "on_topic" in refused:
                 raise _GuardFailure("refusal on on_topic")
             if "on_topic" not in scores or "unsafe" not in scores:
                 raise _GuardFailure("missing_answer")
         except _GuardFailure as exc:
-            return _failed(str(exc))
+            return _failed(str(exc), usage)
         if scores["unsafe"] > unsafe_max:
-            return GuardrailVerdict.block("unsafe", replies["unsafe"], scores=scores)
+            return GuardrailVerdict.block("unsafe", replies["unsafe"], scores=scores, usage=usage)
         if scores["on_topic"] < on_topic_min:
-            return GuardrailVerdict.block("off_topic", replies["off_topic"], scores=scores)
-        return GuardrailVerdict.allow(**scores)
+            return GuardrailVerdict.block(
+                "off_topic", replies["off_topic"], scores=scores, usage=usage
+            )
+        return GuardrailVerdict.allow(usage=usage, **scores)
 
     guard = openai_decision_guard
     guard.name = "openai_decision_guard"  # type: ignore[attr-defined]
-    guard.last_usage = Usage()  # type: ignore[attr-defined]
     return guard
