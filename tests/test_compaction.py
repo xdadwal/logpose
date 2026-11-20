@@ -395,7 +395,9 @@ def all_text(messages: list[Message]) -> str:
 
 
 def is_summary_call(request: CompletionRequest) -> bool:
-    return request.tools == [] and request.max_tokens == 2048
+    from logpose.compaction import SUMMARY_INSTRUCTION
+
+    return request.tools == [] and request.system == SUMMARY_INSTRUCTION
 
 
 def summary_messages(request: CompletionRequest) -> list[Message]:
@@ -666,6 +668,45 @@ async def test_summary_failure_sends_uncompacted_when_it_fits() -> None:
     conv = Conversation(chat_history(10))
     result = await agent.run("latest", conversation=conv)
     assert result.text == "ok"
+    assert provider.call_count == 2
+    assert provider.requests[1].messages == conv.messages[:-1]
+    compacted = [e for e in events if e.name == "context.compacted"]
+    assert len(compacted) == 1 and compacted[0].summarized is False
+    assert conv._compaction is not None and conv._compaction.summary is None
+
+
+@pytest.mark.parametrize(
+    ("max_tokens", "expected"), [(None, 16_384), (20_000, 20_000), (1_000, 2_048)]
+)
+async def test_summary_call_gets_at_least_the_turn_output_ceiling(
+    max_tokens: int | None, expected: int
+) -> None:
+    # Reasoning models spend output tokens thinking; a fixed small ceiling can
+    # leave no room for the summary text itself.
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model", context_budget=2_000, max_tokens=max_tokens)
+    await agent.run("latest", conversation=Conversation(chat_history(10)))
+    assert is_summary_call(provider.requests[0])
+    assert provider.requests[0].max_tokens == expected
+    assert provider.requests[0].max_tokens >= agent._max_tokens()
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        ScriptedTurn.text("", thinking="thinking " * 500, stop_reason="max_tokens"),
+        ScriptedTurn.text("   ", stop_reason="end_turn"),
+    ],
+    ids=["reasoning-only-cut-off", "blank"],
+)
+async def test_summary_without_text_is_a_failed_summary(turn: ScriptedTurn) -> None:
+    events: list[RuntimeEvent] = []
+    provider = FakeProvider([turn, ScriptedTurn.text("ok"), ScriptedTurn.text("ok2")])
+    agent = Agent(provider, model="test-model", context_budget=2_000, observers=[events.append])
+    conv = Conversation(chat_history(10))
+    result = await agent.run("latest", conversation=conv)
+    assert result.text == "ok"
+    # Not retried: the uncompacted request goes out, which still fits the window.
     assert provider.call_count == 2
     assert provider.requests[1].messages == conv.messages[:-1]
     compacted = [e for e in events if e.name == "context.compacted"]

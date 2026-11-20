@@ -40,7 +40,7 @@ SUMMARY_PREFIX = "[Summary of earlier conversation]\n"
 """Text that starts the assistant-role message carrying the summary."""
 
 SUMMARY_MAX_TOKENS = 2048
-"""Output ceiling for the summary call."""
+"""Floor for the summary call's output ceiling (the agent's ``max_tokens`` if larger)."""
 
 SUMMARY_INSTRUCTION = (
     "You compress the earlier part of a conversation between a user and an AI "

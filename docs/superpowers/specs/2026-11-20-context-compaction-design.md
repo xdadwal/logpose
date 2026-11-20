@@ -102,8 +102,11 @@ model is shaped.
      estimate falls to `compaction_target × input_budget`. Cut points fall only
      on turn boundaries, so tool pairs are never split.
   2. Make one extra model call (same provider and model, no tools, `max_tokens`
-     2,048) with a fixed summarization instruction and the span's text
-     (pointers, not full outputs). The output is the summary.
+     = max(2,048, the agent's resolved per-turn `max_tokens`) — amended
+     2026-11-20: a fixed 2,048 let reasoning models spend the whole budget
+     thinking) with a fixed summarization instruction and the span's text
+     (pointers, not full outputs). The output is the summary. A response with
+     no text counts as a failed summary (not retried).
   3. The request becomes: system, the first user turn, one **assistant-role**
      message `"[Summary of earlier conversation]\n<summary>"`, then the
      remaining recent turns. (Amended 2026-11-20: originally user-role; changed

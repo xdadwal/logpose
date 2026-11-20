@@ -1996,14 +1996,19 @@ class Agent:
                 else:
                     span, previous = messages[first + 1 : cut], None
                 attempted = True
+                failure: ProviderError | None = None
                 try:
                     summary = await self._summarize(
                         span, previous, context, run_deadline, add_usage
                     )
                 except ProviderError as exc:
-                    # Keep whatever valid shape we had (no summary, or the older
-                    # one) if it fits the window. Not retried again this run:
-                    # every later turn would pay for the same failing call.
+                    summary, failure = None, exc
+                if summary is None:
+                    # Failed, or answered with no text (e.g. a reasoning model
+                    # that spent its output budget thinking). Keep whatever
+                    # valid shape we had (no summary, or the older one) if it
+                    # fits the window. Not retried again this run: every later
+                    # turn would pay for the same failing call.
                     run_state.summary_failed = True
                     estimate = calibrated(raw)
                     if estimate > window:
@@ -2013,7 +2018,7 @@ class Agent:
                             f"leaves (input budget {self.input_budget}).",
                             estimated_tokens=estimate,
                             input_budget=self.input_budget,
-                        ) from exc
+                        ) from failure
                 else:
                     state.summary = summary
                     state.cut_index = cut
@@ -2059,7 +2064,7 @@ class Agent:
         context: RuntimeContext | None,
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
-    ) -> str:
+    ) -> str | None:
         """Make the summary call: same provider and model, no tools, retried.
 
         Not a loop turn: it does not count toward ``max_iterations`` and emits
@@ -2067,18 +2072,24 @@ class Agent:
         caller bounds it by the run deadline; each attempt is also bounded by
         the provider turn timeout.
 
+        Its output ceiling is the larger of :data:`SUMMARY_MAX_TOKENS` and the
+        agent's per-turn ``max_tokens``: a reasoning model spends output tokens
+        thinking before it writes, and the per-turn ceiling is already sized
+        for that and already fits the window.
+
         Returns:
-            The summary text.
+            The summary text, or ``None`` if the model answered with no text
+            (not retried: the same request would spend its budget the same way).
 
         Raises:
-            ProviderError: If every allowed attempt failed or returned no text.
+            ProviderError: If every allowed attempt failed.
         """
         request = CompletionRequest(
             messages=[
                 Message(role="user", content=[TextBlock(text=render_transcript(span, previous))])
             ],
             model=self._model(),
-            max_tokens=SUMMARY_MAX_TOKENS,
+            max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
             system=SUMMARY_INSTRUCTION,
             tools=[],
             extra={k: v for k, v in self.extra.items() if k not in _TURN_ONLY_EXTRA},
@@ -2121,11 +2132,7 @@ class Agent:
                 if done is not None and add_usage is not None:
                     add_usage(done.usage)
                 text = done.message.text.strip() if done is not None else ""
-                if text:
-                    return text
-                failure = ProviderError(
-                    f"Provider {self.provider_name!r} returned no summary text."
-                )
+                return text or None
             failure.attempts = attempt
             if not failure.retryable or attempt >= self.retry_policy.max_attempts:
                 raise failure
