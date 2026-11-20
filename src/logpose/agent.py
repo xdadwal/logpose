@@ -91,6 +91,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import AbstractAsyncContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -103,6 +104,7 @@ from logpose.cancellation import (
     _clear_deadline_handle,
     _install_deadline_handle,
 )
+from logpose.compaction import RECALL_TOOL_NAME, apply_pointers, make_recall_tool
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     LogposeError,
@@ -196,6 +198,21 @@ DEFAULT_PROVIDER_TURN_TIMEOUT = 120.0
 DEFAULT_RUN_TIMEOUT = 320.0
 """Wall-clock deadline, in seconds, for a whole run. ``None`` disables it."""
 
+DEFAULT_CONTEXT_WINDOW = 128_000
+"""Model context window, in tokens, assumed when the app does not state one."""
+
+DEFAULT_CONTEXT_BUDGET = 32_000
+"""Cap on estimated input tokens per request for the built-in context policy."""
+
+DEFAULT_COMPACTION_THRESHOLD = 0.85
+"""Fraction of the input budget at which the built-in policy summarizes."""
+
+DEFAULT_COMPACTION_TARGET = 0.60
+"""Fraction of the input budget the built-in policy summarizes down to."""
+
+DEFAULT_POINTER_MIN_CHARS = 1_000
+"""Earlier-run tool outputs longer than this are sent as pointers."""
+
 DEFAULT_MAX_CONCURRENT_TOOLS = 8
 """Maximum tool handlers one agent executes at once across concurrent runs."""
 
@@ -228,6 +245,22 @@ class _Unset(enum.Enum):
 
 _UNSET = _Unset.UNSET
 """Means "use the agent default" for ``output_type`` / ``output_retries``."""
+
+
+class _BuiltinContext(enum.Enum):
+    """Sentinel type: ``context_policy`` left at its default (the built-in path)."""
+
+    BUILTIN = enum.auto()
+
+    def __repr__(self) -> str:
+        return "<built-in>"
+
+
+_BUILTIN_CONTEXT = _BuiltinContext.BUILTIN
+"""Default ``context_policy``: logpose's own compaction path."""
+
+_RUN_HISTORY: ContextVar[Sequence[Message]] = ContextVar("logpose_run_history", default=())
+"""The executing run's full history, read by the ``recall_tool_output`` tool."""
 
 _CORRECTION_PREFIX = "Your previous answer did not match the required JSON schema:\n"
 _CORRECTION_SUFFIX = "\nReply again with only the corrected JSON."
@@ -463,10 +496,15 @@ class Agent:
         on_tool_call: ToolGate | None = None,
         observers: Sequence[RuntimeObserver] = (),
         tool_observer: ToolObserver | None = None,
-        context_policy: ContextPolicy | None = None,
+        context_policy: ContextPolicy | None | _BuiltinContext = _BUILTIN_CONTEXT,
         output_type: type[BaseModel] | None = None,
         output_retries: int = 1,
         session_wait: float = 0.0,
+        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
+        compaction_threshold: float = DEFAULT_COMPACTION_THRESHOLD,
+        compaction_target: float = DEFAULT_COMPACTION_TARGET,
+        pointer_min_chars: int = DEFAULT_POINTER_MIN_CHARS,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -528,9 +566,14 @@ class Agent:
                 detached approved tool intent and normalized outcome. Failures stop
                 the run with ToolObservationError rather than becoming tool results.
                 Contains application content; never attach it to telemetry logging.
-            context_policy: Optional sync/async request preparation policy. Runs before
-                every provider iteration on detached data; never rewrites history.
-                Applications own selection and summaries. Failure stops the run.
+            context_policy: Request preparation. Left at its default, logpose's
+                built-in path runs: tool outputs from earlier runs longer than
+                ``pointer_min_chars`` are sent as short pointers, and agents with
+                tools get a ``recall_tool_output`` tool to read them back. A
+                sync/async function replaces the built-in path entirely; it runs
+                before every provider iteration on detached data, never rewrites
+                history, and its failure stops the run. ``None`` sends the full
+                history unchanged.
             output_type: Default pydantic model the final answer must satisfy.
                 When set, every turn requests strict ``json_schema`` output and
                 the run returns the validated object as ``RunResult.output``.
@@ -539,6 +582,16 @@ class Agent:
                 final answer fails validation (default 1). ``0`` fails at once.
             session_wait: Seconds to keep retrying a busy session's lease before
                 raising :class:`~logpose.errors.SessionBusyError` (default 0).
+            context_window: The model's total context window in tokens
+                (default 128,000).
+            context_budget: Cap on input tokens per request (default 32,000), or
+                ``None`` for no cap beyond the window.
+            compaction_threshold: Fraction of the input budget at which the
+                built-in policy summarizes older turns (default 0.85).
+            compaction_target: Fraction of the input budget it summarizes down
+                to (default 0.60). Must be below ``compaction_threshold``.
+            pointer_min_chars: Earlier-run tool outputs longer than this are sent
+                as pointers (default 1,000).
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -554,7 +607,10 @@ class Agent:
             ``provider_turn_timeout``, ``max_concurrent_tools``, or
             ``tool_timeout`` is invalid, or if a tool-error option is invalid,
             or if ``output_type`` is not a ``BaseModel`` subclass or
-            ``output_retries`` is not an int >= 0.
+            ``output_retries`` is not an int >= 0, or if a context setting is
+            invalid, or if, with the built-in context path, the input budget
+            (``min(context_window - max_tokens, context_budget)``) is not
+            positive or an app tool is named ``recall_tool_output``.
         """
         _check_output_type(output_type)
         _check_output_retries(output_retries)
@@ -618,6 +674,21 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        _check_positive_int("context_window", context_window)
+        if context_budget is not None:
+            _check_positive_int("context_budget", context_budget)
+        _check_positive_int("pointer_min_chars", pointer_min_chars)
+        for label, fraction in (
+            ("compaction_threshold", compaction_threshold),
+            ("compaction_target", compaction_target),
+        ):
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                raise LogposeError(f"{label} must be a number, got {fraction!r}.")
+        if not 0 < compaction_target < compaction_threshold <= 1:
+            raise LogposeError(
+                "context settings must satisfy 0 < compaction_target < compaction_threshold "
+                f"<= 1; got target={compaction_target!r}, threshold={compaction_threshold!r}."
+            )
 
         if isinstance(provider, str):
             self.provider: Provider = resolve(provider, **provider_kwargs)
@@ -656,7 +727,15 @@ class Agent:
         self.on_tool_call = on_tool_call
         self.observers: tuple[RuntimeObserver, ...] = tuple(observers)
         self.tool_observer = tool_observer
-        self.context_policy = context_policy
+        self._context_policy_is_default = context_policy is _BUILTIN_CONTEXT
+        self.context_policy: ContextPolicy | None = (
+            None if isinstance(context_policy, _BuiltinContext) else context_policy
+        )
+        self.context_window = context_window
+        self.context_budget = context_budget
+        self.compaction_threshold = float(compaction_threshold)
+        self.compaction_target = float(compaction_target)
+        self.pointer_min_chars = pointer_min_chars
         self.last_context_diagnostics: dict[str, int | str | bool] = {}
         self.output_type = output_type
         self.output_retries = output_retries
@@ -675,8 +754,29 @@ class Agent:
                     f"Duplicate tool name {tool_def.name!r}; every tool must be uniquely named."
                 )
             by_name[tool_def.name] = tool_def
+        # The built-in path's own tool: present from the first turn whenever the
+        # agent has tools, so the advertised tool list never changes mid-chat.
+        # Not added to ``self.tools``, which stays the app's own list.
+        self._recall_active = self._context_policy_is_default and bool(self.tools)
+        if self._recall_active:
+            if RECALL_TOOL_NAME in by_name:
+                raise LogposeError(
+                    f"Tool name {RECALL_TOOL_NAME!r} is reserved by the built-in context "
+                    "policy; rename the tool or pass context_policy=None."
+                )
+            by_name[RECALL_TOOL_NAME] = make_recall_tool(_RUN_HISTORY.get)
         self._tools_by_name = by_name
-        self._specs: tuple[ToolSpec, ...] = tuple(tool_def.spec() for tool_def in self.tools)
+        self._specs: tuple[ToolSpec, ...] = tuple(tool_def.spec() for tool_def in by_name.values())
+        resolved_window = context_window - self._max_tokens()
+        self.input_budget = (
+            resolved_window if context_budget is None else min(resolved_window, context_budget)
+        )
+        if self._context_policy_is_default and self.input_budget <= 0:
+            raise LogposeError(
+                f"The input budget is {self.input_budget} tokens: context_window="
+                f"{context_window} minus max_tokens={self._max_tokens()} leaves no room "
+                "for input. Raise context_window or lower max_tokens."
+            )
 
     # -- public API ---------------------------------------------------------
 
@@ -1217,6 +1317,9 @@ class Agent:
         run_deadline = started_at + self.run_timeout if self.run_timeout is not None else None
         self._emit_runtime("run.started", context=run_context)
         history: list[Message] = conversation.messages if conversation is not None else []
+        # Messages from here on belong to this run; the built-in context path
+        # sends their tool outputs in full and points at earlier runs' ones.
+        current_start = len(history)
         iterations = 0
         if stats is None:
             stats = _RunStats()
@@ -1263,7 +1366,9 @@ class Agent:
                 )
                 done: CompletionDone | None = None
                 async with _run_budget(run_deadline):
-                    request = await self._prepare_request(history, response_format)
+                    request = await self._prepare_request(
+                        history, response_format, current_start=current_start
+                    )
                 turn_stream = self._provider_turn(request, turn_context, run_deadline)
                 try:
                     async for event in turn_stream:
@@ -1318,7 +1423,7 @@ class Agent:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
                     async with _run_budget(run_deadline):
-                        results = await self._execute(calls, turn_context)
+                        results = await self._execute(calls, turn_context, history)
                     # ONE user message holding every result, in request order —
                     # appended before the results are yielded, so a consumer that
                     # walks away mid-results still leaves a replayable history.
@@ -1621,13 +1726,31 @@ class Agent:
         self,
         history: Sequence[Message],
         response_format: dict[str, Any] | None = None,
+        *,
+        current_start: int | None = None,
     ) -> CompletionRequest:
-        """Await selection before inference; isolate policy mutation from canonical data."""
+        """Await selection before inference; isolate policy mutation from canonical data.
+
+        Args:
+            history: The run's full history. Never modified.
+            response_format: Structured-output format to attach, if any.
+            current_start: Index of the first message this run appended. The
+                built-in path sends tool outputs before it as pointers; ``None``
+                treats the whole history as the current run.
+        """
         request = self._request(history)
         if response_format is not None:
             request.extra["response_format"] = copy.deepcopy(response_format)
         self.last_context_diagnostics = {}
         if self.context_policy is None:
+            if self._recall_active and current_start:
+                # Pointers only when the model can recall what they point at.
+                messages, _ = apply_pointers(
+                    request.messages,
+                    current_start=current_start,
+                    min_chars=self.pointer_min_chars,
+                )
+                return replace(request, messages=messages)
             return request
         try:
             selected = self.context_policy(
@@ -1747,7 +1870,10 @@ class Agent:
     # -- tools --------------------------------------------------------------
 
     async def _execute(
-        self, calls: Sequence[ToolUseBlock], turn_context: RuntimeContext
+        self,
+        calls: Sequence[ToolUseBlock],
+        turn_context: RuntimeContext,
+        history: Sequence[Message] = (),
     ) -> list[ToolResultBlock]:
         """Gate every requested call, then run the survivors concurrently.
 
@@ -1757,6 +1883,8 @@ class Agent:
 
         Args:
             calls: The tool-use blocks from the assistant turn, in wire order.
+            turn_context: Correlation context of the turn that requested them.
+            history: The run's full history, readable by ``recall_tool_output``.
 
         Returns:
             One :class:`~logpose.messages.ToolResultBlock` per call, in the same
@@ -1770,10 +1898,16 @@ class Agent:
             context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
             self._emit_runtime("tool.queued", context=context)
             queued.append((index, call, queued_at))
-        tasks = [
-            asyncio.create_task(self._invoke(call, queued_at, turn_context))
-            for _, call, queued_at in queued
-        ]
+        # Each task copies the current context at creation, so the recall tool
+        # sees this run's history even while other runs share the agent.
+        history_token = _RUN_HISTORY.set(history)
+        try:
+            tasks = [
+                asyncio.create_task(self._invoke(call, queued_at, turn_context))
+                for _, call, queued_at in queued
+            ]
+        finally:
+            _RUN_HISTORY.reset(history_token)
         try:
             ran: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
         except ToolObservationError:
@@ -2079,6 +2213,12 @@ def _check_output_type(output_type: object) -> None:
             f"output_type must be a pydantic BaseModel subclass or None, got {shown}."
         )
     strict_json_schema(output_type)
+
+
+def _check_positive_int(label: str, value: object) -> None:
+    """Raise unless ``value`` is an ``int`` (not a ``bool``) of at least 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LogposeError(f"{label} must be a positive int, got {value!r}.")
 
 
 def _check_output_retries(output_retries: object) -> None:
