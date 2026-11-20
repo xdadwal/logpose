@@ -395,8 +395,10 @@ def assert_request_valid(request: CompletionRequest) -> None:
             assert previous.role == "assistant"
             assert results == [b.id for b in previous.content if isinstance(b, ToolUseBlock)]
         if index:
-            # Never two assistant turns in a row.
-            assert not (message.role == "assistant" and messages[index - 1].role == "assistant")
+            # Strict alternation: chat templates on vLLM, llama.cpp and Ollama
+            # reject two user or two assistant messages in a row.
+            assert message.role != messages[index - 1].role, f"roles repeat at {index}"
+    assert messages[-1].role == "user"  # never a trailing assistant message (prefill)
     # The Chat Completions wire form pairs every tool message with a preceding call.
     from logpose.providers.openai_compat import _messages_to_wire
 
@@ -454,8 +456,9 @@ async def test_summary_at_threshold() -> None:
     assert "<q0>" not in transcript
 
     assert turn.messages[0] == conv.messages[0]
-    assert turn.messages[1].role == "user"
+    assert turn.messages[1].role == "assistant"
     assert turn.messages[1].text == SUMMARY_PREFIX + "SUMMARY-ONE"
+    assert_request_valid(turn)
     sent = all_text(turn.messages)
     assert "<q1>" not in sent and "<a1>" not in sent
     assert "<q9>" in sent and "latest question" in sent
@@ -481,6 +484,8 @@ async def test_summary_is_reused_until_threshold_again() -> None:
     # The request prefix is unchanged, so provider prompt caching keeps working.
     assert second_turn.messages[: len(first_turn.messages)] == first_turn.messages
     assert second_turn.messages[-1].text == "follow up"
+    assert_request_valid(first_turn)
+    assert_request_valid(second_turn)
 
 
 async def test_summary_extends_when_threshold_reached_again() -> None:
@@ -508,6 +513,7 @@ async def test_summary_extends_when_threshold_reached_again() -> None:
     assert "<qb0>" in transcript
     turn = provider.requests[3]
     assert [m.text for m in summary_messages(turn)] == [SUMMARY_PREFIX + "SUMMARY-TWO"]
+    assert_request_valid(turn)
     assert estimate_tokens(turn.messages, turn.system, turn.tools) <= 0.60 * 2_000
 
 
@@ -522,6 +528,8 @@ async def test_first_user_turn_never_summarized() -> None:
     assert "FIRST-TURN" not in all_text(summary_call.messages)
     assert turn.messages[0] == history[0]
     assert turn.messages[1].text == SUMMARY_PREFIX + "S"
+    assert turn.messages[1].role == "assistant"
+    assert_request_valid(turn)
 
 
 async def test_cut_never_splits_tool_pair() -> None:
@@ -583,6 +591,7 @@ async def test_edited_history_invalidates_cache() -> None:
     assert "<q1>" not in transcript and "<a0>" in transcript
     turn = provider.requests[3]
     assert [m.text for m in summary_messages(turn)] == [SUMMARY_PREFIX + "SUMMARY-NEW"]
+    assert_request_valid(turn)
     # The recent turns are the real tail of the edited history.
     assert (
         turn.messages[2:] == conv.messages[len(conv.messages) - (len(turn.messages) - 2) - 1 : -1]
@@ -701,11 +710,15 @@ async def test_overflow_after_summary_raises() -> None:
     assert provider.call_count == 0
 
 
+def clamp(ratio: float) -> float:
+    return min(2.0, max(0.5, ratio))
+
+
 async def test_calibration_ratio_updates_from_reported_usage() -> None:
     provider = FakeProvider(
         [
-            ScriptedTurn.text("one", usage=Usage(input_tokens=600, cache_read_input_tokens=400)),
-            ScriptedTurn.text("two", usage=Usage(input_tokens=50)),
+            ScriptedTurn.text("one", usage=Usage(input_tokens=12, cache_read_input_tokens=8)),
+            ScriptedTurn.text("two", usage=Usage(input_tokens=30)),
             ScriptedTurn.text("three"),
         ]
     )
@@ -716,13 +729,14 @@ async def test_calibration_ratio_updates_from_reported_usage() -> None:
     assert state is not None
     first = provider.requests[0]
     est1 = estimate_tokens(first.messages, first.system, first.tools)
-    expected = 0.7 * 1.0 + 0.3 * (1000 / est1)
+    expected = 0.7 * 1.0 + 0.3 * (20 / est1)
+    assert 0.5 < expected < 2.0  # inside the clamp: the formula itself is checked
     assert state.ratio == pytest.approx(expected)
 
     await agent.run("again", conversation=conv)
     second = provider.requests[1]
     est2 = estimate_tokens(second.messages, second.system, second.tools)
-    expected = 0.7 * expected + 0.3 * (50 / est2)
+    expected = clamp(0.7 * expected + 0.3 * (30 / est2))
     assert state.ratio == pytest.approx(expected)
 
     # No reported usage leaves the ratio alone.
@@ -850,3 +864,105 @@ async def test_structured_output_correction_with_summary() -> None:
     assert summary_messages(correction)
     assert correction.messages[-1].role == "user"
     assert correction.messages[-2].text == "not json"
+    assert_request_valid(correction)
+
+
+@pytest.mark.parametrize("turns", [4, 5, 6, 8, 10, 14])
+@pytest.mark.parametrize("chars", [150, 400, 700])
+async def test_every_cut_configuration_alternates(turns: int, chars: int) -> None:
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("answer")], repeat_last=True)
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    conv = Conversation(chat_history(turns, chars))
+    await agent.run("latest", conversation=conv)
+    for request in provider.requests:
+        if not is_summary_call(request):
+            assert_request_valid(request)
+    # And again with tool rounds in every earlier turn and in the current run.
+    history: list[Message] = []
+    for i in range(turns):
+        history.append(Message(role="user", content=[TextBlock(text=f"<q{i}> " + "x" * chars)]))
+        history.append(
+            Message(role="assistant", content=[ToolUseBlock(id=f"u{i}", name="small", input={})])
+        )
+        history.append(
+            Message(role="user", content=[ToolResultBlock(tool_use_id=f"u{i}", content="r" * 500)])
+        )
+        history.append(Message(role="assistant", content=[TextBlock(text=f"<a{i}> done")]))
+    provider = FakeProvider(
+        [
+            ScriptedTurn.text("S"),
+            ScriptedTurn.tool_use(tool_call("small", id="now")),
+            ScriptedTurn.text("answer"),
+        ]
+    )
+    agent = Agent(provider, model="test-model", tools=[small], context_budget=2_000)
+    await agent.run("latest", conversation=Conversation(history))
+    for request in provider.requests:
+        if not is_summary_call(request):
+            assert_request_valid(request)
+
+
+async def test_calibration_ratio_is_clamped_low() -> None:
+    # A server that under-reports prompt tokens (2% of the estimate) cannot
+    # collapse the estimate below half: the threshold still fires.
+    history = chat_history(10)
+    probe = estimate_tokens(history, None, [])
+    under = Usage(input_tokens=max(1, probe // 50))
+    provider = FakeProvider(
+        [ScriptedTurn.text(f"r{i}", usage=under) for i in range(12)]
+        + [ScriptedTurn.text("S"), ScriptedTurn.text("final")]
+    )
+    agent = Agent(provider, model="test-model", context_budget=4_000)
+    conv = Conversation(chat_history(2, chars=50))
+    for i in range(12):
+        await agent.run(f"p{i}", conversation=conv)
+        assert conv._compaction is not None and conv._compaction.ratio >= 0.5
+    assert conv._compaction.ratio == pytest.approx(0.5)
+    # Raw history now ~1.8x the 85% threshold of 4,000: halved, it still fires.
+    conv.extend(chat_history(30, tag="z"))
+    raw = estimate_tokens(conv.messages, None, [])
+    assert raw * 0.5 >= 0.85 * 4_000
+    await agent.run("go", conversation=conv)
+    assert is_summary_call(provider.requests[12])
+
+
+async def test_calibration_ratio_is_clamped_high() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.text(f"r{i}", usage=Usage(input_tokens=1_000_000)) for i in range(8)]
+    )
+    agent = Agent(provider, model="test-model")
+    conv = Conversation()
+    for i in range(8):
+        await agent.run(f"p{i}", conversation=conv)
+        assert conv._compaction is not None and conv._compaction.ratio <= 2.0
+    assert conv._compaction.ratio == pytest.approx(2.0)
+
+
+async def test_failed_summary_not_retried_within_the_run() -> None:
+    events: list[RuntimeEvent] = []
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError("down", status_code=400)),
+            ScriptedTurn.tool_use(tool_call("small", id="now")),
+            ScriptedTurn.text("done"),
+            ScriptedTurn.text("S"),
+            ScriptedTurn.text("next run"),
+        ]
+    )
+    agent = Agent(
+        provider, model="test-model", tools=[small], context_budget=2_000, observers=[events.append]
+    )
+    conv = Conversation(chat_history(10))
+    result = await agent.run("latest", conversation=conv)
+    assert result.text == "done"
+    # One failed summary call, then two uncompacted turns: no second attempt.
+    assert provider.call_count == 3
+    assert not any(summary_messages(r) for r in provider.requests[1:3])
+    compacted = [e for e in events if e.name == "context.compacted"]
+    # Only the turn that attempted the summary reports; the next one has
+    # nothing to report (no pointers, no summary, no attempt).
+    assert [e.summarized for e in compacted] == [False]
+    # A new run tries again.
+    await agent.run("again", conversation=conv)
+    assert is_summary_call(provider.requests[3])
+    assert summary_messages(provider.requests[4])

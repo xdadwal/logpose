@@ -1350,6 +1350,7 @@ class Agent:
         run_stats = stats
         # Built-in context policy state: the conversation's, or this run's only.
         compaction: _CompactionState | None = None
+        run_compaction = _RunCompaction()
         if self._context_policy_is_default:
             if conversation is None:
                 compaction = _CompactionState()
@@ -1410,6 +1411,7 @@ class Agent:
                         response_format,
                         current_start=current_start,
                         compaction=compaction,
+                        run_compaction=run_compaction,
                         context=turn_context,
                         run_deadline=run_deadline,
                         add_usage=add_usage,
@@ -1780,6 +1782,7 @@ class Agent:
         *,
         current_start: int | None = None,
         compaction: _CompactionState | None = None,
+        run_compaction: _RunCompaction | None = None,
         context: RuntimeContext | None = None,
         run_deadline: float | None = None,
         add_usage: Callable[[Usage], None] | None = None,
@@ -1794,6 +1797,7 @@ class Agent:
                 treats the whole history as the current run.
             compaction: The built-in path's per-conversation state; a fresh
                 one is used when omitted.
+            run_compaction: The built-in path's state for this run only.
             context: Correlation context for the summary call and the
                 ``context.compacted`` event.
             run_deadline: Bounds the summary call's retries.
@@ -1813,6 +1817,7 @@ class Agent:
                 history,
                 current_start=current_start,
                 state=compaction if compaction is not None else _CompactionState(),
+                run_state=run_compaction if run_compaction is not None else _RunCompaction(),
                 context=context,
                 run_deadline=run_deadline,
                 add_usage=add_usage,
@@ -1866,6 +1871,7 @@ class Agent:
         *,
         current_start: int | None,
         state: _CompactionState,
+        run_state: _RunCompaction,
         context: RuntimeContext | None,
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
@@ -1908,10 +1914,11 @@ class Agent:
         first = starts[0] if starts else -1
 
         # A cached summary applies only to the exact history it was made from,
-        # and its cut must still start a caller turn (edits after it can move that).
+        # and its cut must still start a caller turn (edits after it can move
+        # that): the summary is an assistant message, so a user turn must follow.
         if state.summary is not None and not (
             0 <= first < state.cut_index
-            and (state.cut_index == len(history) or state.cut_index in starts)
+            and state.cut_index in starts
             and fingerprint(history[: state.cut_index]) == state.fingerprint
         ):
             state.clear_summary()
@@ -1921,7 +1928,11 @@ class Agent:
             raw = estimate_tokens(sent, system, tools)
         attempted = False
 
-        if calibrated(raw) >= self.compaction_threshold * self.input_budget and first >= 0:
+        if (
+            calibrated(raw) >= self.compaction_threshold * self.input_budget
+            and first >= 0
+            and not run_state.summary_failed
+        ):
             # The span must be non-empty and must end at or before the current
             # run's own first message, which is always sent verbatim.
             lower = state.cut_index if state.summary is not None else first + 1
@@ -1958,7 +1969,9 @@ class Agent:
                     )
                 except ProviderError as exc:
                     # Keep whatever valid shape we had (no summary, or the older
-                    # one) if it fits the window; the next turn tries again.
+                    # one) if it fits the window. Not retried again this run:
+                    # every later turn would pay for the same failing call.
+                    run_state.summary_failed = True
                     estimate = calibrated(raw)
                     if estimate > window:
                         raise ContextOverflowError(
@@ -2531,6 +2544,13 @@ def _check_output_retries(output_retries: object) -> None:
         or output_retries < 0
     ):
         raise LogposeError(f"output_retries must be an int >= 0, got {output_retries!r}.")
+
+
+@dataclass
+class _RunCompaction:
+    """Built-in context policy state that lasts for one run only."""
+
+    summary_failed: bool = False
 
 
 @dataclass

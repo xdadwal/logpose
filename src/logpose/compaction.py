@@ -37,7 +37,7 @@ RECALL_PAGE_CHARS = 8000
 _CHARS_PER_TOKEN = 4
 
 SUMMARY_PREFIX = "[Summary of earlier conversation]\n"
-"""Text that starts the user-role message carrying the summary."""
+"""Text that starts the assistant-role message carrying the summary."""
 
 SUMMARY_MAX_TOKENS = 2048
 """Output ceiling for the summary call."""
@@ -55,6 +55,12 @@ SUMMARY_INSTRUCTION = (
 
 _SMOOTHING = 0.7
 """Weight the calibration ratio keeps on its old value after each turn."""
+
+RATIO_MIN = 0.5
+RATIO_MAX = 2.0
+"""Bounds on the calibration ratio, so a server that under- or over-reports
+prompt tokens (prompt-cache accounting, for example) cannot disable the
+threshold or the overflow guard."""
 
 
 @dataclasses.dataclass
@@ -82,9 +88,12 @@ class _CompactionState:
             reported: Input tokens the provider reported for the request
                 (uncached + cache reads + cache writes). ``0`` means unknown.
             estimate: The raw (uncalibrated) estimate of that request.
+
+        The result is clamped to [``RATIO_MIN``, ``RATIO_MAX``].
         """
         if reported > 0 and estimate > 0:
-            self.ratio = _SMOOTHING * self.ratio + (1 - _SMOOTHING) * (reported / estimate)
+            ratio = _SMOOTHING * self.ratio + (1 - _SMOOTHING) * (reported / estimate)
+            self.ratio = min(RATIO_MAX, max(RATIO_MIN, ratio))
 
     def clear_summary(self) -> None:
         """Forget the cached summary and cut point."""
@@ -276,8 +285,13 @@ def fingerprint(messages: Sequence[Message]) -> str:
 
 
 def summary_message(summary: str) -> Message:
-    """The user-role message that stands in for the summarized span."""
-    return Message(role="user", content=[TextBlock(text=SUMMARY_PREFIX + summary)])
+    """The message that stands in for the summarized span.
+
+    Assistant role: it sits between the pinned first user turn and a user turn
+    start, so the request keeps strict user/assistant alternation, which chat
+    templates on vLLM, llama.cpp and Ollama enforce.
+    """
+    return Message(role="assistant", content=[TextBlock(text=SUMMARY_PREFIX + summary)])
 
 
 def message_chars(message: Message) -> int:
