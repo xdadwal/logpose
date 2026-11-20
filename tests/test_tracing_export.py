@@ -315,3 +315,61 @@ def test_import_logpose_does_not_import_aiosqlite() -> None:
     code = "import sys, logpose; print('aiosqlite' in sys.modules)"
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "False"
+
+
+async def _probe_after_delete(db: Path, tmp_path: Path, wipe: str) -> None:
+    store = await manager.get_store()
+    async with store.session("keep"):
+        pass
+    async with store.session("gone"):
+        pass
+    old = T0
+    await _put(_span(_tid(1), _sid(1), session="keep", start=T0 + 5))
+    await _put(
+        _span(_tid(2), _sid(20), parent=_sid(2), session="gone", start=old),
+        _span(_tid(2), _sid(2), session="gone", start=old),
+    )
+    out = tmp_path / "o.jsonl"
+    first = await export_traces(out)
+    assert first.traces == 2 and first.cursor == 3
+    if wipe == "session":
+        await store.delete_session("gone")
+    elif wipe == "purge":
+        assert await store.purge_spans(T0 // 1_000_000 + 1) == 2
+    else:
+        await store.purge_expired(now_ms=10**15)
+    await _put(_span(_tid(3), _sid(3), session="keep", start=T0 + 9))
+    second = await export_traces(out, after=first.cursor)
+    assert second.traces == 1 and _trace_ids(out) == [_tid(3)]
+
+
+async def test_seq_never_reused_after_delete_session(db: Path, tmp_path: Path) -> None:
+    await _probe_after_delete(db, tmp_path, "session")
+
+
+async def test_seq_never_reused_after_purge_spans(db: Path, tmp_path: Path) -> None:
+    await _probe_after_delete(db, tmp_path, "purge")
+
+
+async def test_seq_never_reused_after_expiry_sweep(db: Path, tmp_path: Path) -> None:
+    await _probe_after_delete(db, tmp_path, "expired")
+
+
+async def test_concurrent_processes_get_distinct_increasing_seqs(db: Path) -> None:
+    store = await manager.get_store()
+    await _put(_span(_tid(9), _sid(9)))
+    code = (
+        "import sys\\n"
+        "from logpose.store.sqlite import write_spans_blocking\\n"
+        "from tests.test_tracing_export import _span\\n"
+        "w = sys.argv[2]\\n"
+        "for i in range(20):\\n"
+        "    write_spans_blocking(sys.argv[1], [_span(f'{w}{i:031x}', f'{i:016x}')], timeout=30)\\n"
+    )
+    procs = [
+        subprocess.Popen([sys.executable, "-c", code.replace("\\n", "\n"), str(db), w])
+        for w in "ab"
+    ]
+    assert [p.wait() for p in procs] == [0, 0]
+    seqs = [seq async for seq, _ in store.read_root_spans()]
+    assert seqs == sorted(seqs) and len(set(seqs)) == 41

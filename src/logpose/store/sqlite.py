@@ -65,7 +65,8 @@ _MIGRATIONS: list[list[str]] = [
         "CREATE INDEX logpose_spans_run ON logpose_spans (run_id)",
         "CREATE INDEX logpose_spans_session ON logpose_spans (session_id)",
         "CREATE INDEX logpose_spans_start ON logpose_spans (start_ns)",
-        "CREATE INDEX logpose_spans_seq ON logpose_spans (export_seq)",
+        "CREATE TABLE logpose_counters (name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
+        "INSERT INTO logpose_counters (name, value) VALUES ('export_seq', 0)",
         "CREATE INDEX logpose_spans_root_seq ON logpose_spans (export_seq) "
         "WHERE parent_span_id IS NULL",
         "CREATE INDEX logpose_spans_root_start ON logpose_spans (start_ns) "
@@ -108,7 +109,9 @@ _SPAN_INSERT = (
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
     f"ON CONFLICT(trace_id, span_id) DO UPDATE SET {_SPAN_UPDATE}"
 )
-_MAX_SEQ = "SELECT COALESCE(MAX(export_seq), 0) FROM logpose_spans"
+# Never decreases, so deleting spans cannot make a later span reuse a handed-out number.
+_GET_SEQ = "SELECT value FROM logpose_counters WHERE name = 'export_seq'"
+_SET_SEQ = "UPDATE logpose_counters SET value = ? WHERE name = 'export_seq'"
 
 
 def _span_row(sp: SpanRecord) -> tuple[Any, ...]:
@@ -144,7 +147,8 @@ def write_spans_blocking(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            base = conn.execute(_MAX_SEQ).fetchone()[0]
+            base = conn.execute(_GET_SEQ).fetchone()[0]
+            conn.execute(_SET_SEQ, (base + len(spans),))
             conn.executemany(
                 _SPAN_INSERT,
                 [(*_span_row(sp), base + i) for i, sp in enumerate(spans, 1)],
@@ -700,9 +704,10 @@ class SQLiteStore:
         rows = [_span_row(sp) for sp in spans]
 
         async def run(db: aiosqlite.Connection) -> None:
-            async with db.execute(_MAX_SEQ) as cur:
+            async with db.execute(_GET_SEQ) as cur:
                 row = await cur.fetchone()
             base = int(row[0]) if row else 0
+            await (await db.execute(_SET_SEQ, (base + len(rows),))).close()
             cur2 = await db.executemany(
                 _SPAN_INSERT, [(*r, base + i) for i, r in enumerate(rows, 1)]
             )
@@ -780,7 +785,6 @@ class SQLiteStore:
         where = ["parent_span_id IS NULL"]
         params: list[Any] = []
         for clause, value in (
-            ("export_seq > ?", after_seq),
             ("start_ns >= ?", since_ns),
             ("start_ns <= ?", until_ns),
             ("session_id = ?", session_id),
