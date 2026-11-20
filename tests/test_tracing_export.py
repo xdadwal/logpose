@@ -324,7 +324,7 @@ async def _probe_after_delete(db: Path, tmp_path: Path, wipe: str) -> None:
     async with store.session("gone"):
         pass
     old = T0
-    await _put(_span(_tid(1), _sid(1), session="keep", start=T0 + 5))
+    await _put(_span(_tid(1), _sid(1), session="keep", start=T0 + 5_000_000))
     await _put(
         _span(_tid(2), _sid(20), parent=_sid(2), session="gone", start=old),
         _span(_tid(2), _sid(2), session="gone", start=old),

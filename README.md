@@ -1021,7 +1021,8 @@ deleted = await agent.purge_traces(older_than=timedelta(days=30))
 `purge_traces` deletes whole traces whose root span started more than `older_than`
 ago, in every session, plus orphan spans (no root stored) that started before the
 cutoff, and returns the span count. Run records stay, so a purged `run_id` still
-cannot be reused.
+cannot be reused. A cutoff shorter than a still-running run can remove that run's
+already-written child spans, leaving a partial trace.
 
 ### Convention status
 
