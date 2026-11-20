@@ -46,6 +46,7 @@ from logpose import (
     stream_sync,
     tool,
 )
+from logpose.guardrails import GuardrailInput, GuardrailVerdict
 from logpose.providers.base import CompletionRequest, Provider, ProviderEvent
 from logpose.sync import _RUNNERS
 from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
@@ -188,6 +189,23 @@ def test_run_sync_returns_the_result() -> None:
     assert result.iterations == 1
     assert provider.call_count == 1
     assert provider.last_request.messages[0].text == "hi"
+
+
+def test_run_sync_blocked_returns_placeholder() -> None:
+    def deny(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict.block("off_topic", "Billing only.", reason="r")
+
+    agent, provider = _fresh_agent(ScriptedTurn.text("never"), input_guardrails=[deny])
+    try:
+        result = run_sync(agent, "tell me a story")
+    finally:
+        close_sync(agent)
+
+    assert result.text == "Billing only."
+    assert result.stop_reason == "refusal"
+    assert result.guardrail is not None
+    assert result.guardrail.category == "off_topic"
+    assert provider.call_count == 0
 
 
 def test_run_sync_executes_tools_and_aggregates_usage() -> None:
