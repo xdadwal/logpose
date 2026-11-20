@@ -79,6 +79,8 @@ import inspect
 import json
 import logging
 import math
+import os
+import re
 import time
 import traceback
 from collections.abc import (
@@ -95,6 +97,7 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from time import monotonic
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
 from uuid import uuid4
 
@@ -187,6 +190,15 @@ from logpose.runtime import (
     current_runtime_context,
 )
 from logpose.tools import ToolDef
+from logpose.tracing.spans import (
+    _NO_TRACE,
+    SUMMARY_PURPOSE,
+    Tracing,
+    _MemorySink,
+    _SpanBuilder,
+    _SpanSink,
+    tracing_from_env,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - store modules import this one
     from logpose.store.base import Outcome, SessionHandle, SessionStore
@@ -263,6 +275,12 @@ SESSION_EXIT_TIMEOUT = 5.0
 """Seconds a session run's exit (record the run, save, release) may take once shielded."""
 
 _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
+_TRACE_LOGGER = logging.getLogger("logpose.trace")
+
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+RunMetadata = Mapping[str, Union[str, int, float, bool]]  # noqa: UP007
+"""App-supplied labels for one run (``run(..., metadata=...)``)."""
 
 _M = TypeVar("_M", bound=BaseModel)
 
@@ -554,6 +572,7 @@ class Agent:
         pointer_min_chars: int = DEFAULT_POINTER_MIN_CHARS,
         input_guardrails: Sequence[InputGuardrail] = (),
         guardrail_mode: GuardrailMode = "blocking",
+        tracing: Tracing | None | _Unset = _UNSET,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -660,6 +679,10 @@ class Agent:
                 deltas are held back until the guards allow, and no tool runs
                 before then; on a block the turn is cancelled and the run ends
                 exactly as in blocking mode, leaving the conversation as it was.
+            tracing: OpenTelemetry GenAI tracing settings. Omitted, the
+                environment decides: ``LOGPOSE_TRACE`` (``1``/``true``/``yes``)
+                turns it on and ``LOGPOSE_TRACE_CONTENT`` adds content capture.
+                ``None`` turns tracing off whatever the environment says.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -746,6 +769,12 @@ class Agent:
                 f"guardrail_mode must be one of {', '.join(map(repr, _GUARDRAIL_MODES))}, "
                 f"got {guardrail_mode!r}."
             )
+        if tracing is _UNSET:
+            resolved_tracing = tracing_from_env()
+        elif tracing is None or isinstance(tracing, Tracing):
+            resolved_tracing = tracing
+        else:
+            raise LogposeError(f"tracing must be a Tracing or None, got {type(tracing).__name__}.")
         if (
             isinstance(session_wait, bool)
             or not isinstance(session_wait, (int, float))
@@ -821,6 +850,9 @@ class Agent:
         self.input_guardrails: tuple[InputGuardrail, ...] = tuple(input_guardrails)
         self.guardrail_mode: GuardrailMode = guardrail_mode
         self._uses_store = False
+        self.tracing: Tracing | None = resolved_tracing
+        # Where finished spans go. In-memory until the store writer replaces it.
+        self._trace_sink: _SpanSink | None = _MemorySink() if resolved_tracing is not None else None
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -871,6 +903,8 @@ class Agent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> RunResult[_M]: ...
 
     @overload
@@ -884,6 +918,8 @@ class Agent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> RunResult[Any]: ...
 
     async def run(
@@ -896,6 +932,8 @@ class Agent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> RunResult[Any]:
         """Run the loop to completion and return its result.
 
@@ -920,6 +958,14 @@ class Agent:
                 with ``session_id``.
             session: A handle from an open :meth:`session` block to run on. The
                 run is recorded at once; messages are saved when the block exits.
+            metadata: Labels for this run (``str`` keys; ``str``, ``int``,
+                ``float`` or ``bool`` values). Readable through
+                :func:`~logpose.runtime.current_runtime_context`, stored on the
+                run record and on trace spans as ``logpose.metadata.*``.
+            run_id: Use this run ID (``[A-Za-z0-9._-]{1,128}``) instead of a
+                generated one, everywhere the run ID appears. With tracing or a
+                session, an ID already recorded raises ``LogposeError`` before
+                any guard or provider call.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -948,6 +994,8 @@ class Agent:
             session_id=session_id,
             session_metadata=session_metadata,
             session=session,
+            metadata=metadata,
+            run_id=run_id,
         )
         async for event in events:
             if isinstance(event, RunEnd):
@@ -966,6 +1014,8 @@ class Agent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> AsyncIterator[Event]:
         """Run the loop, yielding events as they happen.
 
@@ -993,6 +1043,8 @@ class Agent:
                 use :meth:`session` to learn that before streaming.
             session_metadata: As for :meth:`run`.
             session: As for :meth:`run`.
+            metadata: As for :meth:`run`.
+            run_id: As for :meth:`run`.
 
         Returns:
             An async iterator of :data:`~logpose.events.Event` values.
@@ -1001,7 +1053,8 @@ class Agent:
             LogposeError: If ``prompt`` is not a supported type, if there is
                 nothing to send, if the output options are invalid or
                 conflict with ``extra["response_format"]``, or if the session
-                arguments are invalid or combined. Iterating can raise
+                arguments are invalid or combined, or if ``metadata`` or
+                ``run_id`` is invalid. Iterating can raise
                 the same errors :meth:`run` documents, including whatever
                 ``on_tool_call`` raises.
         """
@@ -1027,6 +1080,8 @@ class Agent:
             raise LogposeError(f"Pass at most one of {', '.join(given)}.")
         if session_metadata is not None and session_id is None:
             raise LogposeError("session_metadata is only valid with session_id.")
+        run_metadata = _check_run_metadata(metadata)
+        _check_run_id(run_id)
         first = _as_message(prompt) if prompt is not None else None
         if session_id is not None:
             from logpose.store.base import validate_session_id
@@ -1038,17 +1093,33 @@ class Agent:
                 resolved_retries,
                 session_id=session_id,
                 metadata=_check_metadata(session_metadata),
+                run_id=run_id,
+                run_metadata=run_metadata,
             )
         if session is not None:
             self._active_store(session)
             if first is None and not session.conversation.messages:
                 raise LogposeError("Nothing to send: pass a prompt, or a session with history.")
-            return self._session_loop(first, resolved_type, resolved_retries, handle=session)
+            return self._session_loop(
+                first,
+                resolved_type,
+                resolved_retries,
+                handle=session,
+                run_id=run_id,
+                run_metadata=run_metadata,
+            )
         if first is None and not (conversation is not None and conversation.messages):
             raise LogposeError(
                 "Nothing to send: pass a prompt, or a conversation that already has messages."
             )
-        return self._loop(first, conversation, resolved_type, resolved_retries)
+        return self._loop(
+            first,
+            conversation,
+            resolved_type,
+            resolved_retries,
+            run_id=run_id,
+            run_metadata=run_metadata,
+        )
 
     def session(
         self, session_id: str, *, metadata: Mapping[str, str] | None = None
@@ -1149,6 +1220,8 @@ class Agent:
         session_id: str | None = None,
         metadata: dict[str, str] | None = None,
         handle: SessionHandle | None = None,
+        run_id: str | None = None,
+        run_metadata: dict[str, str | int | float | bool] | None = None,
     ) -> AsyncIterator[Event]:
         """Run :meth:`_loop` on a session and record the run on every outcome.
 
@@ -1164,6 +1237,8 @@ class Agent:
         if handle is None:
             assert session_id is not None
             store = await self._store()
+            # Before the lease: a duplicate run ID touches nothing.
+            await self._reject_duplicate_run_id(run_id, store)
             cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
             handle = await cm.__aenter__()
             manager._ACTIVE_HANDLES[handle] = store
@@ -1173,8 +1248,14 @@ class Agent:
                 raise error
         else:
             store = self._active_store(handle)
+            manager._RUNNING.add(handle)
+            try:
+                await self._reject_duplicate_run_id(run_id, store)
+            except BaseException:
+                manager._RUNNING.discard(handle)
+                raise
         manager._RUNNING.add(handle)
-        stats = _RunStats()
+        stats = _RunStats(metadata=run_metadata)
         started_ms = _now_ms()
         run_end: RunEnd | None = None
         try:
@@ -1185,6 +1266,10 @@ class Agent:
                 output_retries,
                 stats,
                 guard_metadata=handle.metadata,
+                run_id=run_id,
+                run_metadata=run_metadata,
+                session_id=handle.id,
+                run_id_checked=True,
             )
             try:
                 async for event in inner:
@@ -1241,6 +1326,7 @@ class Agent:
             cache_read_input_tokens=stats.usage.cache_read_input_tokens,
             cache_creation_input_tokens=stats.usage.cache_creation_input_tokens,
             error_type=error_type,
+            metadata=stats.metadata,
         )
         try:
             await store.record_run(record)
@@ -1367,6 +1453,98 @@ class Agent:
         """Return an opaque identifier without embedding application data."""
         return f"{kind}_{uuid4().hex}"
 
+    # -- tracing ------------------------------------------------------------
+
+    async def _reject_duplicate_run_id(
+        self, run_id: str | None, store: SessionStore | None
+    ) -> None:
+        """Raise if a caller-supplied ``run_id`` was already recorded.
+
+        Checked only with a session store or tracing; generated IDs are unique.
+        A tracing sink that cannot answer is logged and treated as "unknown".
+        """
+        if run_id is None:
+            return
+        exists = await store.run_id_exists(run_id) if store is not None else False
+        if not exists and self._trace_sink is not None:
+            try:
+                exists = await self._trace_sink.run_id_exists(run_id)
+            except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+                _TRACE_LOGGER.warning(
+                    "could not check run_id against stored traces: %s", type(exc).__name__
+                )
+        if exists:
+            raise LogposeError(f"run_id {run_id!r} already exists; every run needs a fresh run_id.")
+
+    def _trace_secrets(self) -> tuple[str, ...]:
+        """Configured credentials to scrub from captured content."""
+        found: list[str] = []
+        for owner in (self.provider, *self.input_guardrails):
+            getter = getattr(owner, "_secrets", None)
+            if callable(getter):
+                with contextlib.suppress(Exception):
+                    found.extend(s for s in getter() if isinstance(s, str) and s)
+        env_key = os.environ.get("LOGPOSE_API_KEY", "").strip()
+        if env_key:
+            found.append(env_key)
+        return tuple(dict.fromkeys(found))
+
+    def _trace_config(self) -> dict[str, Any]:
+        """The ``logpose.config.*`` snapshot: settings only, never content."""
+        policy = self.retry_policy
+        return {
+            "max_iterations": self.max_iterations,
+            "max_tokens": self._max_tokens(),
+            "run_timeout": self.run_timeout,
+            "provider_turn_timeout": self.provider_turn_timeout,
+            "tool_timeout": self.tool_timeout,
+            "max_concurrent_tools": self.max_concurrent_tools,
+            "retry.max_attempts": policy.max_attempts,
+            "retry.initial_delay": policy.initial_delay,
+            "retry.backoff_multiplier": policy.backoff_multiplier,
+            "retry.max_delay": policy.max_delay,
+            "retry.jitter": policy.jitter,
+            "retry.max_retry_after": policy.max_retry_after,
+            "tools": list(self._tools_by_name),
+            "guardrails": [_guard_name(g) for g in self.input_guardrails],
+            "guardrail_mode": self.guardrail_mode,
+            "context_policy": (
+                "builtin"
+                if self._context_policy_is_default
+                else "none"
+                if self.context_policy is None
+                else "custom"
+            ),
+            "input_budget": self.input_budget,
+        }
+
+    def _new_trace(
+        self,
+        run_id: str,
+        session_id: str | None,
+        metadata: Mapping[str, str | int | float | bool] | None,
+    ) -> _SpanBuilder:
+        """A span builder for one run, or the do-nothing one when tracing is off."""
+        if self.tracing is None or self._trace_sink is None:
+            return _NO_TRACE
+        try:
+            return _SpanBuilder(
+                tracing=self.tracing,
+                sink=self._trace_sink,
+                run_id=run_id,
+                session_id=session_id,
+                provider=self.provider_name,
+                model=self._model(),
+                metadata=metadata,
+                config=self._trace_config(),
+                system=self.system,
+                tool_specs=self._specs,
+                secrets=self._trace_secrets(),
+            )
+        except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+            _TRACE_LOGGER.warning("tracing disabled for run %s: %s", run_id, type(exc).__name__)
+            return _NO_TRACE
+
     # -- the loop -----------------------------------------------------------
 
     async def _loop(
@@ -1378,6 +1556,70 @@ class Agent:
         stats: _RunStats | None = None,
         *,
         guard_metadata: Mapping[str, str] | None = None,
+        run_id: str | None = None,
+        run_metadata: Mapping[str, str | int | float | bool] | None = None,
+        session_id: str | None = None,
+        run_id_checked: bool = False,
+    ) -> AsyncIterator[Event]:
+        """Run :meth:`_loop_body` inside the run's ``invoke_agent`` span.
+
+        Resolves the run ID (checking a caller-supplied one unless the session
+        path already did), opens the span before anything else happens, and
+        closes it with the run's outcome however the run ends.
+        """
+        if not run_id_checked:
+            await self._reject_duplicate_run_id(run_id, None)
+        resolved_id = run_id or self._runtime_id("run")
+        if stats is None:
+            stats = _RunStats()
+        run_stats = stats
+        trace = self._new_trace(resolved_id, session_id, run_metadata)
+        trace.start_run()
+        body = self._loop_body(
+            prompt,
+            conversation,
+            output_type,
+            output_retries,
+            run_stats,
+            guard_metadata=guard_metadata,
+            run_id=resolved_id,
+            run_metadata=run_metadata,
+            trace=trace,
+        )
+        error: BaseException | None = None
+        try:
+            async for event in body:
+                if isinstance(event, RunEnd):
+                    blocked = event.result.guardrail is not None
+                    trace.end_run(
+                        outcome="blocked" if blocked else "completed",
+                        iterations=run_stats.iterations,
+                        usage=run_stats.usage,
+                    )
+                yield event
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            await _aclose(body)
+            outcome = _outcome(error)[0] if error is not None else "cancelled"
+            # A no-op when RunEnd already closed the span.
+            trace.end_run(
+                outcome=outcome, iterations=run_stats.iterations, usage=run_stats.usage, error=error
+            )
+
+    async def _loop_body(
+        self,
+        prompt: Message | None,
+        conversation: Conversation | None,
+        output_type: type[BaseModel] | None = None,
+        output_retries: int = 0,
+        stats: _RunStats | None = None,
+        *,
+        guard_metadata: Mapping[str, str] | None = None,
+        run_id: str | None = None,
+        run_metadata: Mapping[str, str | int | float | bool] | None = None,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> AsyncIterator[Event]:
         """Drive provider turns and tool executions until the run ends.
 
@@ -1389,6 +1631,9 @@ class Agent:
             stats: Run-scoped accumulator kept current with the run id, usage and
                 iterations, so a caller can read them whatever the outcome.
             guard_metadata: Session metadata handed to input guardrails.
+            run_id: The run ID; generated when omitted.
+            run_metadata: App-supplied run metadata for the runtime context.
+            trace: The run's span builder (a no-op when tracing is off).
 
         Yields:
             :data:`~logpose.events.Event` values, ending with
@@ -1406,7 +1651,10 @@ class Agent:
         model = self._model()
         response_format = response_format_for(output_type) if output_type is not None else None
         run_context = RuntimeContext(
-            run_id=self._runtime_id("run"), provider=self.provider_name, model=model
+            run_id=run_id or self._runtime_id("run"),
+            provider=self.provider_name,
+            model=model,
+            metadata=MappingProxyType(dict(run_metadata)) if run_metadata else None,
         )
         started_at = monotonic()
         run_deadline = started_at + self.run_timeout if self.run_timeout is not None else None
@@ -1453,6 +1701,8 @@ class Agent:
             # allow reports none, as a blocking-mode block does.
             nonlocal unvetted, iterations
             if unvetted:
+                # The racing first turn's spans are kept, marked discarded.
+                trace.discard()
                 del history[current_start:]
                 unvetted = False
                 iterations = 0
@@ -1506,13 +1756,14 @@ class Agent:
                         run_deadline=run_deadline,
                         add_usage=add_usage,
                         force_summary=rejection is not None,
+                        trace=trace,
                     )
                 if rejection is not None and shape == _summary_shape(compaction):
                     # Nothing more could be summarized (or the summary call
                     # failed): the same request would be rejected again.
                     raise rejection
                 done: CompletionDone | None = None
-                turn_stream = self._provider_turn(request, turn_context, run_deadline)
+                turn_stream = self._provider_turn(request, turn_context, run_deadline, trace)
                 try:
                     async for event in turn_stream:
                         if isinstance(event, ProviderTextDelta):
@@ -1558,6 +1809,7 @@ class Agent:
                         context=run_context,
                         add_usage=add_usage,
                         tiers="sync" if parallel else "all",
+                        trace=trace,
                     )
                 if blocked is not None:
                     for item in blocked_end(blocked, reply):
@@ -1614,9 +1866,16 @@ class Agent:
                     assert guard_input is not None
                     diagnostics = self.last_context_diagnostics
                     buffer: asyncio.Queue[object] = asyncio.Queue()
+                    # The turn's spans wait for the verdict: kept on allow,
+                    # marked discarded on block.
+                    trace.hold()
                     guard_task = asyncio.ensure_future(
                         self._run_guardrails(
-                            guard_input, context=run_context, add_usage=add_usage, tiers="async"
+                            guard_input,
+                            context=run_context,
+                            add_usage=add_usage,
+                            tiers="async",
+                            trace=trace,
                         )
                     )
                     producer = asyncio.ensure_future(_pump(turn_events(), buffer))
@@ -1632,6 +1891,7 @@ class Agent:
                                 yield item
                             return
                         unvetted = False
+                        trace.release()
                         if conversation is not None and self._context_policy_is_default:
                             conversation._compaction = compaction
                         while True:
@@ -1706,7 +1966,7 @@ class Agent:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
                     async with _run_budget(run_deadline):
-                        results = await self._execute(calls, turn_context, history)
+                        results = await self._execute(calls, turn_context, history, trace)
                     # ONE user message holding every result, in request order —
                     # appended before the results are yielded, so a consumer that
                     # walks away mid-results still leaves a replayable history.
@@ -1810,6 +2070,7 @@ class Agent:
         context: RuntimeContext,
         add_usage: Callable[[Usage], None],
         tiers: Literal["all", "sync", "async"] = "all",
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> tuple[GuardrailResult | None, str]:
         """Run the input guardrails in two tiers.
 
@@ -1876,6 +2137,17 @@ class Agent:
                 guard_scores=scores_json,
                 exception_type=type(error).__name__ if error is not None else None,
             )
+            trace.guardrail(
+                name=name,
+                allowed=verdict.allowed,
+                category=category,
+                scores_json=scores_json,
+                reason=verdict.reason,
+                usage=verdict.usage,
+                error_type=type(error).__name__ if error is not None else None,
+                duration=monotonic() - began,
+                text=lambda: guard_text(inp.message),
+            )
             if verdict.allowed:
                 return None
             assert category is not None
@@ -1935,8 +2207,12 @@ class Agent:
         request: CompletionRequest,
         turn_context: RuntimeContext,
         run_deadline: float | None = None,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> AsyncIterator[ProviderEvent]:
         """Stream one provider turn with safe, pre-delta retries.
+
+        Each attempt is one ``chat`` span; retries are siblings, and only the
+        first attempt records the input messages.
 
         A retry can replay a request only while nothing has reached the caller.
         Once a text or reasoning delta was yielded, replaying would duplicate
@@ -1953,12 +2229,16 @@ class Agent:
                 streaming contract, exhausts retry attempts, or fails after an
                 emitted delta.
         """
+        first_chat = None
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             done: CompletionDone | None = None
             emitted = False
             attempt_context = replace(turn_context, attempt_id=self._runtime_id("attempt"))
             started_at = monotonic()
             self._emit_runtime("provider.attempt.started", context=attempt_context)
+            chat = trace.start_chat(request, attempt, first=first_chat)
+            if attempt == 1:
+                first_chat = chat
             provider_token = _set_runtime_context(attempt_context)
             try:
                 provider_stream = self.provider.stream(request)
@@ -2011,6 +2291,7 @@ class Agent:
                         exception_type=type(exc).__name__,
                         status_code=exc.status_code,
                     )
+                    trace.end_chat(chat, error=exc)
                     raise exc from None
                 delay = self.retry_policy.delay(attempt)
                 if _outlasts_run(delay, run_deadline):
@@ -2022,6 +2303,7 @@ class Agent:
                         exception_type=type(exc).__name__,
                         status_code=exc.status_code,
                     )
+                    trace.end_chat(chat, error=exc)
                     raise exc from None
                 self._emit_runtime(
                     "provider.attempt.failed",
@@ -2036,6 +2318,8 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
+                trace.retry_scheduled(chat, delay)
+                trace.end_chat(chat, error=exc)
                 await asyncio.sleep(delay)
                 continue
             except ProviderError as exc:
@@ -2051,6 +2335,7 @@ class Agent:
                         exception_type=type(exc).__name__,
                         status_code=exc.status_code,
                     )
+                    trace.end_chat(chat, error=exc)
                     raise
                 delay = self.retry_policy.delay(attempt, retry_after=exc.retry_after)
                 if _outlasts_run(delay, run_deadline):
@@ -2062,6 +2347,7 @@ class Agent:
                         exception_type=type(exc).__name__,
                         status_code=exc.status_code,
                     )
+                    trace.end_chat(chat, error=exc)
                     raise
                 self._emit_runtime(
                     "provider.attempt.failed",
@@ -2076,9 +2362,12 @@ class Agent:
                     context=attempt_context,
                     retry_delay_seconds=delay,
                 )
+                trace.retry_scheduled(chat, delay)
+                trace.end_chat(chat, error=exc)
                 await asyncio.sleep(delay)
                 continue
-            except _RunExpired:
+            except _RunExpired as exc:
+                trace.end_chat(chat, error=exc)
                 raise
             except Exception as exc:
                 self._emit_runtime(
@@ -2088,6 +2377,11 @@ class Agent:
                     error_id=self._runtime_id("error"),
                     exception_type=type(exc).__name__,
                 )
+                trace.end_chat(chat, error=exc)
+                raise
+            except BaseException as exc:
+                # Cancelled, or the consumer closed the stream mid-turn.
+                trace.end_chat(chat, error=exc)
                 raise
             finally:
                 await _aclose_with_runtime_context(provider_stream, attempt_context)
@@ -2104,7 +2398,9 @@ class Agent:
                     error_id=self._runtime_id("error"),
                     exception_type=type(error).__name__,
                 )
+                trace.end_chat(chat, error=error)
                 raise error
+            trace.end_chat(chat, done=done)
             self._emit_runtime(
                 "provider.attempt.completed",
                 context=attempt_context,
@@ -2146,6 +2442,7 @@ class Agent:
         run_deadline: float | None = None,
         add_usage: Callable[[Usage], None] | None = None,
         force_summary: bool = False,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> tuple[CompletionRequest, int]:
         """Await selection before inference; isolate policy mutation from canonical data.
 
@@ -2165,6 +2462,8 @@ class Agent:
             force_summary: Summarize (or extend the summary) even below the
                 threshold; set after the provider rejected the request for
                 exceeding its context length.
+            trace: The run's span builder; receives the context diagnostics,
+                the compaction span and the summary call's ``chat`` span.
 
         Returns:
             The request to send, and its raw (uncalibrated) token estimate on
@@ -2174,6 +2473,7 @@ class Agent:
         if response_format is not None:
             request.extra["response_format"] = copy.deepcopy(response_format)
         self.last_context_diagnostics = {}
+        trace.set_context({})
         if self._context_policy_is_default:
             return await self._builtin_context(
                 request,
@@ -2185,6 +2485,7 @@ class Agent:
                 run_deadline=run_deadline,
                 add_usage=add_usage,
                 force=force_summary,
+                trace=trace,
             )
         if self.context_policy is None:
             return request, 0
@@ -2213,6 +2514,7 @@ class Agent:
             ):
                 raise TypeError("Diagnostics must contain metadata scalars")
             self.last_context_diagnostics = dict(prepared.diagnostics)
+            trace.set_context(prepared.diagnostics)
             return (
                 replace(
                     request,
@@ -2240,6 +2542,7 @@ class Agent:
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
         force: bool = False,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> tuple[CompletionRequest, int]:
         """Shape a request with the built-in policy: pointers, then the summary.
 
@@ -2260,6 +2563,7 @@ class Agent:
             ContextOverflowError: If the request cannot be made to fit the
                 window (``context_window − max_tokens``).
         """
+        started_ns = time.time_ns()
         messages = request.messages
         applied = 0
         if self._recall_active and current_start:
@@ -2335,7 +2639,7 @@ class Agent:
                 failure: ProviderError | None = None
                 try:
                     summary = await self._summarize(
-                        span, previous, context, run_deadline, add_usage
+                        span, previous, context, run_deadline, add_usage, trace
                     )
                 except ProviderError as exc:
                     summary, failure = None, exc
@@ -2379,7 +2683,17 @@ class Agent:
             "input_budget": self.input_budget,
         }
         self.last_context_diagnostics = diagnostics
+        trace.set_context(diagnostics)
         if applied or summarized or attempted:
+            trace.compaction(
+                start_ns=started_ns,
+                pointers=applied,
+                summarized=summarized,
+                before=before,
+                after=after,
+                budget=self.input_budget,
+                summary=state.summary,
+            )
             self._emit_runtime(
                 "context.compacted",
                 context=context,
@@ -2400,8 +2714,11 @@ class Agent:
         context: RuntimeContext | None,
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> str | None:
         """Make the summary call: same provider and model, no tools, retried.
+
+        Each attempt is a ``chat`` span marked ``logpose.chat.purpose="summary"``.
 
         Not a loop turn: it does not count toward ``max_iterations`` and emits
         no ``provider.attempt.*`` events. Its usage goes to ``add_usage``. The
@@ -2433,9 +2750,13 @@ class Agent:
         attempt_context = context or RuntimeContext(
             run_id=self._runtime_id("run"), provider=self.provider_name, model=self._model()
         )
+        first_chat = None
         for attempt in range(1, self.retry_policy.max_attempts + 1):
             turn_timeout = self._turn_timeout()
             turn_deadline = monotonic() + turn_timeout if turn_timeout is not None else None
+            chat = trace.start_chat(request, attempt, first=first_chat, purpose=SUMMARY_PURPOSE)
+            if attempt == 1:
+                first_chat = chat
             token = _set_runtime_context(attempt_context)
             try:
                 stream = self.provider.stream(request)
@@ -2462,19 +2783,27 @@ class Agent:
                 )
             except ProviderError as error:
                 failure = error
+            except BaseException as exc:
+                trace.end_chat(chat, error=exc)
+                raise
             finally:
                 await _aclose_with_runtime_context(stream, attempt_context)
             if failure is None:
+                trace.end_chat(chat, done=done)
                 if done is not None and add_usage is not None:
                     add_usage(done.usage)
                 text = done.message.text.strip() if done is not None else ""
                 return text or None
             failure.attempts = attempt
             if not failure.retryable or attempt >= self.retry_policy.max_attempts:
+                trace.end_chat(chat, error=failure)
                 raise failure
             delay = self.retry_policy.delay(attempt, retry_after=failure.retry_after)
             if _outlasts_run(delay, run_deadline):
+                trace.end_chat(chat, error=failure)
                 raise failure
+            trace.retry_scheduled(chat, delay)
+            trace.end_chat(chat, error=failure)
             await asyncio.sleep(delay)
         raise AssertionError(  # pragma: no cover
             "Retry loop exhausted without returning or raising."
@@ -2565,6 +2894,7 @@ class Agent:
         calls: Sequence[ToolUseBlock],
         turn_context: RuntimeContext,
         history: Sequence[Message] = (),
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> list[ToolResultBlock]:
         """Gate every requested call, then run the survivors concurrently.
 
@@ -2576,26 +2906,31 @@ class Agent:
             calls: The tool-use blocks from the assistant turn, in wire order.
             turn_context: Correlation context of the turn that requested them.
             history: The run's full history, readable by ``recall_tool_output``.
+            trace: The run's span builder; one ``execute_tool`` span per call.
 
         Returns:
             One :class:`~logpose.messages.ToolResultBlock` per call, in the same
             order. Failures are reported as error results, never raised.
         """
-        blocked = await self._gate(calls)
+        blocked = await self._gate(calls, trace)
         runnable = [(index, call) for index, call in enumerate(calls) if index not in blocked]
         queued: list[tuple[int, ToolUseBlock, float]] = []
+        spans: dict[int, Any] = {}
         for index, call in runnable:
             queued_at = monotonic()
             context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
             self._emit_runtime("tool.queued", context=context)
+            spans[index] = trace.start_tool(call)
             queued.append((index, call, queued_at))
         # Each task copies the current context at creation, so the recall tool
         # sees this run's history even while other runs share the agent.
         history_token = _RUN_HISTORY.set(history)
         try:
             tasks = [
-                asyncio.create_task(self._invoke(call, queued_at, turn_context))
-                for _, call, queued_at in queued
+                asyncio.create_task(
+                    self._invoke(call, queued_at, turn_context, spans[index], trace)
+                )
+                for index, call, queued_at in queued
             ]
         finally:
             _RUN_HISTORY.reset(history_token)
@@ -2625,7 +2960,9 @@ class Agent:
             results[index] = result
         return [results[index] for index in range(len(calls))]
 
-    async def _gate(self, calls: Sequence[ToolUseBlock]) -> dict[int, ToolResultBlock]:
+    async def _gate(
+        self, calls: Sequence[ToolUseBlock], trace: _SpanBuilder = _NO_TRACE
+    ) -> dict[int, ToolResultBlock]:
         """Offer each call to ``on_tool_call`` and collect the ones it blocked.
 
         Runs one call at a time, in wire order, and entirely before any handler
@@ -2672,14 +3009,20 @@ class Agent:
                 content=outcome.content if outcome.content.strip() else EMPTY_TOOL_RESULT,
                 is_error=outcome.is_error,
             )
+            trace.gate_blocked(call, blocked[index])
         return blocked
 
     async def _invoke(
-        self, call: ToolUseBlock, queued_at: float, turn_context: RuntimeContext
+        self,
+        call: ToolUseBlock,
+        queued_at: float,
+        turn_context: RuntimeContext,
+        span: Any = None,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> ToolResultBlock:
         """Journal approved known tools without converting persistence failures into results."""
         if self.tool_observer is None or call.name not in self._tools_by_name:
-            return await self._invoke_handler(call, queued_at, turn_context)
+            return await self._invoke_handler(call, queued_at, turn_context, span, trace)
         context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
         try:
             await self.tool_observer(ToolObservation("intent", context, call.model_copy(deep=True)))
@@ -2688,7 +3031,7 @@ class Agent:
         except Exception as exc:
             raise ToolObservationError("intent") from exc
         try:
-            result = await self._invoke_handler(call, queued_at, turn_context)
+            result = await self._invoke_handler(call, queued_at, turn_context, span, trace)
         except asyncio.CancelledError:
             # Run deadline or abandoned stream: close the journal entry so it
             # matches the error result the conversation records for this call.
@@ -2720,7 +3063,12 @@ class Agent:
         return result
 
     async def _invoke_handler(
-        self, call: ToolUseBlock, queued_at: float, turn_context: RuntimeContext
+        self,
+        call: ToolUseBlock,
+        queued_at: float,
+        turn_context: RuntimeContext,
+        span: Any = None,
+        trace: _SpanBuilder = _NO_TRACE,
     ) -> ToolResultBlock:
         """Execute one tool call and render the outcome for the model.
 
@@ -2755,10 +3103,12 @@ class Agent:
                     result_bytes=len(result.content.encode()),
                     exception_type="UnknownTool",
                 )
+                trace.end_tool(span, result, error_type="UnknownTool")
                 return result
             async with self._tool_slots:
                 started_at = monotonic()
-                self._emit_runtime("tool.started", queue_seconds=started_at - queued_at)
+                queue_seconds = started_at - queued_at
+                self._emit_runtime("tool.started", queue_seconds=queue_seconds)
                 try:
                     if self.tool_timeout is None:
                         content = await tool_def.invoke(call.input)
@@ -2790,6 +3140,13 @@ class Agent:
                         tool_timed_out=True,
                         result_bytes=len(result.content.encode()),
                     )
+                    trace.end_tool(
+                        span,
+                        result,
+                        queue_seconds=queue_seconds,
+                        timed_out=True,
+                        error_type="TimeoutError",
+                    )
                     return result
                 except ToolExecutionError as exc:
                     error_id = self._runtime_id("toolerr")
@@ -2800,6 +3157,12 @@ class Agent:
                         error_id=error_id,
                         exception_type=type(exc.__cause__ or exc).__name__,
                         result_bytes=len(result.content.encode()),
+                    )
+                    trace.end_tool(
+                        span,
+                        result,
+                        queue_seconds=queue_seconds,
+                        error_type=type(exc.__cause__ or exc).__name__,
                     )
                     return result
                 except Exception as exc:  # noqa: BLE001 - a tool must never crash the loop
@@ -2812,6 +3175,9 @@ class Agent:
                         exception_type=type(exc).__name__,
                         result_bytes=len(result.content.encode()),
                     )
+                    trace.end_tool(
+                        span, result, queue_seconds=queue_seconds, error_type=type(exc).__name__
+                    )
                     return result
             result = ToolResultBlock(
                 tool_use_id=call.id,
@@ -2823,9 +3189,11 @@ class Agent:
                 execution_seconds=monotonic() - started_at,
                 result_bytes=len(result.content.encode()),
             )
+            trace.end_tool(span, result, queue_seconds=queue_seconds)
             return result
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             self._emit_runtime("tool.cancelled")
+            trace.end_tool(span, None, error=exc)
             raise
         finally:
             _reset_runtime_context(token)
@@ -3006,6 +3374,7 @@ class _RunStats:
     run_id: str = ""
     iterations: int = 0
     usage: Usage = field(default_factory=Usage)
+    metadata: dict[str, str | int | float | bool] | None = None
 
 
 def _now_ms() -> int:
@@ -3035,6 +3404,32 @@ def _check_metadata(metadata: Mapping[str, str] | None) -> dict[str, str] | None
     ):
         raise LogposeError("session metadata must be a mapping of str to str.")
     return dict(metadata)
+
+
+def _check_run_metadata(
+    metadata: Mapping[str, str | int | float | bool] | None,
+) -> dict[str, str | int | float | bool] | None:
+    """Copy run metadata after checking keys are ``str`` and values are scalars."""
+    if metadata is None:
+        return None
+    if not isinstance(metadata, Mapping):
+        raise LogposeError(f"metadata must be a mapping, got {type(metadata).__name__}.")
+    checked: dict[str, str | int | float | bool] = {}
+    for key, value in metadata.items():
+        if not isinstance(key, str):
+            raise LogposeError(f"metadata keys must be str, got {type(key).__name__}.")
+        if not isinstance(value, (str, int, float, bool)):
+            raise LogposeError(
+                f"metadata[{key!r}] must be str, int, float or bool, got {type(value).__name__}."
+            )
+        checked[key] = value
+    return checked
+
+
+def _check_run_id(run_id: str | None) -> None:
+    """Raise unless ``run_id`` is ``None`` or matches ``[A-Za-z0-9._-]{1,128}``."""
+    if run_id is not None and (not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id)):
+        raise LogposeError("run_id must match [A-Za-z0-9._-]{1,128}.")
 
 
 async def _exit_session(
@@ -3220,9 +3615,13 @@ async def _aclose_with_runtime_context(
 class _DeadlineExpired(TimeoutError):
     """A ``_deadline`` timer fired (as opposed to a TimeoutError raised by user code)."""
 
+    trace_error_type = "TimeoutError"
+
 
 class _RunExpired(Exception):
     """Internal signal: the whole-run deadline passed. Becomes RunTimeoutError."""
+
+    trace_error_type = "RunTimeoutError"
 
 
 def _remaining(run_deadline: float | None) -> float | None:
