@@ -30,6 +30,7 @@ classifiers = [
 dependencies = [
     "pydantic>=2",
     "httpx",
+    "aiosqlite>=0.22",
 ]
 
 [project.optional-dependencies]

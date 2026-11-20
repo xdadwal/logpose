@@ -297,10 +297,17 @@ def _map_usage(raw: Any) -> Usage:
     details = raw.get("prompt_tokens_details")
     cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
     cached = min(cached, prompt)
+    completion_details = raw.get("completion_tokens_details")
+    reasoning = (
+        int(completion_details.get("reasoning_tokens") or 0)
+        if isinstance(completion_details, dict)
+        else 0
+    )
     return Usage(
         input_tokens=max(prompt - cached, 0),
         output_tokens=int(raw.get("completion_tokens") or 0),
         cache_read_input_tokens=cached,
+        reasoning_tokens=reasoning,
     )
 
 

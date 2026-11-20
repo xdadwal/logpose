@@ -651,3 +651,52 @@ def test_concurrent_callers_share_one_agent_safely() -> None:
     assert len(results) == 6
     assert sorted(results.values()) == sorted(f"answer {i}" for i in range(6))
     assert len(set(map(id, probe.loops))) == 1
+
+
+def test_run_sync_with_session_id_persists(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sqlite3
+
+    from logpose.store import manager
+
+    db = tmp_path / "sync.db"
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(db))
+    manager.reset_stores_for_tests()
+    agent = Agent(FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]), model="m")
+    try:
+        run_sync(agent, "one", session_id="s1", session_metadata={"user": "u"})
+        result = run_sync(agent, "two", session_id="s1")
+        assert result.text == "b"
+        with sqlite3.connect(db) as conn:
+            count = conn.execute("SELECT COUNT(*) FROM logpose_messages").fetchone()[0]
+        assert count == 4
+    finally:
+        close_sync(agent)
+        manager.reset_stores_for_tests()
+
+
+def test_sync_agent_session_context(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from logpose import SessionBusyError, SessionHandle
+    from logpose.store import manager
+
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(tmp_path / "ctx.db"))
+    manager.reset_stores_for_tests()
+    provider = FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")])
+    try:
+        with SyncAgent(Agent(provider, model="m")) as sync_agent:
+            with sync_agent.session("s1", metadata={"k": "v"}) as handle:
+                assert isinstance(handle, SessionHandle)
+                events = list(sync_agent.stream("one", session=handle))
+                assert isinstance(events[-1], RunEnd)
+                with pytest.raises(SessionBusyError):
+                    with sync_agent.session("s1"):
+                        pass  # pragma: no cover
+            result = sync_agent.run("two", session_id="s1")
+            assert result.text == "b"
+            with pytest.raises(ValueError, match="boom"):
+                with sync_agent.session("s1"):
+                    raise ValueError("boom")
+            # lease released after the failing block
+            with sync_agent.session("s1"):
+                pass
+    finally:
+        manager.reset_stores_for_tests()

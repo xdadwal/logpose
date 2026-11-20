@@ -30,11 +30,16 @@ __all__ = [
     "StructuredOutputUnsupportedError",
     "OutputValidationError",
     "OutputRefusalError",
+    "SessionBusyError",
 ]
 
 
 class LogposeError(Exception):
     """Base class for every error raised by logpose."""
+
+
+class SessionBusyError(LogposeError):
+    """Raised when a session already has a run in flight and cannot take another."""
 
 
 class AuthError(LogposeError):

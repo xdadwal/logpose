@@ -43,6 +43,7 @@ from logpose.events import (
 from logpose.lifecycle import ToolObservation
 from logpose.messages import (
     Message,
+    RawBlock,
     RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
@@ -2145,3 +2146,32 @@ async def test_run_timeout_is_not_reported_as_a_provider_failure() -> None:
     failed = [e for e in events if e.name == "provider.attempt.failed"]
     assert all(e.exception_type != "_RunExpired" for e in failed)
     assert events[-1].name == "run.timed_out"
+
+
+def test_conversation_json_round_trip_is_lossless() -> None:
+    conv = Conversation(
+        [
+            Message.user("hi"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(thinking="hmm", signature="sig"),
+                    TextBlock(text="calling"),
+                    ToolUseBlock(id="t1", name="f", input={"a": 1}),
+                    RawBlock(data={"k": [1, 2]}),
+                ],
+            ),
+            Message(
+                role="user",
+                content=[ToolResultBlock(tool_use_id="t1", content="ok", is_error=True)],
+            ),
+        ]
+    )
+    assert Conversation.from_json(conv.to_json()).messages == conv.messages
+
+
+def test_conversation_from_json_rejects_unknown_version() -> None:
+    from logpose.errors import LogposeError
+
+    with pytest.raises(LogposeError, match="version"):
+        Conversation.from_json('{"version": 99, "messages": []}')
