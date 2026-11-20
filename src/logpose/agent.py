@@ -1449,10 +1449,14 @@ class Agent:
         unvetted = False
 
         def drop_unvetted() -> None:
-            nonlocal unvetted
+            # Iterations count only vetted turns: any exit before the guards
+            # allow reports none, as a blocking-mode block does.
+            nonlocal unvetted, iterations
             if unvetted:
                 del history[current_start:]
                 unvetted = False
+                iterations = 0
+                run_stats.iterations = 0
 
         def blocked_end(blocked: GuardrailResult, reply: str) -> Iterator[Event]:
             if output_type is not None:
@@ -1542,18 +1546,25 @@ class Agent:
                     run_id=run_context.run_id,
                 )
             parallel = guard_input is not None and self.guardrail_mode == "parallel"
-            if guard_input is not None and not parallel:
-                # Blocking mode: before the prompt is appended and before any
-                # compaction work, so a blocked run makes no provider call and
-                # leaves the conversation as it was.
+            if guard_input is not None:
+                # Before the prompt is appended and before any compaction work,
+                # so a blocked run makes no provider call and leaves the
+                # conversation as it was. Parallel mode runs only the cheap
+                # synchronous tier here: just the asynchronous one races the
+                # first provider turn.
                 async with _run_budget(run_deadline):
                     blocked, reply = await self._run_guardrails(
-                        guard_input, context=run_context, add_usage=add_usage
+                        guard_input,
+                        context=run_context,
+                        add_usage=add_usage,
+                        tiers="sync" if parallel else "all",
                     )
                 if blocked is not None:
                     for item in blocked_end(blocked, reply):
                         yield item
                     return
+                if parallel and not any(_is_async_guard(g) for g in self.input_guardrails):
+                    parallel = False  # nothing left to race
             if self._context_policy_is_default:
                 if conversation is None:
                     compaction = _CompactionState()
@@ -1604,7 +1615,9 @@ class Agent:
                     diagnostics = self.last_context_diagnostics
                     buffer: asyncio.Queue[object] = asyncio.Queue()
                     guard_task = asyncio.ensure_future(
-                        self._run_guardrails(guard_input, context=run_context, add_usage=add_usage)
+                        self._run_guardrails(
+                            guard_input, context=run_context, add_usage=add_usage, tiers="async"
+                        )
                     )
                     producer = asyncio.ensure_future(_pump(turn_events(), buffer))
                     try:
@@ -1614,8 +1627,6 @@ class Agent:
                             producer.cancel()
                             await asyncio.gather(producer, return_exceptions=True)
                             drop_unvetted()
-                            iterations = 0
-                            stats.iterations = 0
                             self.last_context_diagnostics = diagnostics
                             for item in blocked_end(blocked, reply):
                                 yield item
@@ -1798,6 +1809,7 @@ class Agent:
         *,
         context: RuntimeContext,
         add_usage: Callable[[Usage], None],
+        tiers: Literal["all", "sync", "async"] = "all",
     ) -> tuple[GuardrailResult | None, str]:
         """Run the input guardrails in two tiers.
 
@@ -1816,13 +1828,18 @@ class Agent:
             add_usage: Receives each decided guard's reported usage as soon as
                 it is decided, so it counts even if the run then times out or
                 is cancelled. Usage of a guard cancelled before deciding is lost.
+            tiers: Which tiers to run: both (``"all"``), or only the
+                synchronous or asynchronous one (parallel mode runs the
+                synchronous tier before the first provider turn starts).
 
         Returns:
             ``(result, reply)``: the block's result and placeholder reply, or
             ``(None, "")`` when every guard allowed.
         """
-        sync_guards = [g for g in self.input_guardrails if not _is_async_guard(g)]
-        async_guards = [g for g in self.input_guardrails if _is_async_guard(g)]
+        sync_guards = [
+            g for g in self.input_guardrails if tiers != "async" and not _is_async_guard(g)
+        ]
+        async_guards = [g for g in self.input_guardrails if tiers != "sync" and _is_async_guard(g)]
 
         def decide(
             guard: InputGuardrail, verdict: object, error: BaseException | None, began: float
@@ -2941,7 +2958,7 @@ class _TurnDone:
 class _PumpFailed:
     """An exception a buffered provider turn raised, handed to the consumer."""
 
-    error: Exception
+    error: BaseException
 
 
 async def _pump(events: AsyncIterator[object], buffer: asyncio.Queue[object]) -> None:
@@ -2955,6 +2972,11 @@ async def _pump(events: AsyncIterator[object], buffer: asyncio.Queue[object]) ->
             buffer.put_nowait(item)
     except Exception as exc:  # noqa: BLE001 - surfaced by the consumer once the guards allow
         buffer.put_nowait(_PumpFailed(exc))
+    except BaseException as exc:
+        # Still terminal for the consumer (it would otherwise wait forever),
+        # and still this task's outcome.
+        buffer.put_nowait(_PumpFailed(exc))
+        raise
     finally:
         await _aclose(events)
 

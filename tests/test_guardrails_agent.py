@@ -600,3 +600,73 @@ def test_parallel_mode_through_sync_stream() -> None:
     events = list(stream_sync(blocked, PROMPT))
     assert events[0] == TextDelta(REPLY) and len(events) == 2
     close_sync(blocked)
+
+
+# --- Fix round 1
+
+
+async def test_parallel_sync_block_never_calls_model() -> None:
+    results = []
+    for mode in ("blocking", "parallel"):
+        provider = FakeProvider(ScriptedTurn.text("never"))
+        conv = Conversation([Message.user("earlier"), Message.assistant_text("ok")])
+        agent = Agent(
+            provider,
+            model="m",
+            input_guardrails=[off_topic_guard, pattern_guard(max_chars=10, reply="too long")],
+            guardrail_mode=mode,  # type: ignore[arg-type]
+        )
+        events = await _collect(agent, "x" * 50, conversation=conv)
+        assert provider.call_count == 0, mode
+        assert conv._compaction is None
+        assert events[0] == TextDelta("too long")
+        results.append(events[-1].result)
+    assert results[0] == results[1]
+
+
+class _ProviderDied(BaseException):
+    pass
+
+
+async def test_parallel_provider_base_exception_does_not_hang() -> None:
+    provider = FakeProvider(ScriptedTurn.failure(_ProviderDied()))
+
+    async def slow_allow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.allow()
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_allow], guardrail_mode="parallel")
+    with pytest.raises(_ProviderDied):
+        await asyncio.wait_for(agent.run(PROMPT), timeout=2)
+
+
+async def test_parallel_exit_before_verdict_reports_zero_iterations(db: Path) -> None:
+    async def slow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(5)
+        return GuardrailVerdict.allow()  # pragma: no cover
+
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("fast answer")),
+        model="m",
+        input_guardrails=[slow],
+        guardrail_mode="parallel",
+        run_timeout=0.2,
+    )
+    with pytest.raises(RunTimeoutError):
+        await asyncio.wait_for(agent.run(PROMPT, session_id="z1"), timeout=2)
+
+    cancelled = Agent(
+        FakeProvider(ScriptedTurn.text("fast answer")),
+        model="m",
+        input_guardrails=[slow],
+        guardrail_mode="parallel",
+    )
+    task = asyncio.ensure_future(cancelled.run(PROMPT, session_id="z2"))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    rows = _rows(db, "SELECT session_id, outcome, iterations FROM logpose_runs ORDER BY session_id")
+    assert rows == [("z1", "run_timeout", 0), ("z2", "cancelled", 0)]
+    await agent.aclose()
+    await cancelled.aclose()
