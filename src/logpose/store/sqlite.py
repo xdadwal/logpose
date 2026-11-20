@@ -10,7 +10,9 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import secrets
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -64,6 +66,14 @@ def _message_row(session_id: str, seq: int, m: Message, now: int) -> tuple[str, 
         "VALUES (?, ?, ?, ?, ?)",
         (session_id, seq, dumped["role"], json.dumps(dumped["content"]), now),
     )
+
+
+def _refuse_newer(version: int) -> None:
+    if version > SCHEMA_VERSION:
+        raise LogposeError(
+            f"database schema version {version} is newer than the supported "
+            f"version {SCHEMA_VERSION}"
+        )
 
 
 async def _rollback(db: aiosqlite.Connection) -> None:
@@ -133,18 +143,65 @@ class SQLiteStore:
                 return
             import aiosqlite
 
-            db = await aiosqlite.connect(self._path, isolation_level=None)
             try:
-                # busy_timeout first, so switching to WAL also waits for other writers.
+                db = await aiosqlite.connect(self._path, isolation_level=None)
+            except sqlite3.Error as exc:
+                raise self._open_error(exc) from exc
+            try:
                 async with db.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}"):
                     pass
-                async with db.execute("PRAGMA journal_mode=WAL"):
-                    pass
+                # Refuse a newer schema before changing anything in the file.
+                await self._check_schema_version(db)
+                await self._enable_wal(db)
                 await self._migrate(db)
+            except sqlite3.Error as exc:
+                await db.close()
+                raise self._open_error(exc) from exc
             except BaseException:
                 await db.close()
                 raise
             self._db = db
+
+    def _open_error(self, exc: sqlite3.Error) -> LogposeError:
+        return LogposeError(f"Could not open session database {self._path!r}: {exc}")
+
+    @staticmethod
+    async def _check_schema_version(db: aiosqlite.Connection) -> None:
+        """Raise if the file holds a schema newer than this release supports. Read-only."""
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logpose_schema'"
+        ) as cur:
+            if await cur.fetchone() is None:
+                return
+        async with db.execute("SELECT version FROM logpose_schema") as cur:
+            row = await cur.fetchone()
+        if row is not None:
+            _refuse_newer(int(row[0]))
+
+    async def _enable_wal(self, db: aiosqlite.Connection) -> None:
+        """Switch to WAL, retrying while another connection holds a lock.
+
+        ``PRAGMA journal_mode=WAL`` needs an exclusive lock and does not use the
+        busy handler, so connections racing on a fresh file (several workers
+        starting at once) see an immediate "database is locked". Retry with a
+        short backoff for up to ``busy_timeout``; the last error propagates.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._busy_timeout_ms / 1000
+        delay = 0.005
+        while True:
+            try:
+                async with db.execute("PRAGMA journal_mode=WAL"):
+                    return
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if "locked" not in message and "busy" not in message:
+                    raise
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise
+            await asyncio.sleep(min(delay * (0.5 + random.random()), remaining))
+            delay = min(delay * 2, 0.1)
 
     async def _migrate(self, db: aiosqlite.Connection) -> None:
         try:
@@ -157,11 +214,7 @@ class SQLiteStore:
                 current = 0
             else:
                 current = int(row[0])
-            if current > SCHEMA_VERSION:
-                raise LogposeError(
-                    f"database schema version {current} is newer than the supported "
-                    f"version {SCHEMA_VERSION}"
-                )
+            _refuse_newer(current)
             for script in _MIGRATIONS[current:]:
                 for stmt in script:
                     await db.execute(stmt)

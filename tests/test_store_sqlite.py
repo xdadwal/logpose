@@ -565,3 +565,89 @@ async def test_session_exit_survives_renewal_cancelled_mid_begin(tmp_path: Path)
         assert _texts(await s.load_messages("s1")) == ["saved"]
         async with s.session("s1") as h:
             assert _texts(h.conversation.messages) == ["saved"]
+
+
+# --- opening a fresh or busy file -----------------------------------------------------
+
+
+async def test_newer_schema_refusal_leaves_journal_mode_untouched(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    with sqlite3.connect(p) as conn:
+        conn.execute("CREATE TABLE logpose_schema (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO logpose_schema (version) VALUES (99)")
+    with pytest.raises(LogposeError, match=r"(?s)99.*1"):
+        await SQLiteStore(p).open()
+    with sqlite3.connect(p) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+
+async def test_wal_switch_waits_for_a_writer_instead_of_failing(tmp_path: Path) -> None:
+    """``PRAGMA journal_mode=WAL`` ignores busy_timeout; open() must retry it."""
+    p = tmp_path / "t.db"
+    writer = sqlite3.connect(p, isolation_level=None)
+    writer.execute("CREATE TABLE other (x)")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO other VALUES (1)")
+    store = SQLiteStore(p)
+    opening = asyncio.create_task(store.open())
+    await asyncio.sleep(0.3)
+    assert not opening.done()  # waiting, not failed
+    writer.execute("COMMIT")
+    writer.close()
+    await opening
+    await store.close()
+    assert await _scalar(p, "PRAGMA journal_mode") == "wal"
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 1
+
+
+async def test_wal_switch_gives_up_with_logpose_error(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    writer = sqlite3.connect(p, isolation_level=None)
+    writer.execute("CREATE TABLE other (x)")
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute("INSERT INTO other VALUES (1)")
+    try:
+        started = time.monotonic()
+        with pytest.raises(LogposeError, match="locked"):
+            await SQLiteStore(p, busy_timeout_ms=300).open()
+        assert time.monotonic() - started >= 0.25
+    finally:
+        writer.execute("ROLLBACK")
+        writer.close()
+
+
+_RACE_CHILD = (
+    "import asyncio, sys, time\n"
+    "from logpose.store.sqlite import SQLiteStore\n"
+    "async def main():\n"
+    "    store = SQLiteStore(sys.argv[1])\n"
+    "    while time.time() < float(sys.argv[2]):\n"
+    "        pass\n"
+    "    await store.open()\n"
+    "    await store.close()\n"
+    "asyncio.run(main())\n"
+)
+
+
+def test_processes_racing_on_a_fresh_file_all_open(tmp_path: Path) -> None:
+    """Like ``uvicorn --workers N`` after a fresh deploy: every worker opens cleanly."""
+    import subprocess
+    import sys
+
+    for round_ in range(2):
+        p = tmp_path / f"race{round_}.db"
+        start = time.time() + 1.5
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", _RACE_CHILD, str(p), str(start)],
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(12)
+        ]
+        outputs = [(proc.communicate(timeout=60)[1], proc.returncode) for proc in procs]
+        errors = [err for err, code in outputs if code]
+        assert errors == []
+        with sqlite3.connect(p) as conn:
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+            assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(1,)]
