@@ -64,6 +64,10 @@ model is shaped.
 
 ### Token estimation
 
+- The calibration ratio is clamped to [0.5, 2.0] (amended 2026-11-20), so a
+  server that under- or over-reports prompt tokens (for example prompt-cache
+  accounting) cannot disable compaction or the overflow guard.
+
 - Estimate = characters of the request's messages, system and tool schemas ÷ 4.
 - Calibration: after each provider turn, logpose knows the real `input_tokens`
   for the request it sent. It keeps a per-conversation correction ratio
@@ -100,9 +104,12 @@ model is shaped.
   2. Make one extra model call (same provider and model, no tools, `max_tokens`
      2,048) with a fixed summarization instruction and the span's text
      (pointers, not full outputs). The output is the summary.
-  3. The request becomes: system, the first user turn, one user-role message
-     `"[Summary of earlier conversation]\n<summary>"`, then the remaining recent
-     turns.
+  3. The request becomes: system, the first user turn, one **assistant-role**
+     message `"[Summary of earlier conversation]\n<summary>"`, then the
+     remaining recent turns. (Amended 2026-11-20: originally user-role; changed
+     because user, user, user breaks chat templates that enforce strict
+     alternation, which is common on vLLM, llama.cpp and Ollama. The assistant
+     role keeps alternation valid in every cut configuration.)
 - **Stability:** the summary and its cut point are cached for the conversation
   and reused on later turns until the threshold is reached again; then the
   summary is extended (re-summarized up to a new cut point). With sessions,
