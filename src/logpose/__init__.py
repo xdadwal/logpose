@@ -122,6 +122,8 @@ from logpose.runtime import RuntimeContext, RuntimeEvent, RuntimeObserver, curre
 from logpose.store.base import SessionHandle
 from logpose.sync import SyncAgent, close_sync, run_sync, stream_sync
 from logpose.tools import ToolDef, discover_tools, tool
+from logpose.tracing.export import ExportResult, export_traces
+from logpose.tracing.spans import Tracing
 
 __version__ = "0.1.0"
 
@@ -142,6 +144,9 @@ __all__ = [
     "ToolObservation",
     "ToolObservationError",
     "ToolObserver",
+    "Tracing",
+    "export_traces",
+    "ExportResult",
     "ContextInput",
     "ContextPolicy",
     "ContextPreparationError",

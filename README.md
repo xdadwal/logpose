@@ -892,6 +892,137 @@ models = await resolve("openai-compat").list_models()
 - `provider_status()` checks local configuration without making a network request.
 - `provider.list_models()` asks the selected backend for its current model list.
 
+## Tracing
+
+logpose can record each run as an OpenTelemetry trace using the GenAI semantic
+conventions, store it in the same SQLite database as sessions, and export it as
+OTLP/JSON. It is off by default and has no OpenTelemetry dependency.
+
+```python
+from logpose import Agent, Tracing
+
+agent = Agent("openai-compat", model="gpt-5.1", tracing=Tracing())
+```
+
+`LOGPOSE_TRACE=1` (also `true` or `yes`) turns tracing on for agents that do not
+pass `tracing=`; `LOGPOSE_TRACE_CONTENT=1` then also captures content.
+`tracing=None` forces tracing off whatever the environment says.
+
+A trace has an `invoke_agent` root span per run with `chat`, `execute_tool`,
+`guardrail` and `compaction` child spans. Without `capture_content` spans carry
+metadata only: models, token counts, finish reasons, tool names, outcomes and
+your run metadata. With `Tracing(capture_content=True)` they also carry prompts,
+outputs, reasoning, tool arguments and results, and exception messages.
+
+What capture stores and scrubs:
+
+- The configured provider API key and `LOGPOSE_API_KEY` are replaced in captured
+  content. Request headers are never recorded. An `api_key` you pass directly to
+  `openai_decision_guard` is not known to the scrubber, although the guard never
+  puts it in content.
+- Anything else the model or your tools see is stored as is. Treat the database
+  as sensitive when capturing content.
+- Each content value is capped at `content_max_chars` (default 64,000). A longer
+  value keeps its end and starts with `…[truncated N chars]`, and the span gets
+  `logpose.content.truncated`.
+
+### Where spans live
+
+Spans are rows in the SQLite store (`LOGPOSE_DB_PATH`; schema v3, migrated
+automatically on open). A background writer saves them as they end. At the end of
+a run logpose waits at most `flush_timeout` seconds (default 1) for that run's
+spans; spans not yet written stay queued and are written later. The queue holds
+up to 10,000 spans or 64 MiB; beyond that new spans are dropped and one `WARNING`
+is logged on the `logpose.trace` logger. Tracing never fails or changes a run: a
+store or writer error is logged and the run continues.
+
+### Run IDs and metadata (evals)
+
+Give a run your own ID and labels to join traces to eval results:
+
+```python
+await agent.run(
+    "question", run_id="eval-2026-11-20-case-17", metadata={"suite": "smoke", "case": 17}
+)
+```
+
+`run_id` matches `[A-Za-z0-9._-]{1,128}`; reusing an ID that is already recorded
+(in a run record or in stored spans) raises `LogposeError` before any provider
+call. `metadata` takes at most 64 keys, keys up to 128 characters, string values
+up to 1,024 characters, and `str`, `int`, `float` (finite) or `bool` values. It
+appears on spans as `logpose.metadata.<key>`, on `RuntimeContext`, and on the
+session `RunRecord`, but not on `RuntimeEvent`.
+
+### Export
+
+```python
+from datetime import datetime, timezone
+
+from logpose import export_traces
+
+result = await export_traces("traces.jsonl")
+print(result.traces, result.through)
+```
+
+`export_traces` writes one OTLP `ExportTraceServiceRequest` per line (OTLP/JSON,
+one trace per line) for traces whose root span has finished; runs still in
+progress are skipped until they end. `since` (exclusive) and `until` (inclusive)
+are timezone-aware datetimes compared with the root span's start at microsecond
+resolution; naive datetimes raise `LogposeError`. `session_id=` limits the export
+to one session. The file is replaced atomically (written to a temporary file in
+the same directory, then renamed), so use a new path per incremental batch.
+`service_name=` sets `service.name`
+(default `"logpose"`; it is not stored on spans).
+
+Export incrementally by passing the previous `through`, the start of the latest
+root exported:
+
+```python
+first = await export_traces("batch-1.jsonl")
+second = await export_traces("batch-2.jsonl", since=first.through)  # no repeats
+```
+
+Because the cursor is a start time, a run that began before `through` but ended
+after the export is not picked up by `since=through`; export a wider window
+(or no `since`) when long runs may overlap.
+
+Feed the files to an OpenTelemetry Collector with the `otlpjsonfile` receiver:
+
+```yaml
+receivers:
+  otlpjsonfile:
+    include: [/var/lib/logpose/traces/*.jsonl]
+    start_at: beginning
+exporters:
+  otlphttp:
+    endpoint: https://collector.example.com:4318
+service:
+  pipelines:
+    traces:
+      receivers: [otlpjsonfile]
+      exporters: [otlphttp]
+```
+
+### Purging
+
+logpose never deletes spans on its own.
+
+```python
+from datetime import timedelta
+
+deleted = await agent.purge_traces(older_than=timedelta(days=30))
+```
+
+`purge_traces` deletes spans that started more than `older_than` ago, in every
+session, and returns the count. Run records stay, so a purged `run_id` still
+cannot be reused.
+
+### Convention status
+
+The GenAI semantic conventions are still in Development. logpose pins release
+1.45.0 and stamps it on exports (`logpose.semconv.version` and the schema URL),
+so attribute names may change in a future logpose release.
+
 ## Configuration reference
 
 | Provider | Model | Endpoint | Credential |

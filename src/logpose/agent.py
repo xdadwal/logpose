@@ -96,6 +96,7 @@ from collections.abc import (
 from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from time import monotonic
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -1196,6 +1197,18 @@ class Agent:
         """
         store = await self._store()
         return await store.purge_expired()
+
+    async def purge_traces(self, older_than: timedelta) -> int:
+        """Delete stored spans that started more than ``older_than`` ago; return the count.
+
+        Applies to every session in the store. Run records are kept, so a purged
+        ``run_id`` still cannot be reused. logpose never purges on its own.
+        """
+        if not isinstance(older_than, timedelta) or older_than < timedelta(0):
+            raise LogposeError(f"older_than must be a non-negative timedelta, got {older_than!r}.")
+        cutoff_ms = int(time.time() * 1000) - older_than // timedelta(milliseconds=1)
+        store = await self._store()
+        return await store.purge_spans(cutoff_ms)
 
     async def delete_session(self, session_id: str) -> None:
         """Delete a stored session with its messages and run records."""
