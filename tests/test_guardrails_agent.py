@@ -670,3 +670,65 @@ async def test_parallel_exit_before_verdict_reports_zero_iterations(db: Path) ->
     assert rows == [("z1", "run_timeout", 0), ("z2", "cancelled", 0)]
     await agent.aclose()
     await cancelled.aclose()
+
+
+@pytest.mark.parametrize("bad", ["scores", "usage"])
+async def test_malformed_verdict_blocks_as_error(db: Path, bad: str) -> None:
+    async def guard(inp: GuardrailInput) -> GuardrailVerdict:
+        if bad == "scores":
+            return GuardrailVerdict(allowed=True, scores={"x": object()})  # type: ignore[dict-item]
+        return GuardrailVerdict(allowed=True, usage="nope")  # type: ignore[arg-type]
+
+    provider = FakeProvider(ScriptedTurn.text("never"))
+    agent = Agent(provider, model="m", input_guardrails=[guard])
+    result = await agent.run(PROMPT, session_id="m1")
+    assert result.text == ERROR_REPLY
+    assert result.guardrail is not None and result.guardrail.category == "error"
+    assert result.guardrail.reason in ("guard raised TypeError", "guard raised ValueError")
+    assert "SECRETPROMPT" not in (result.guardrail.reason or "")
+    assert provider.call_count == 0
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("blocked",)]
+    await agent.aclose()
+
+
+async def test_fail_open_event_is_distinguishable() -> None:
+    async def guard(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict(allowed=True, category="fail_open", reason="timeout")
+
+    events: list[RuntimeEvent] = []
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("ok")),
+        model="m",
+        input_guardrails=[guard],
+        observers=[events.append],
+    )
+    result = await agent.run(PROMPT)
+    assert result.text == "ok"
+    (event,) = [e for e in events if e.name == "guardrail.decided"]
+    assert event.guard_allowed is True and event.guard_category == "fail_open"
+
+
+@pytest.mark.parametrize("mode", ["blocking", "parallel"])
+async def test_cancel_mid_guard_releases_session(db: Path, mode: str) -> None:
+    started = asyncio.Event()
+    hang = True
+
+    async def guard(inp: GuardrailInput) -> GuardrailVerdict:
+        if hang:
+            started.set()
+            await asyncio.sleep(30)
+        return GuardrailVerdict.allow()
+
+    provider = FakeProvider([ScriptedTurn.text("first", delay=0.01), ScriptedTurn.text("again")])
+    agent = Agent(provider, model="m", input_guardrails=[guard], guardrail_mode=mode)  # type: ignore[arg-type]
+    task = asyncio.ensure_future(agent.run(PROMPT, session_id="c1"))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT seq FROM logpose_messages") == []
+    hang = False
+    result = await asyncio.wait_for(agent.run("hello", session_id="c1"), 2)
+    assert result.text in ("first", "again")
+    await agent.aclose()

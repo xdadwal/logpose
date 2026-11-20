@@ -92,7 +92,11 @@ async def test_decision_request_shape() -> None:
     assert all(q["type"] == "predicate" for q in qs)
     assert "billing support" in qs[0]["instructions"]
     msgs = body["input"]
-    assert len(msgs) == 5
+    assert len(msgs) == 6
+    assert msgs[0]["role"] == "developer"
+    assert "untrusted" in msgs[0]["content"][0]["text"]
+    assert msgs[0]["content"][0]["type"] == "input_text"
+    msgs = msgs[1:]
     assert msgs[-1]["role"] == "user"
     assert msgs[-1]["content"] == [{"type": "input_text", "text": "new"}]
     assert msgs[0]["content"][0]["text"] == "u2"
@@ -164,6 +168,28 @@ async def test_decision_http_error_and_timeout_apply_on_error(failure: str) -> N
     assert v.reason and BODY_MARKER not in v.reason and "sk-test" not in v.reason
     v = await _guard(handler, on_error="allow")(_inp())
     assert v.allowed
+    assert v.category == "fail_open" and v.reason and BODY_MARKER not in v.reason
+
+
+@pytest.mark.parametrize("history", [-1, 5, 100])
+def test_history_out_of_range_rejected(history: int) -> None:
+    with pytest.raises(LogposeError, match="history"):
+        openai_decision_guard("x", replies=REPLIES, history=history)
+
+
+async def test_decision_usage_cache_write_mapped() -> None:
+    usage = {
+        "input_tokens": 120,
+        "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30},
+        "output_tokens": 3,
+    }
+    v = await _guard(lambda r: httpx.Response(200, json=_answers(0.9, 0.1, usage)))(_inp())
+    assert v.usage == Usage(
+        input_tokens=70,
+        cache_read_input_tokens=20,
+        cache_creation_input_tokens=30,
+        output_tokens=3,
+    )
 
 
 async def test_decision_usage_mapped() -> None:
@@ -195,7 +221,7 @@ async def test_recent_history_is_text_only() -> None:
         Message(role="assistant", content=[TextBlock(text="answer")]),
     )
     await _guard(handler, history=4)(_inp("new", recent))
-    texts = [m["content"][0]["text"] for m in seen["body"]["input"]]
+    texts = [m["content"][0]["text"] for m in seen["body"]["input"][1:]]
     assert texts == ["first", "answer", "new"]
 
 

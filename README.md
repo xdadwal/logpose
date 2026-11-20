@@ -673,7 +673,6 @@ llama.cpp and LM Studio), logpose forces one summary and retries once.
 
 | Error | Raised when |
 | --- | --- |
-| `GuardrailTripped` | An input guardrail blocked a run that uses `output_type`; see [Input guardrails](#input-guardrails). |
 | `ContextOverflowError` | The request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). Raised before the request is sent; carries `estimated_tokens` and `input_budget`. |
 
 ```python
@@ -767,7 +766,12 @@ They are configured on the agent, so `run`, `stream` and the sync facade need no
 extra arguments:
 
 ```python
+import httpx
+
 from logpose import Agent, openai_decision_guard, pattern_guard
+
+# Create once and keep for the app's lifetime; close it at shutdown.
+shared_httpx_client = httpx.AsyncClient()
 
 agent = Agent(
     "openai-compat",
@@ -791,7 +795,7 @@ A guard is any sync or async callable taking a `GuardrailInput` (the new
 `message`, a few `recent` messages, session `metadata`, `run_id`) and returning
 a `GuardrailVerdict`. Guards are text-only; a run whose prompt has no text, or
 that has no new prompt, skips them. A guard that raises or returns the wrong type
-counts as a block with category `"error"`.
+counts as a block with category `"error"`, as does a verdict with malformed `scores` or `usage`. A sync callable that returns a coroutine is treated as a sync-tier guard (awaited in sequence, so it does not race the turn); write async guards as `async def`.
 
 **Order.** Sync guards run first, in list order, and the first block ends the run
 before any async guard starts (in parallel mode too: sync guards run before the
@@ -819,7 +823,7 @@ with `guard`, `category`, `reason`, `scores`). In blocking mode no model call is
 made. Neither the prompt nor the placeholder is added to the `Conversation` or
 the session, and the session's `RunRecord` has outcome `"blocked"`. With
 `output_type`, a block raises `GuardrailTripped` instead; the result is on
-`.result`. Each decided guard emits a `guardrail.decided` runtime event with the
+`.result` (a `GuardrailResult`). Each decided guard emits a `guardrail.decided` runtime event with the
 guard name, verdict, category, and scores, never message text. Usage a guard
 reports on `GuardrailVerdict.usage` counts in the run's usage and session
 records; a custom async guard that calls a model should return its usage there.
@@ -835,8 +839,12 @@ input tokens only. It is OpenAI-specific: for other providers, write a custom
 guard. It opens a new httpx client per call unless you pass a shared `client=`,
 which is recommended in web apps for connection reuse. A blank `api_key` falls
 back to `LOGPOSE_API_KEY`. `on_error` is `"block"` (the default, fail closed)
-or `"allow"`; a fail-open allow carries no reason or scores, so in events it
-looks like a plain allow. A malformed or non-finite probability is handled as an
+or `"allow"`. A fail-open allow is observable: the verdict has
+`category="fail_open"` and the failure `reason` (no body text), and the
+`guardrail.decided` event has `guard_allowed=True` with
+`guard_category="fail_open"`. `history` (default 4) is how many prior messages
+the judge sees; the runner supplies at most 4, so values outside 0 to 4 raise
+`LogposeError`. A malformed or non-finite probability is handled as an
 error under `on_error`.
 
 **Tuning thresholds.** Start with `on_topic_min=0.5` and `unsafe_max=0.5`, then
@@ -913,6 +921,7 @@ All library-defined errors inherit from `LogposeError`.
 | `OutputRefusalError` | The model refused a structured-output request. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (a `ProviderError`). |
 | `ContextOverflowError` | The request cannot fit the context window even after compaction; see [Long conversations](#long-conversations). |
+| `GuardrailTripped` | An input guardrail blocked a run that uses `output_type`; `.result` is the `GuardrailResult`. See [Input guardrails](#input-guardrails). |
 
 Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or

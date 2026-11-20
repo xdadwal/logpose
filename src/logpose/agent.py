@@ -1852,9 +1852,20 @@ class Agent:
                     "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(error).__name__}"
                 )
             assert isinstance(verdict, GuardrailVerdict)
-            if verdict.usage is not None:
-                add_usage(verdict.usage)
-            category = None if verdict.allowed else (verdict.category or "blocked")
+            scores_json = ""
+            try:
+                scores_json = json.dumps(dict(verdict.scores), sort_keys=True)
+                if verdict.usage is not None:
+                    if not isinstance(verdict.usage, Usage):
+                        raise TypeError("guard usage is not a Usage")
+                    add_usage(verdict.usage)
+            except Exception as exc:  # noqa: BLE001 - a malformed verdict is a guard failure
+                error = exc
+                verdict = GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(exc).__name__}"
+                )
+                scores_json = "{}"
+            category = verdict.category if verdict.allowed else (verdict.category or "blocked")
             self._emit_runtime(
                 "guardrail.decided",
                 context=context,
@@ -1862,7 +1873,7 @@ class Agent:
                 guard_name=name,
                 guard_allowed=verdict.allowed,
                 guard_category=category,
-                guard_scores=json.dumps(dict(verdict.scores), sort_keys=True),
+                guard_scores=scores_json,
                 exception_type=type(error).__name__ if error is not None else None,
             )
             if verdict.allowed:
