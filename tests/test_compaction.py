@@ -1155,6 +1155,12 @@ async def test_second_context_length_rejection_propagates() -> None:
         "Error: context_length_exceeded",
         "prompt exceeds the model's CONTEXT WINDOW",
         "Maximum Context Length reached",
+        # llama.cpp server
+        "the request exceeds the available context size, try increasing it",
+        "exceed_context_size_error",
+        # LM Studio
+        "Trying to keep the first 9000 tokens when Context Length is 4096",
+        "EXCEED_CONTEXT",
     ],
 )
 async def test_context_length_phrasings_detected(message: str) -> None:
@@ -1164,6 +1170,19 @@ async def test_context_length_phrasings_detected(message: str) -> None:
             ScriptedTurn.text("S"),
             ScriptedTurn.text("ok"),
         ]
+    )
+    agent = Agent(provider, model="test-model")
+    result = await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert result.text == "ok"
+    assert provider.call_count == 3
+
+
+async def test_llama_cpp_error_type_detected_from_error_code() -> None:
+    rejection = ProviderError(
+        "bad request", status_code=400, error_code="exceed_context_size_error"
+    )
+    provider = FakeProvider(
+        [ScriptedTurn.failure(rejection), ScriptedTurn.text("S"), ScriptedTurn.text("ok")]
     )
     agent = Agent(provider, model="test-model")
     result = await agent.run("latest", conversation=Conversation(chat_history(4)))

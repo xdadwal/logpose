@@ -121,10 +121,14 @@ model is shaped.
 
 ### Reactive fallback
 
-- If the provider rejects a request for exceeding the context length (HTTP 400
-  whose error mentions `context_length`, `maximum context length`, or
-  `context window`), force step 2 regardless of the estimate and retry the turn
-  once. A second rejection propagates as the original `ProviderError`.
+- If the provider rejects a request for exceeding the context length (HTTP 400,
+  not partial, not a `StructuredOutputUnsupportedError`, whose error message or
+  code mentions, case-insensitively, `context_length`, `maximum context length`,
+  `context window`, `context size`, `context length`, or `exceed_context` — the
+  last three cover llama.cpp's "exceeds the available context size" /
+  `exceed_context_size_error` and LM Studio's "context length"), force step 2
+  regardless of the estimate and retry the turn once. A second rejection
+  propagates as the original `ProviderError`.
 
 ### Observability
 

@@ -2584,14 +2584,24 @@ def _summary_shape(state: _CompactionState | None) -> tuple[str | None, int] | N
     return (state.summary, state.cut_index) if state is not None else None
 
 
-_CONTEXT_LENGTH_MARKERS = ("context_length", "maximum context length", "context window")
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length",
+    "maximum context length",
+    "context window",
+    # llama.cpp: "the request exceeds the available context size", type
+    # "exceed_context_size_error"; LM Studio: "... Context Length ...".
+    "context size",
+    "context length",
+    "exceed_context",
+)
 
 
 def _is_context_length_error(error: ProviderError) -> bool:
     """Whether ``error`` is a provider rejecting a request as too long for its context.
 
     An HTTP 400 whose message (or error code) mentions ``context_length``,
-    ``maximum context length`` or ``context window``, case-insensitively. A
+    ``maximum context length``, ``context window``, ``context size``,
+    ``context length`` or ``exceed_context``, case-insensitively. A
     structured-output rejection or a failure after output was delivered never is.
     """
     if (
