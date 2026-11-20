@@ -17,7 +17,7 @@ __all__ = ["RunRecord", "SessionHandle", "SessionStore", "validate_session_id"]
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
-Outcome = Literal["completed", "max_iterations", "run_timeout", "cancelled", "error"]
+Outcome = Literal["completed", "max_iterations", "run_timeout", "cancelled", "error", "blocked"]
 
 
 def validate_session_id(session_id: str) -> str:
