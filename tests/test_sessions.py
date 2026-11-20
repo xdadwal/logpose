@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -497,4 +498,27 @@ def test_sync_facade_uses_its_own_loop_store(db: Path) -> None:
         result = runner.run(msgs.run("again", session_id="s1"))
         assert result.text == "b"
     assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(4,)]
+    assert manager._open_count() == 0
+
+
+def test_closed_loop_stores_are_swept(db: Path) -> None:
+    """A long-lived agent driven by asyncio.run per request must not leak connections."""
+    import threading
+
+    agent = Agent(FakeProvider([ScriptedTurn.text("x")], repeat_last=True), model="m")
+    asyncio.run(agent.run("hi", session_id="s1"))
+    threads_after_first = threading.active_count()
+    for _ in range(4):
+        asyncio.run(agent.run("hi", session_id="s1"))
+    assert manager._open_count() == 1
+    deadline = time.monotonic() + 2
+    while threading.active_count() > threads_after_first and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert threading.active_count() <= threads_after_first
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_runs") == [(5,)]
+
+    async def close() -> None:
+        await agent.aclose()  # tolerates the swept stores
+
+    asyncio.run(close())
     assert manager._open_count() == 0

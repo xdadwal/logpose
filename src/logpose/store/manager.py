@@ -86,8 +86,17 @@ async def get_store(*, owner: object | None = None) -> SessionStore:
     path = db_path()
     key: _Key = (str(path), loop)
     with _GUARD:
+        # A store whose loop has closed can never be matched again (for example a
+        # long-lived agent driven by asyncio.run per request): stop it now rather
+        # than leaking its connection and thread until aclose or exit.
+        dead = [k for k, e in _ENTRIES.items() if e.loop.is_closed()]
+        swept = [_ENTRIES.pop(k) for k in dead]
+        for k in dead:
+            _CREATE_LOCKS.pop(k, None)
         entry = _ENTRIES.get(key)
         lock = None if entry is not None else _CREATE_LOCKS.setdefault(key, asyncio.Lock())
+    for stale in swept:
+        _stop_now(stale.store)
     if lock is not None:
         async with lock:
             with _GUARD:
