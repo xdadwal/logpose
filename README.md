@@ -599,6 +599,28 @@ By default logpose keeps long conversations inside the model's context window.
 Only the request that is sent is changed. The `Conversation`, the session store and
 `RunResult.messages` always keep the full, original history.
 
+**What the default changes for existing apps.** This is on unless you pass
+`context_policy=None`:
+
+- **logpose assumes a 128,000-token `context_window` unless you set it.** A request
+  estimated above `context_window - max_tokens` is refused before it is sent, with
+  `ContextOverflowError`. On a larger-window model (for example OpenAI's
+  `gpt-6-luna`, about 1.05M tokens) set `context_window`, or large prompts that the
+  model would accept are refused. On a small local model set it lower, so logpose
+  compacts before the server rejects the request.
+- **A `recall_tool_output` tool appears in every request that has tools.** Allow-list
+  gates in `on_tool_call` must allow it, and tests that assert the exact tool specs
+  sent to the provider will see it. `context_policy=None` removes it.
+- **Summaries are extra, billed model calls** on the same provider and model. Their
+  usage is counted in the run's usage.
+
+```python
+agent = Agent(
+    "openai-compat", model="gpt-6-luna", tools=[get_weather],
+    context_window=1_050_000,  # the model's window; the 128k default would refuse big prompts
+)
+```
+
 **Tool-output pointers.** A tool result longer than `pointer_min_chars` (default
 1,000) that the model has already answered, in an earlier run, is sent as a short
 pointer instead of its text:
@@ -621,18 +643,35 @@ resolved as in [Output limit](#output-limit). Input size is estimated as
 characters / 4, multiplied by a calibration ratio learned from the usage the
 provider reports (smoothed, clamped to [0.5, 2.0]). When the estimate reaches 85%
 of the budget (`compaction_threshold`), older turns are summarized down to about
-60% (`compaction_target`): one extra model call (2,048 output tokens max, no tools,
+60% (`compaction_target`): one extra model call (no tools, output ceiling the
+larger of 2,048 and the agent's `max_tokens` so reasoning models have room to think,
 counted in the run's usage) whose result is inserted as an assistant message after
 the first user turn, which stays pinned. Recent turns, and everything from the
 current run, are sent verbatim. The summary is cached and reused until the
-threshold is reached again. With sessions it is persisted (schema v2, migrated
-automatically) and reused across requests.
+threshold is reached again.
 
-If the summary call fails, the request is sent uncompacted when it fits the window
-(`context_window - max_tokens`); otherwise the run raises `ContextOverflowError`.
-A failed summary is not retried again within the same run. If the provider rejects
-a request with a 400 context-length error, logpose forces one summary and retries
-once.
+The summary cache lives on the `Conversation` (and, with sessions, is persisted in
+the session store: schema v2, migrated automatically, reused across requests). An
+app that builds a fresh `Conversation(messages)` for every request without sessions
+pays for a new summary each time; use sessions, or keep the `Conversation` object
+between requests.
+
+Prompt-cache stability is per run. Pointers are decided at run boundaries: the
+previous run's long tool outputs are sent in full during that run and become
+pointers at the next run, so the provider's prompt cache misses from that point
+once per run (and again whenever a summary is made or extended).
+
+If the summary call fails or returns no text, the request is sent uncompacted when
+it fits the window (`context_window - max_tokens`); otherwise the run raises
+`ContextOverflowError`. A failed summary is not retried again within the same run.
+If the provider rejects a request with an HTTP 400 that mentions the context length
+(`context_length`, `maximum context length`, `context window`, `context size`,
+`context length` or `exceed_context`, covering OpenAI-style servers, vLLM,
+llama.cpp and LM Studio), logpose forces one summary and retries once.
+
+| Error | Raised when |
+| --- | --- |
+| `ContextOverflowError` | The request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). Raised before the request is sent; carries `estimated_tokens` and `input_budget`. |
 
 ```python
 agent = Agent(
@@ -696,7 +735,6 @@ default, while `X | None` fields keep `None`.
 
 | Error | Raised when |
 | --- | --- |
-| `ContextOverflowError` | The request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). |
 | `OutputValidationError` | The reply is not valid for the model after the retry budget, including `reason="max_tokens"` when output was cut off. |
 | `OutputRefusalError` | The model refused. There is no correction turn. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (HTTP 400/422). The message includes the provider's reason when it gave one. Not retried. |
@@ -785,6 +823,7 @@ All library-defined errors inherit from `LogposeError`.
 | `OutputValidationError` | Structured output did not validate after the retry budget (or was cut off by `max_tokens`). |
 | `OutputRefusalError` | The model refused a structured-output request. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (a `ProviderError`). |
+| `ContextOverflowError` | The request cannot fit the context window even after compaction; see [Long conversations](#long-conversations). |
 
 Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or
