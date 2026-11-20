@@ -1221,6 +1221,17 @@ class Agent:
         if stats is None:
             stats = _RunStats()
         stats.run_id = run_context.run_id
+        # Tool calls appended to history whose results are not yet appended.
+        # Whatever ends the run meanwhile (timeout, cancellation, an abandoned
+        # stream, a raising gate), each one gets an error result, or every later
+        # request on this conversation is rejected by the provider.
+        unanswered: list[ToolUseBlock] = []
+
+        def answer_unanswered(text: str) -> None:
+            if unanswered:
+                history.append(_error_results(unanswered, text))
+                unanswered.clear()
+
         try:
             if prompt is not None:
                 history.append(prompt)
@@ -1280,9 +1291,17 @@ class Agent:
                 # later turn on this conversation with an error naming a message the
                 # consumer never wrote. `last` still carries the stop reason.
                 stored = bool(done.message.content)
+                # The model asking for tools without naming any is the end of
+                # the run: re-sending would loop forever.
+                calls = (
+                    [block for block in done.message.content if isinstance(block, ToolUseBlock)]
+                    if done.stop_reason == "tool_use"
+                    else []
+                )
                 if stored:
                     answer_index = len(history)
                     history.append(done.message)
+                    unanswered[:] = calls
                 total_usage = total_usage + done.usage
                 stats.usage = total_usage
                 last = done
@@ -1295,36 +1314,16 @@ class Agent:
                     # iteration cap, so that case falls through and ends the run.
                     continue
 
-                # The model asking for tools without naming any is the end of
-                # the run: re-sending would loop forever.
-                calls = (
-                    [block for block in done.message.content if isinstance(block, ToolUseBlock)]
-                    if done.stop_reason == "tool_use"
-                    else []
-                )
                 if calls:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
-                    try:
-                        async with _run_budget(run_deadline):
-                            results = await self._execute(calls, turn_context)
-                    except _RunExpired:
-                        # Every tool_use needs a tool_result, or the next request
-                        # on this conversation is rejected by the provider.
-                        history.append(
-                            Message(
-                                role="user",
-                                content=[
-                                    ToolResultBlock(
-                                        tool_use_id=call.id,
-                                        content="Run deadline exceeded before this tool finished.",
-                                        is_error=True,
-                                    )
-                                    for call in calls
-                                ],
-                            )
-                        )
-                        raise
+                    async with _run_budget(run_deadline):
+                        results = await self._execute(calls, turn_context)
+                    # ONE user message holding every result, in request order —
+                    # appended before the results are yielded, so a consumer that
+                    # walks away mid-results still leaves a replayable history.
+                    history.append(Message(role="user", content=list(results)))
+                    unanswered.clear()
                     for call, tool_result in zip(calls, results, strict=True):
                         yield ToolResult(
                             id=tool_result.tool_use_id,
@@ -1332,8 +1331,6 @@ class Agent:
                             content=tool_result.content,
                             is_error=tool_result.is_error,
                         )
-                    # ONE user message holding every result, in request order.
-                    history.append(Message(role="user", content=list(results)))
                     continue
 
                 if output_type is not None:
@@ -1396,6 +1393,7 @@ class Agent:
             )
             yield RunEnd(result=result)
         except _RunExpired:
+            answer_unanswered("Run deadline exceeded before this tool finished.")
             self._emit_runtime(
                 "run.timed_out",
                 context=run_context,
@@ -1412,6 +1410,8 @@ class Agent:
                 "run.cancelled", context=run_context, duration_seconds=monotonic() - started_at
             )
             raise
+        finally:
+            answer_unanswered("Run ended before this tool finished.")
 
     async def _provider_turn(
         self,
@@ -2189,6 +2189,16 @@ async def _finish_session(work: Coroutine[Any, Any, None], exc: BaseException | 
             _RUNTIME_LOGGER.warning("session exit failed: %s", type(task.exception()).__name__)
         return
     task.result()
+
+
+def _error_results(calls: list[ToolUseBlock], text: str) -> Message:
+    """Build the user turn answering every call in ``calls`` with an error result."""
+    return Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_use_id=call.id, content=text, is_error=True) for call in calls
+        ],
+    )
 
 
 def _as_message(prompt: str | Message) -> Message:

@@ -518,3 +518,144 @@ def test_closed_loop_stores_are_swept(db: Path) -> None:
 
     asyncio.run(close())
     assert manager._open_count() == 0
+
+
+# --- every persisted tool_use is answered, whatever ends the run -------------------
+
+
+def _assert_replayable(messages: list[Any], ids: list[str], text: str) -> None:
+    """The history ends with one user message answering every call in ``ids``."""
+    from logpose.messages import ToolResultBlock, ToolUseBlock
+
+    assert messages[-2].role == "assistant"
+    assert [b.id for b in messages[-2].content if isinstance(b, ToolUseBlock)] == ids
+    last = messages[-1]
+    assert last.role == "user"
+    assert all(isinstance(b, ToolResultBlock) for b in last.content)
+    assert [b.tool_use_id for b in last.content] == ids
+    assert all(b.is_error and b.content == text for b in last.content)
+
+
+_ENDED = "Run ended before this tool finished."
+
+
+async def test_cancel_during_tool_persists_answered_tool_use(db: Path) -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(
+                tool_call("nap", {"seconds": 10}, id="t1"),
+                tool_call("nap", {"seconds": 10}, id="t2"),
+            ),
+            ScriptedTurn.text("recovered"),
+        ]
+    )
+    agent = Agent(provider, model="m", tools=[nap], tool_timeout=None)
+    task = asyncio.create_task(agent.run("go", session_id="s1"))
+    while provider.call_count == 0:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    async with agent.session("s1") as handle:
+        _assert_replayable(list(handle.conversation), ["t1", "t2"], _ENDED)
+    # The session stays usable: the next request carries the answered history.
+    result = await agent.run("again", session_id="s1")
+    assert result.text == "recovered"
+    await agent.aclose()
+
+
+async def test_consumer_break_after_tool_call_persists_answered_tool_use(db: Path) -> None:
+    from logpose.events import ToolCall
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t1"))])
+    agent = Agent(provider, model="m", tools=[nap])
+    events = agent.stream("go", session_id="s1")
+    async for event in events:
+        if isinstance(event, ToolCall):
+            break
+    await events.aclose()  # type: ignore[attr-defined]
+    async with agent.session("s1") as handle:
+        _assert_replayable(list(handle.conversation), ["t1"], _ENDED)
+    await agent.aclose()
+
+
+async def test_raising_gate_persists_answered_tool_use(db: Path) -> None:
+    def gate(call: Any) -> None:
+        raise PermissionError("down")
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t1"))])
+    agent = Agent(provider, model="m", tools=[nap], on_tool_call=gate)
+    with pytest.raises(PermissionError):
+        await agent.run("go", session_id="s1")
+    async with agent.session("s1") as handle:
+        _assert_replayable(list(handle.conversation), ["t1"], _ENDED)
+    await agent.aclose()
+
+
+async def test_conversation_answers_tool_use_on_break_and_gate_error() -> None:
+    from logpose.events import ToolCall
+
+    conv = Conversation()
+    agent = Agent(
+        FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t1"))]),
+        model="m",
+        tools=[nap],
+    )
+    events = agent.stream("go", conversation=conv)
+    async for event in events:
+        if isinstance(event, ToolCall):
+            break
+    await events.aclose()  # type: ignore[attr-defined]
+    _assert_replayable(list(conv), ["t1"], _ENDED)
+
+    def gate(call: Any) -> None:
+        raise PermissionError("down")
+
+    conv2 = Conversation()
+    gated = Agent(
+        FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t2"))]),
+        model="m",
+        tools=[nap],
+        on_tool_call=gate,
+    )
+    with pytest.raises(PermissionError):
+        await gated.run("go", conversation=conv2)
+    _assert_replayable(list(conv2), ["t2"], _ENDED)
+
+
+async def test_conversation_cancel_during_tool_answers_tool_use() -> None:
+    conv = Conversation()
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 10}, id="t1"))])
+    agent = Agent(provider, model="m", tools=[nap], tool_timeout=None)
+    task = asyncio.create_task(agent.run("go", conversation=conv))
+    while provider.call_count == 0:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    _assert_replayable(list(conv), ["t1"], _ENDED)
+
+
+async def test_run_timeout_answers_tool_use_exactly_once(db: Path) -> None:
+    from logpose.errors import RunTimeoutError
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("nap", {"seconds": 5}, id="t1"))])
+    agent = Agent(
+        provider,
+        model="m",
+        tools=[nap],
+        run_timeout=0.3,
+        provider_turn_timeout=None,
+        tool_timeout=None,
+    )
+    with pytest.raises(RunTimeoutError) as info:
+        await agent.run("go", session_id="s1")
+    deadline = "Run deadline exceeded before this tool finished."
+    _assert_replayable(info.value.messages, ["t1"], deadline)
+    async with agent.session("s1") as handle:
+        stored = list(handle.conversation)
+    assert [m.role for m in stored] == ["user", "assistant", "user"]
+    _assert_replayable(stored, ["t1"], deadline)
+    await agent.aclose()
