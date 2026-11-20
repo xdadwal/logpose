@@ -47,6 +47,11 @@ _MIGRATIONS: list[list[str]] = [
         "error_type TEXT NULL)",
         "CREATE INDEX logpose_runs_session ON logpose_runs (session_id, started_at)",
     ],
+    [
+        "CREATE TABLE logpose_summaries ("
+        "session_id TEXT, upto_seq INTEGER, text TEXT, created_at INTEGER, "
+        "PRIMARY KEY (session_id, upto_seq))",
+    ],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
@@ -98,6 +103,26 @@ async def _fetch_messages(db: aiosqlite.Connection, session_id: str) -> list[Mes
         Message.model_validate({"role": role, "content": json.loads(content)})
         for role, content in rows
     ]
+
+
+def _summary_row(session_id: str, upto_seq: int, text: str, now: int) -> tuple[str, Sequence[Any]]:
+    return (
+        "INSERT OR REPLACE INTO logpose_summaries (session_id, upto_seq, text, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, upto_seq, text, now),
+    )
+
+
+async def _fetch_summary(db: aiosqlite.Connection, session_id: str) -> tuple[int, str] | None:
+    # Latest written wins: INSERT OR REPLACE gives the row a new, larger rowid,
+    # and rowid order does not depend on the wall clock.
+    async with db.execute(
+        "SELECT upto_seq, text FROM logpose_summaries WHERE session_id = ? "
+        "ORDER BY rowid DESC LIMIT 1",
+        (session_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    return (int(row[0]), str(row[1])) if row is not None else None
 
 
 class SQLiteStore:
@@ -332,6 +357,7 @@ class SQLiteStore:
                 for sql in (
                     "DELETE FROM logpose_messages WHERE session_id = ?",
                     "DELETE FROM logpose_runs WHERE session_id = ?",
+                    "DELETE FROM logpose_summaries WHERE session_id = ?",
                     "DELETE FROM logpose_sessions WHERE id = ?",
                 ):
                     await db.execute(sql, (session_id,))
@@ -378,6 +404,7 @@ class SQLiteStore:
             created=False,
             loaded_count=len(messages),
             next_seq=next_seq,
+            stored_summary=await _fetch_summary(db, session_id),
         )
         return handle, token
 
@@ -413,6 +440,7 @@ class SQLiteStore:
 
     async def _release(self, handle: SessionHandle, token: str, exc: BaseException | None) -> None:
         new = handle.new_messages()
+        summary = handle.summary_to_save()
 
         async def save(db: aiosqlite.Connection) -> bool:
             async with db.execute(
@@ -432,6 +460,9 @@ class SQLiteStore:
             now = _now_ms()
             for i, m in enumerate(new):
                 await db.execute(*_message_row(handle.id, handle.next_seq + i, m, now))
+            if summary is not None:
+                # Same transaction as the messages it covers.
+                await db.execute(*_summary_row(handle.id, *summary, now))
             await db.execute(
                 "UPDATE logpose_sessions SET version = version + 1, updated_at = ?, "
                 "expires_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ?",
@@ -461,6 +492,17 @@ class SQLiteStore:
         if stmts:
             await self._write(stmts)
         return start_seq + len(stmts)
+
+    async def save_summary(self, session_id: str, upto_seq: int, text: str) -> None:
+        """Store a summary covering messages up to and including ``seq == upto_seq``."""
+        validate_session_id(session_id)
+        await self._write([_summary_row(session_id, upto_seq, text, _now_ms())])
+
+    async def load_summary(self, session_id: str) -> tuple[int, str] | None:
+        """Return the most recently saved summary as ``(upto_seq, text)``, or ``None``."""
+        validate_session_id(session_id)
+        async with self._lock:
+            return await _fetch_summary(self._conn(), session_id)
 
     async def record_run(self, record: RunRecord) -> None:
         validate_session_id(record.session_id)
@@ -497,6 +539,7 @@ class SQLiteStore:
             [
                 ("DELETE FROM logpose_messages WHERE session_id = ?", (session_id,)),
                 ("DELETE FROM logpose_runs WHERE session_id = ?", (session_id,)),
+                ("DELETE FROM logpose_summaries WHERE session_id = ?", (session_id,)),
                 ("DELETE FROM logpose_sessions WHERE id = ?", (session_id,)),
             ]
         )
@@ -508,7 +551,8 @@ class SQLiteStore:
             [
                 (f"DELETE FROM logpose_messages WHERE session_id IN ({expired})", (now,)),
                 (f"DELETE FROM logpose_runs WHERE session_id IN ({expired})", (now,)),
+                (f"DELETE FROM logpose_summaries WHERE session_id IN ({expired})", (now,)),
                 ("DELETE FROM logpose_sessions WHERE expires_at < ?", (now,)),
             ]
         )
-        return counts[2]
+        return counts[3]

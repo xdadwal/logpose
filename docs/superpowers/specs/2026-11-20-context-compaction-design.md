@@ -64,6 +64,10 @@ model is shaped.
 
 ### Token estimation
 
+- The calibration ratio is clamped to [0.5, 2.0] (amended 2026-11-20), so a
+  server that under- or over-reports prompt tokens (for example prompt-cache
+  accounting) cannot disable compaction or the overflow guard.
+
 - Estimate = characters of the request's messages, system and tool schemas ÷ 4.
 - Calibration: after each provider turn, logpose knows the real `input_tokens`
   for the request it sent. It keeps a per-conversation correction ratio
@@ -98,11 +102,17 @@ model is shaped.
      estimate falls to `compaction_target × input_budget`. Cut points fall only
      on turn boundaries, so tool pairs are never split.
   2. Make one extra model call (same provider and model, no tools, `max_tokens`
-     2,048) with a fixed summarization instruction and the span's text
-     (pointers, not full outputs). The output is the summary.
-  3. The request becomes: system, the first user turn, one user-role message
-     `"[Summary of earlier conversation]\n<summary>"`, then the remaining recent
-     turns.
+     = max(2,048, the agent's resolved per-turn `max_tokens`) — amended
+     2026-11-20: a fixed 2,048 let reasoning models spend the whole budget
+     thinking) with a fixed summarization instruction and the span's text
+     (pointers, not full outputs). The output is the summary. A response with
+     no text counts as a failed summary (not retried).
+  3. The request becomes: system, the first user turn, one **assistant-role**
+     message `"[Summary of earlier conversation]\n<summary>"`, then the
+     remaining recent turns. (Amended 2026-11-20: originally user-role; changed
+     because user, user, user breaks chat templates that enforce strict
+     alternation, which is common on vLLM, llama.cpp and Ollama. The assistant
+     role keeps alternation valid in every cut configuration.)
 - **Stability:** the summary and its cut point are cached for the conversation
   and reused on later turns until the threshold is reached again; then the
   summary is extended (re-summarized up to a new cut point). With sessions,
@@ -114,10 +124,14 @@ model is shaped.
 
 ### Reactive fallback
 
-- If the provider rejects a request for exceeding the context length (HTTP 400
-  whose error mentions `context_length`, `maximum context length`, or
-  `context window`), force step 2 regardless of the estimate and retry the turn
-  once. A second rejection propagates as the original `ProviderError`.
+- If the provider rejects a request for exceeding the context length (HTTP 400,
+  not partial, not a `StructuredOutputUnsupportedError`, whose error message or
+  code mentions, case-insensitively, `context_length`, `maximum context length`,
+  `context window`, `context size`, `context length`, or `exceed_context` — the
+  last three cover llama.cpp's "exceeds the available context size" /
+  `exceed_context_size_error` and LM Studio's "context length"), force step 2
+  regardless of the estimate and retry the turn once. A second rejection
+  propagates as the original `ProviderError`.
 
 ### Observability
 

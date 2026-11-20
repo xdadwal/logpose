@@ -20,12 +20,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
   search was already 8,000.
 
+- **Breaking: context compaction is now on by default.** `context_policy` now
+  defaults to the built-in policy instead of `None`; pass `context_policy=None`
+  for the previous full-history behavior. Requests over about 85% of the input
+  budget (default 32,000 tokens) are summarized, and long earlier tool outputs
+  are sent as pointers. Stored history is unchanged. What this changes for
+  existing apps:
+  - logpose assumes a 128,000-token `context_window` unless you set it. Requests
+    estimated above `context_window - max_tokens` are refused before sending with
+    `ContextOverflowError`. Apps on larger-window models (for example OpenAI
+    `gpt-6-luna`, about 1.05M tokens) must set `context_window`, or large prompts
+    are refused; small local models should set it lower.
+  - A `recall_tool_output` tool now appears in every request that has tools.
+    Allow-list gates in `on_tool_call` must allow it, and tests asserting the
+    exact tool specs sent will change.
+  - Summaries are extra, billed model calls (counted in the run's usage). The
+    summary cache lives on the `Conversation` or session; apps that rebuild
+    `Conversation(...)` per request without sessions re-summarize every time.
+- Session database schema v2 (persisted summaries) migrates automatically.
+
 ### Changed (dependencies)
 
 - `aiosqlite>=0.20` is now a core dependency, imported lazily on first session use.
 
 ### Added
 
+- Context compaction: tool-output pointers with an automatic
+  `recall_tool_output` tool, a calibrated model-written summary of older turns
+  (first turn pinned, assistant-role summary, persisted with sessions), and a
+  reactive summary-and-retry on context-length rejections. New `Agent` options
+  `context_window`, `context_budget`, `compaction_threshold`,
+  `compaction_target` and `pointer_min_chars`; `ContextOverflowError`; the
+  `context.compacted` runtime event. Reactive retry recognizes OpenAI-style,
+  vLLM, llama.cpp ("context size", `exceed_context_size_error`) and LM Studio
+  ("context length") rejections. Token estimates count non-ASCII text by
+  character, and the summary call's output ceiling is at least the agent's
+  `max_tokens` so reasoning models are not starved.
 - Sessions: `agent.run/stream(..., session_id=...)` and
   `async with agent.session(sid)` persist history and run records in SQLite
   (`LOGPOSE_DB_PATH`, default `logpose.db`) with a per-session lease. Adds

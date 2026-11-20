@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -52,12 +53,12 @@ async def _scalar(path: Path, sql: str, *params: object) -> object:
         return row[0] if row else None
 
 
-async def test_open_creates_schema_version_1(tmp_path: Path) -> None:
+async def test_open_creates_schema_version_2(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     async with SQLiteStore(p):
         pass
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 1
-    for t in ("sessions", "messages", "runs", "schema"):
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    for t in ("sessions", "messages", "runs", "schema", "summaries"):
         assert (
             await _scalar(p, "SELECT count(*) FROM sqlite_master WHERE name = ?", f"logpose_{t}")
             == 1
@@ -70,7 +71,7 @@ async def test_open_is_idempotent(tmp_path: Path) -> None:
         pass
     async with SQLiteStore(p) as s:
         await s.open()
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 1
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
     assert await _scalar(p, "SELECT count(*) FROM logpose_schema") == 1
 
 
@@ -81,7 +82,7 @@ async def test_newer_schema_version_is_refused(tmp_path: Path) -> None:
     async with aiosqlite.connect(p) as db:
         await db.execute("UPDATE logpose_schema SET version = 99")
         await db.commit()
-    with pytest.raises(LogposeError, match=r"(?s)99.*1"):
+    with pytest.raises(LogposeError, match=r"(?s)99.*2"):
         await SQLiteStore(p).open()
 
 
@@ -575,7 +576,7 @@ async def test_newer_schema_refusal_leaves_journal_mode_untouched(tmp_path: Path
     with sqlite3.connect(p) as conn:
         conn.execute("CREATE TABLE logpose_schema (version INTEGER NOT NULL)")
         conn.execute("INSERT INTO logpose_schema (version) VALUES (99)")
-    with pytest.raises(LogposeError, match=r"(?s)99.*1"):
+    with pytest.raises(LogposeError, match=r"(?s)99.*2"):
         await SQLiteStore(p).open()
     with sqlite3.connect(p) as conn:
         assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
@@ -597,7 +598,7 @@ async def test_wal_switch_waits_for_a_writer_instead_of_failing(tmp_path: Path) 
     await opening
     await store.close()
     assert await _scalar(p, "PRAGMA journal_mode") == "wal"
-    assert await _scalar(p, "SELECT version FROM logpose_schema") == 1
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
 
 
 async def test_wal_switch_gives_up_with_logpose_error(tmp_path: Path) -> None:
@@ -650,4 +651,178 @@ def test_processes_racing_on_a_fresh_file_all_open(tmp_path: Path) -> None:
         assert errors == []
         with sqlite3.connect(p) as conn:
             assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-            assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(1,)]
+            assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(2,)]
+
+
+# --- schema version 2: persisted summaries ------------------------------------------------
+
+
+def _make_v1_database(path: Path) -> None:
+    """Build a database exactly as the version 1 release left it, with data in it."""
+    from logpose.store.sqlite import _MIGRATIONS
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE logpose_schema (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO logpose_schema (version) VALUES (1)")
+        for stmt in _MIGRATIONS[0]:
+            conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO logpose_sessions (id, created_at, updated_at, expires_at, version, "
+            "metadata) VALUES ('s1', 1, 1, 9999999999999, 4, '{\"k\": \"v\"}')"
+        )
+        for seq, text in enumerate(["one", "two"]):
+            conn.execute(
+                "INSERT INTO logpose_messages (session_id, seq, role, content, created_at) "
+                "VALUES ('s1', ?, 'user', ?, 1)",
+                (seq, json.dumps([{"type": "text", "text": text}])),
+            )
+    finally:
+        conn.close()
+
+
+async def test_schema_migrates_v1_to_v2(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    _make_v1_database(p)
+    async with SQLiteStore(p) as s:
+        assert _texts(await s.load_messages("s1")) == ["one", "two"]
+        assert await s.load_summary("s1") is None
+        await s.save_summary("s1", 1, "S")
+        assert await s.load_summary("s1") == (1, "S")
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+    assert await _scalar(p, "SELECT count(*) FROM logpose_schema") == 1
+    assert await _scalar(p, "SELECT metadata FROM logpose_sessions WHERE id = 's1'") == (
+        '{"k": "v"}'
+    )
+    assert await _scalar(p, "SELECT version FROM logpose_sessions WHERE id = 's1'") == 4
+    # Opening a version 2 file again changes nothing.
+    async with SQLiteStore(p) as s:
+        assert await s.load_summary("s1") == (1, "S")
+        assert _texts(await s.load_messages("s1")) == ["one", "two"]
+    assert await _scalar(p, "SELECT version FROM logpose_schema") == 2
+
+
+async def test_load_summary_returns_latest(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        assert await s.load_summary("s1") is None
+        await s.save_summary("s1", 3, "first")
+        await s.save_summary("s1", 9, "second")
+        await s.save_summary("s2", 1, "other")
+        assert await s.load_summary("s1") == (9, "second")
+        # Saving again at an existing seq replaces that row and becomes the latest.
+        await s.save_summary("s1", 3, "redone")
+        assert await s.load_summary("s1") == (3, "redone")
+        assert await s.load_summary("s2") == (1, "other")
+
+
+async def test_delete_session_removes_summaries(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p) as s:
+        await s.save_summary("s1", 1, "a")
+        await s.save_summary("s2", 1, "b")
+        await s.delete_session("s1")
+        assert await s.load_summary("s1") is None
+        assert await s.load_summary("s2") == (1, "b")
+
+
+async def test_purge_removes_summaries(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p) as s:
+        for sid, exp in (("old", 100), ("new", 10_000)):
+            await s._write(
+                [
+                    (
+                        "INSERT INTO logpose_sessions (id, created_at, updated_at, expires_at, "
+                        "version, metadata) VALUES (?, 0, 0, ?, 0, '{}')",
+                        (sid, exp),
+                    )
+                ]
+            )
+            await s.save_summary(sid, 0, "summary " + sid)
+        assert await s.purge_expired(now_ms=5000) == 1
+        assert await s.load_summary("old") is None
+        assert await s.load_summary("new") == (0, "summary new")
+    assert await _scalar(p, "SELECT count(*) FROM logpose_summaries") == 1
+
+
+async def test_expired_session_drops_its_summary_on_access(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p) as s:
+        async with s.session("s1") as h:
+            h.conversation.append(_msg("old"))
+        await s.save_summary("s1", 0, "stale")
+        await s._write([("UPDATE logpose_sessions SET expires_at = 1 WHERE id = 's1'", ())])
+        async with s.session("s1") as h:
+            assert h.created is True
+            assert h.conversation._compaction is None
+        assert await s.load_summary("s1") is None
+
+
+def _turns(n: int) -> list[Message]:
+    out: list[Message] = []
+    for i in range(n):
+        out.append(Message(role="user", content=[TextBlock(text=f"q{i}")]))
+        out.append(Message(role="assistant", content=[TextBlock(text=f"a{i}")]))
+    return out
+
+
+async def test_session_seeds_compaction_from_stored_summary(tmp_path: Path) -> None:
+    from logpose.compaction import fingerprint
+
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        async with s.session("s1") as h:
+            h.conversation.extend(_turns(3))
+        # upto_seq is the seq of the last summarized message: messages 1..3.
+        await s.save_summary("s1", 3, "S")
+        async with s.session("s1") as h:
+            state = h.conversation._compaction
+            assert state is not None
+            assert state.summary == "S"
+            assert state.cut_index == 4
+            assert state.ratio == 1.0
+            assert state.fingerprint == fingerprint(h.conversation.messages[:4])
+
+
+async def test_session_ignores_summary_past_loaded_history(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        async with s.session("s1") as h:
+            h.conversation.extend(_turns(1))
+        await s.save_summary("s1", 5, "from the future")
+        async with s.session("s1") as h:
+            assert h.conversation._compaction is None
+
+
+async def test_session_saves_new_summary_on_exit(tmp_path: Path) -> None:
+    from logpose.compaction import _CompactionState, fingerprint
+
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        async with s.session("s1") as h:
+            h.conversation.extend(_turns(3))
+            h.conversation._compaction = _CompactionState(
+                summary="S", cut_index=4, fingerprint=fingerprint(h.conversation.messages[:4])
+            )
+        assert await s.load_summary("s1") == (3, "S")
+        # Unchanged on the next block: nothing new is written.
+        async with s.session("s1") as h:
+            h.conversation.extend(_turns(1))
+        assert await s.load_summary("s1") == (3, "S")
+        # A summary whose fingerprint no longer matches the history is not saved.
+        async with s.session("s1") as h:
+            h.conversation._compaction = _CompactionState(
+                summary="stale", cut_index=6, fingerprint="0:nope"
+            )
+        assert await s.load_summary("s1") == (3, "S")
+
+
+async def test_lost_handle_saves_no_summary(tmp_path: Path) -> None:
+    from logpose.compaction import _CompactionState, fingerprint
+
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        with pytest.raises(SessionBusyError):
+            async with s.session("s1") as h:
+                h.conversation.extend(_turns(2))
+                h.conversation._compaction = _CompactionState(
+                    summary="S", cut_index=2, fingerprint=fingerprint(h.conversation.messages[:2])
+                )
+                h.lost = True
+        assert await s.load_summary("s1") is None
