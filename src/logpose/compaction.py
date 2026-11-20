@@ -9,10 +9,11 @@ to the model and returns fresh copies, so the caller's
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 from collections.abc import Callable, Sequence
 
-from logpose.messages import ContentBlock, Message, ToolResultBlock, ToolUseBlock
+from logpose.messages import ContentBlock, Message, TextBlock, ToolResultBlock, ToolUseBlock
 from logpose.providers.base import ToolSpec
 from logpose.tools import ToolDef, tool
 
@@ -22,6 +23,9 @@ __all__ = [
     "estimate_tokens",
     "apply_pointers",
     "make_recall_tool",
+    "turn_starts",
+    "SUMMARY_PREFIX",
+    "SUMMARY_MAX_TOKENS",
 ]
 
 RECALL_TOOL_NAME = "recall_tool_output"
@@ -31,6 +35,62 @@ RECALL_PAGE_CHARS = 8000
 """Characters one ``recall_tool_output`` call returns at most."""
 
 _CHARS_PER_TOKEN = 4
+
+SUMMARY_PREFIX = "[Summary of earlier conversation]\n"
+"""Text that starts the user-role message carrying the summary."""
+
+SUMMARY_MAX_TOKENS = 2048
+"""Output ceiling for the summary call."""
+
+SUMMARY_INSTRUCTION = (
+    "You compress the earlier part of a conversation between a user and an AI "
+    "assistant so the assistant can continue it without the original messages.\n"
+    "Write a concise summary that keeps every fact, decision, identifier (IDs, "
+    "names, numbers, file paths, URLs, tool call ids) and every open or "
+    "unresolved question. Note which tools were called and what they returned, "
+    "briefly. Do not add any information that is not in the transcript, do not "
+    "answer open questions, and do not address the user. Output only the summary."
+)
+"""System prompt for the summary call."""
+
+_SMOOTHING = 0.7
+"""Weight the calibration ratio keeps on its old value after each turn."""
+
+
+@dataclasses.dataclass
+class _CompactionState:
+    """Per-conversation compaction state (private; lives on ``Conversation``).
+
+    Attributes:
+        ratio: Calibration factor applied to raw estimates: smoothed
+            ``reported input tokens ÷ estimate``, starting at 1.0.
+        summary: Cached summary of ``messages[first turn + 1 : cut_index]``.
+        cut_index: Index of the first message sent verbatim after the summary.
+        fingerprint: Identifies ``messages[:cut_index]`` the summary was made
+            from; a mismatch means the caller edited history.
+    """
+
+    ratio: float = 1.0
+    summary: str | None = None
+    cut_index: int = 0
+    fingerprint: str = ""
+
+    def calibrate(self, reported: int, estimate: int) -> None:
+        """Fold one turn's reported input tokens into the ratio.
+
+        Args:
+            reported: Input tokens the provider reported for the request
+                (uncached + cache reads + cache writes). ``0`` means unknown.
+            estimate: The raw (uncalibrated) estimate of that request.
+        """
+        if reported > 0 and estimate > 0:
+            self.ratio = _SMOOTHING * self.ratio + (1 - _SMOOTHING) * (reported / estimate)
+
+    def clear_summary(self) -> None:
+        """Forget the cached summary and cut point."""
+        self.summary = None
+        self.cut_index = 0
+        self.fingerprint = ""
 
 
 def estimate_tokens(
@@ -47,10 +107,19 @@ def estimate_tokens(
         The estimated token count, rounded up.
     """
     chars = len(json.dumps([message.model_dump(mode="json") for message in messages]))
-    if system:
-        chars += len(system)
+    return tokens_for(chars + overhead_chars(system, tools))
+
+
+def overhead_chars(system: str | None, tools: Sequence[ToolSpec]) -> int:
+    """Characters the system prompt and tool schemas add to an estimate."""
+    chars = len(system) if system else 0
     if tools:
         chars += len(json.dumps([dataclasses.asdict(spec) for spec in tools]))
+    return chars
+
+
+def tokens_for(chars: int) -> int:
+    """Convert a character count to estimated tokens, rounding up."""
     return -(-chars // _CHARS_PER_TOKEN)
 
 
@@ -172,3 +241,111 @@ def make_recall_tool(history: Callable[[], Sequence[Message]]) -> ToolDef:
         return page
 
     return recall_tool_output
+
+
+def turn_starts(messages: Sequence[Message]) -> list[int]:
+    """Return the indices of caller-authored user turns.
+
+    A turn starts at a user message that carries a :class:`TextBlock` and no
+    :class:`ToolResultBlock`. Cutting the history at one of these never splits
+    a tool call from its result: the results answering an assistant's calls
+    sit in a tool-result message, which is never a turn start.
+
+    Args:
+        messages: The history to scan.
+
+    Returns:
+        Indices in ascending order.
+    """
+    return [
+        index
+        for index, message in enumerate(messages)
+        if message.role == "user"
+        and any(isinstance(block, TextBlock) for block in message.content)
+        and not any(isinstance(block, ToolResultBlock) for block in message.content)
+    ]
+
+
+def fingerprint(messages: Sequence[Message]) -> str:
+    """Identify a run of messages: their count plus a hash of their content."""
+    digest = hashlib.sha256()
+    for message in messages:
+        digest.update(message.model_dump_json().encode())
+        digest.update(b"\x00")
+    return f"{len(messages)}:{digest.hexdigest()}"
+
+
+def summary_message(summary: str) -> Message:
+    """The user-role message that stands in for the summarized span."""
+    return Message(role="user", content=[TextBlock(text=SUMMARY_PREFIX + summary)])
+
+
+def message_chars(message: Message) -> int:
+    """Characters ``message`` adds to :func:`estimate_tokens`'s JSON list."""
+    return len(json.dumps(message.model_dump(mode="json")))
+
+
+def choose_cut(
+    messages: Sequence[Message],
+    candidates: Sequence[int],
+    *,
+    fixed_chars: int,
+    ratio: float,
+    target_tokens: float,
+) -> int:
+    """Pick the earliest cut whose remaining request fits ``target_tokens``.
+
+    The kept request is the fixed part (system, tools, the pinned first turn
+    and the summary message) plus ``messages[cut:]``. The span grows by whole
+    turns from the oldest end; if no candidate reaches the target, the last
+    (largest) one is used.
+
+    Args:
+        messages: The request's messages (already pointered).
+        candidates: Allowed cut indices, ascending and non-empty.
+        fixed_chars: Characters of everything kept besides ``messages[cut:]``.
+        ratio: Calibration ratio applied to the raw estimate.
+        target_tokens: The estimate to get down to.
+
+    Returns:
+        The chosen cut index.
+    """
+    sizes = [message_chars(message) for message in messages]
+    suffix = [0] * (len(sizes) + 1)
+    for index in range(len(sizes) - 1, -1, -1):
+        # ", " separates list items in json.dumps output.
+        suffix[index] = suffix[index + 1] + sizes[index] + 2
+    for cut in candidates:
+        if tokens_for(fixed_chars + suffix[cut]) * ratio <= target_tokens:
+            return cut
+    return candidates[-1]
+
+
+def render_transcript(messages: Sequence[Message], previous: str | None) -> str:
+    """Render the span to summarize as plain text for the summary call.
+
+    Args:
+        messages: The span (pointers already applied).
+        previous: An earlier summary this one extends, if any.
+
+    Returns:
+        The user message text for the summary call.
+    """
+    lines: list[str] = []
+    if previous:
+        lines += ["Earlier summary (extend it):", previous, ""]
+    lines.append("Transcript to summarize:")
+    for message in messages:
+        speaker = "User" if message.role == "user" else "Assistant"
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                lines.append(f"{speaker}: {block.text}")
+            elif isinstance(block, ToolUseBlock):
+                lines.append(
+                    f"Assistant called tool {block.name} (id {block.id}) with "
+                    f"{json.dumps(block.input, sort_keys=True)}"
+                )
+            elif isinstance(block, ToolResultBlock):
+                label = "error" if block.is_error else "result"
+                lines.append(f"Tool {label} (id {block.tool_use_id}): {block.content}")
+    return "\n".join(lines)
