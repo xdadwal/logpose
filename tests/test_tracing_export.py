@@ -373,3 +373,27 @@ async def test_concurrent_processes_get_distinct_increasing_seqs(db: Path) -> No
     assert [p.wait() for p in procs] == [0, 0]
     seqs = [seq async for seq, _ in store.read_root_spans()]
     assert seqs == sorted(seqs) and len(set(seqs)) == 41
+
+
+async def test_through_is_the_latest_root_start_not_the_last_written(
+    db: Path, tmp_path: Path
+) -> None:
+    # A long run (early start) whose root is written after a later, short run.
+    await _put(_span(_tid(2), _sid(2), start=T0 + 7_000_000))
+    await _put(_span(_tid(1), _sid(1), start=T0))
+    result = await export_traces(tmp_path / "o.jsonl")
+    assert result.traces == 2
+    assert result.through == datetime.fromtimestamp(0, UTC) + timedelta(
+        microseconds=(T0 + 7_000_000) // 1000
+    )
+
+
+async def test_missing_export_counter_raises_instead_of_reusing_seqs(db: Path) -> None:
+    import sqlite3
+
+    store = await manager.get_store()
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM logpose_counters")
+    with pytest.raises(LogposeError, match="export_seq"):
+        await store.write_spans([_span(_tid(1), _sid(1))])
+    assert [r async for r in store.read_root_spans()] == []

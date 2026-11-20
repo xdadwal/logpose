@@ -934,3 +934,15 @@ async def test_traced_run_id_released_when_closer_cancelled_during_close() -> No
     assert "x2" in _ACTIVE_RUN_IDS
     await _close_then_cancel(stream, 0.05)
     assert "x2" not in _ACTIVE_RUN_IDS
+
+
+async def test_system_prompt_hash_only_with_a_system_prompt() -> None:
+    cfg = sc.LOGPOSE_CONFIG_PREFIX + "system_prompt_sha256"
+    plain = Agent(FakeProvider(ScriptedTurn.text("ok")), model="m", tracing=Tracing())
+    await plain.run("hi")
+    assert cfg not in root(spans_of(plain)).attributes
+    prompted = Agent(
+        FakeProvider(ScriptedTurn.text("ok")), model="m", system="Be terse.", tracing=Tracing()
+    )
+    await prompted.run("hi")
+    assert len(root(spans_of(prompted)).attributes[cfg]) == 64

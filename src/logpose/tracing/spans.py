@@ -443,9 +443,10 @@ class _SpanBuilder:
         for key, value in self._config.items():
             if value is not None:
                 attrs[sc.LOGPOSE_CONFIG_PREFIX + key] = value
-        attrs[sc.LOGPOSE_CONFIG_PREFIX + "system_prompt_sha256"] = hashlib.sha256(
-            (self._system or "").encode()
-        ).hexdigest()
+        if self._system:
+            attrs[sc.LOGPOSE_CONFIG_PREFIX + "system_prompt_sha256"] = hashlib.sha256(
+                self._system.encode()
+            ).hexdigest()
         if self._capture:
             if self._system is not None:
                 self._content(

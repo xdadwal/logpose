@@ -35,8 +35,8 @@ class ExportResult:
 
     Attributes:
         traces: Number of traces written.
-        through: Start time (UTC, microsecond precision) of the latest root span
-            exported, or ``None`` when nothing was exported. Informational.
+        through: Latest start time (UTC, microsecond precision) among the root
+            spans exported, or ``None`` when nothing was exported. Informational.
         cursor: Write-order position of the latest root exported. Pass it as
             ``after`` to continue an incremental export. When nothing was
             exported it is the ``after`` you passed (``None`` if you passed none).
@@ -196,7 +196,8 @@ async def export_traces(
                 )
                 handle.write(line + "\n")
                 count += 1
-                last_start = root.start_ns
+                if last_start is None or root.start_ns > last_start:
+                    last_start = root.start_ns
                 cursor = seq
         os.replace(tmp_name, target)
     except BaseException:

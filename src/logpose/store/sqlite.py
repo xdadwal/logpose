@@ -706,7 +706,10 @@ class SQLiteStore:
         async def run(db: aiosqlite.Connection) -> None:
             async with db.execute(_GET_SEQ) as cur:
                 row = await cur.fetchone()
-            base = int(row[0]) if row else 0
+            if row is None:
+                # Never number from 0 again: repeated seqs would make export skip spans.
+                raise LogposeError("the export_seq counter row is missing; spans not written")
+            base = int(row[0])
             await (await db.execute(_SET_SEQ, (base + len(rows),))).close()
             cur2 = await db.executemany(
                 _SPAN_INSERT, [(*r, base + i) for i, r in enumerate(rows, 1)]
