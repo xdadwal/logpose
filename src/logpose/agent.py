@@ -1245,6 +1245,7 @@ class Agent:
         # after the run record is written, so a concurrent duplicate cannot
         # slip in between the run ending and its record existing.
         reserved = await self._reserve_run_id(run_id, store)
+        claim = _RunIdClaim(run_id if reserved else None)
         inner = self._session_run(
             first,
             output_type,
@@ -1255,14 +1256,18 @@ class Agent:
             handle=handle,
             run_id=run_id,
             run_metadata=run_metadata,
+            claim=claim,
         )
         try:
             async for event in inner:
                 yield event
         finally:
-            await _aclose(inner)
-            if reserved:
-                _release_run_id(run_id)
+            try:
+                await _aclose(inner)
+            finally:
+                # Even if this closer is cancelled again: a still-running
+                # session exit releases the ID itself once the record exists.
+                claim.settle()
 
     async def _session_run(
         self,
@@ -1276,6 +1281,7 @@ class Agent:
         handle: SessionHandle | None,
         run_id: str | None,
         run_metadata: dict[str, str | int | float | bool] | None,
+        claim: _RunIdClaim | None = None,
     ) -> AsyncIterator[Event]:
         """The body of :meth:`_session_loop`, once the run ID is claimed."""
         from logpose.store import manager
@@ -1323,13 +1329,14 @@ class Agent:
         except BaseException as exc:
             manager._RUNNING.discard(handle)
             work = self._end_session_run(store, handle, cm, stats, started_ms, exc)
-            await _finish_session(work, exc)
+            await _finish_session(work, exc, claim)
             raise
         manager._RUNNING.discard(handle)
         blocked = run_end is not None and run_end.result.guardrail is not None
         await _finish_session(
             self._end_session_run(store, handle, cm, stats, started_ms, None, blocked=blocked),
             None,
+            claim,
         )
         if run_end is None:  # pragma: no cover - the loop always ends with RunEnd
             raise LogposeError("The agentic loop finished without producing a result.")
@@ -1505,7 +1512,7 @@ class Agent:
 
         Returns:
             ``True`` if this call claimed the ID: the caller must release it
-            with :func:`_release_run_id` once the run is recorded.
+            through a :class:`_RunIdClaim` once the run is recorded.
         """
         if run_id is None:
             return False
@@ -1625,6 +1632,7 @@ class Agent:
         reserved = False
         if not run_id_checked and self._trace_sink is not None:
             reserved = await self._reserve_run_id(run_id, None)
+        claim = _RunIdClaim(run_id if reserved else None)
         inner = self._traced_loop(
             prompt,
             conversation,
@@ -1640,10 +1648,11 @@ class Agent:
             async for event in inner:
                 yield event
         finally:
-            # Closed explicitly so the span closes when the caller walks away.
-            await _aclose(inner)
-            if reserved:
-                _release_run_id(run_id)
+            try:
+                # Closed explicitly so the span closes when the caller walks away.
+                await _aclose(inner)
+            finally:
+                claim.settle()
 
     async def _traced_loop(
         self,
@@ -3531,10 +3540,36 @@ def _check_run_metadata(
     return checked
 
 
-def _release_run_id(run_id: str | None) -> None:
-    """Release a run ID claimed by :meth:`Agent._reserve_run_id`."""
-    if run_id is not None:
-        _ACTIVE_RUN_IDS.discard(run_id)
+class _RunIdClaim:
+    """A run ID claimed by :meth:`Agent._reserve_run_id`, released exactly once.
+
+    ``run_id`` is ``None`` when nothing was claimed. A session exit that
+    writes the run record takes the claim over (:meth:`hand_off`); otherwise
+    the shell releases it (:meth:`settle`).
+    """
+
+    __slots__ = ("run_id", "exit_task")
+
+    def __init__(self, run_id: str | None) -> None:
+        self.run_id = run_id
+        self.exit_task: asyncio.Future[None] | None = None
+
+    def hand_off(self, task: asyncio.Future[None]) -> None:
+        """Release when ``task`` (the shielded session exit) finishes."""
+        if self.run_id is None:
+            return
+        self.exit_task = task
+        task.add_done_callback(self.release)
+
+    def settle(self) -> None:
+        """Release now, unless a running session exit will release it."""
+        if self.exit_task is None or self.exit_task.done():
+            self.release()
+
+    def release(self, _task: object = None) -> None:
+        if self.run_id is not None:
+            _ACTIVE_RUN_IDS.discard(self.run_id)
+            self.run_id = None
 
 
 def _check_run_id(run_id: str | None) -> None:
@@ -3558,7 +3593,11 @@ async def _exit_session(
         await cm.__aexit__(type(exc), exc, exc.__traceback__)
 
 
-async def _finish_session(work: Coroutine[Any, Any, None], exc: BaseException | None) -> None:
+async def _finish_session(
+    work: Coroutine[Any, Any, None],
+    exc: BaseException | None,
+    claim: _RunIdClaim | None = None,
+) -> None:
     """Run a session exit inside a bounded shield.
 
     The work runs as its own task and is waited on for up to
@@ -3569,8 +3608,14 @@ async def _finish_session(work: Coroutine[Any, Any, None], exc: BaseException | 
     rather than raised, so the cancellation propagates unchanged; otherwise
     they propagate (for example :class:`~logpose.errors.SessionBusyError` for
     a lost lease).
+
+    With ``claim``, the run ID is released when the exit work finishes, not
+    before: a caller cancelled mid-exit must not free the ID while the run
+    record is still being written.
     """
     task = asyncio.ensure_future(work)
+    if claim is not None:
+        claim.hand_off(task)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + SESSION_EXIT_TIMEOUT
     cancelled = False

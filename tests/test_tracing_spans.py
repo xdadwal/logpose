@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -17,6 +18,7 @@ from logpose.errors import LogposeError, ProviderError
 from logpose.guardrails import GuardrailInput, GuardrailVerdict
 from logpose.messages import Message, TextBlock, Usage
 from logpose.providers._redact import redact
+from logpose.providers.base import ProviderTextDelta
 from logpose.retry import RetryPolicy
 from logpose.runtime import RuntimeEvent, current_runtime_context
 from logpose.tracing import semconv as sc
@@ -836,3 +838,66 @@ async def test_model_error_is_not_logged_as_tracing_failure(
         with pytest.raises(LogposeError, match="no model"):
             await agent.run("hi")
     assert not [r for r in caplog.records if r.name == "logpose.trace"]
+
+
+# -- fix round 2 ------------------------------------------------------------
+
+
+async def _close_then_cancel(stream: Any, delay: float) -> None:
+    closer = asyncio.ensure_future(stream.aclose())
+    await asyncio.sleep(delay)
+    closer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await closer
+
+
+async def test_session_run_id_released_when_closer_cancelled_during_exit(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from logpose.agent import _ACTIVE_RUN_IDS
+    from logpose.store.sqlite import SQLiteStore
+
+    original = SQLiteStore.record_run
+    writing = asyncio.Event()
+
+    async def slow_record(self: SQLiteStore, record: Any) -> None:
+        writing.set()
+        await asyncio.sleep(0.2)
+        await original(self, record)
+
+    monkeypatch.setattr(SQLiteStore, "record_run", slow_record)
+    provider = FakeProvider(ScriptedTurn.text("ab", chunks=["a", "b"]))
+    agent = Agent(provider, model="m", tracing=None)
+    stream = agent.stream("hi", session_id="s1", run_id="x1")
+    await stream.__anext__()
+    closer = asyncio.ensure_future(stream.aclose())  # type: ignore[attr-defined]
+    await writing.wait()
+    assert "x1" in _ACTIVE_RUN_IDS  # held while the record is being written
+    closer.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await closer
+    await asyncio.sleep(0)
+    assert "x1" not in _ACTIVE_RUN_IDS
+    assert _rows(db, "SELECT run_id FROM logpose_runs") == [("x1",)]
+    await agent.aclose()
+
+
+class SlowCloseProvider(FakeProvider):
+    async def stream(self, req: Any) -> Any:  # type: ignore[override]
+        self.requests.append(req)
+        try:
+            yield ProviderTextDelta(text="a")
+            yield ProviderTextDelta(text="b")
+        finally:
+            await asyncio.sleep(0.5)
+
+
+async def test_traced_run_id_released_when_closer_cancelled_during_close() -> None:
+    from logpose.agent import _ACTIVE_RUN_IDS
+
+    agent = Agent(SlowCloseProvider(), model="m", tracing=Tracing())
+    stream = agent.stream("hi", run_id="x2")
+    await stream.__anext__()
+    assert "x2" in _ACTIVE_RUN_IDS
+    await _close_then_cancel(stream, 0.05)
+    assert "x2" not in _ACTIVE_RUN_IDS
