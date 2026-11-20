@@ -7,6 +7,11 @@ created lazily on first session use, shared by every :class:`~logpose.agent.Agen
 on that loop, and closed by :meth:`~logpose.agent.Agent.aclose` of the last
 agent using them, or at interpreter exit (best effort).
 
+Each store owns one :class:`~logpose.tracing.writer.SpanWriter`. Closing a store
+closes its writer first (writing what is queued, bounded); a store whose loop is
+gone has its leftover spans written with a short-lived stdlib connection, so a
+run's trace survives a finished ``asyncio.run`` or interpreter exit (best effort).
+
 ``aiosqlite`` is imported only when a store is first opened, so runs without
 sessions never load it and never touch disk.
 """
@@ -20,12 +25,15 @@ import os
 import threading
 import warnings
 import weakref
+from collections.abc import Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:  # pragma: no cover
     from logpose.store.base import SessionHandle, SessionStore
     from logpose.store.sqlite import SQLiteStore
+    from logpose.tracing.spans import SpanRecord
+    from logpose.tracing.writer import SpanWriter
 
 __all__ = ["DB_PATH_ENV", "DEFAULT_DB_FILENAME", "db_path", "get_store"]
 
@@ -40,12 +48,18 @@ _Key = tuple[str, asyncio.AbstractEventLoop]
 _LOGGER = logging.getLogger("logpose.store")
 _STOP_WARNED = False
 
+_EXIT_FLUSH_TIMEOUT = 2.0
+"""Seconds the exit hook waits for a writer on a still-running loop."""
+
 
 class _Entry:
     """One opened store and the agents currently using it."""
 
-    def __init__(self, store: SQLiteStore, loop: asyncio.AbstractEventLoop) -> None:
+    def __init__(
+        self, store: SQLiteStore, writer: SpanWriter, loop: asyncio.AbstractEventLoop
+    ) -> None:
         self.store = store
+        self.writer = writer
         self.loop = loop
         self.owners: weakref.WeakSet[object] = weakref.WeakSet()
 
@@ -53,8 +67,11 @@ class _Entry:
 _GUARD = threading.Lock()  # protects the registries below across loops/threads
 _ENTRIES: dict[_Key, _Entry] = {}
 _CREATE_LOCKS: dict[_Key, asyncio.Lock] = {}
-_OPEN: set[SQLiteStore] = set()  # every opened, not yet closed store (for exit cleanup)
+# Every opened, not yet closed store, with its span writer (for exit cleanup).
+_OPEN: dict[SQLiteStore, _Entry] = {}
 _EXIT_HOOK_INSTALLED = False
+# Background opens started by store_opening(), with the owners waiting on each.
+_OPENING: dict[_Key, tuple[asyncio.Future[SessionStore], weakref.WeakSet[object]]] = {}
 
 # Handles currently inside a session block, mapped to the store that leased them.
 _ACTIVE_HANDLES: weakref.WeakKeyDictionary[SessionHandle, SessionStore] = (
@@ -100,41 +117,108 @@ async def get_store(*, owner: object | None = None) -> SessionStore:
         entry = _ENTRIES.get(key)
         lock = None if entry is not None else _CREATE_LOCKS.setdefault(key, asyncio.Lock())
     for stale in swept:
-        _stop_now(stale.store)
+        await _abandon_async(stale)
     if lock is not None:
         async with lock:
             with _GUARD:
                 entry = _ENTRIES.get(key)
             if entry is None:
                 from logpose.store.sqlite import SQLiteStore
+                from logpose.tracing.writer import SpanWriter
 
                 path.parent.mkdir(parents=True, exist_ok=True)
                 store = SQLiteStore(path)
                 await store.open()
                 _install_exit_hook()
-                entry = _Entry(store, loop)
+                entry = _Entry(store, SpanWriter(store), loop)
                 with _GUARD:
                     _ENTRIES[key] = entry
-                    _OPEN.add(store)
+                    _OPEN[store] = entry
     assert entry is not None
     if owner is not None:
         entry.owners.add(owner)
     return entry.store
 
 
-async def release_stores(owner: object) -> None:
+def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
+    """Return a future for the store of the current path and loop, opening it in the background.
+
+    For callers that must not wait longer than they choose (a traced run waits
+    at most its tracing budget): the open runs as its own task, shared by every
+    caller on this path and loop, so a caller that stops waiting neither
+    cancels it nor starts a second one. ``owner`` is registered on the store
+    once it is open (as :func:`get_store` does). A failed open is not retried
+    by the same future; the next call after it finished starts a new one.
+    """
+    loop = asyncio.get_running_loop()
+    key: _Key = (str(db_path()), loop)
+    with _GUARD:
+        entry = _ENTRIES.get(key)
+        if entry is not None:
+            entry.owners.add(owner)
+            done: asyncio.Future[SessionStore] = loop.create_future()
+            done.set_result(entry.store)
+            return done
+        pending = _OPENING.get(key)
+        if pending is not None and not pending[0].done():
+            pending[1].add(owner)
+            return pending[0]
+        owners: weakref.WeakSet[object] = weakref.WeakSet([owner])
+
+    async def open_store() -> SessionStore:
+        store = await get_store()
+        with _GUARD:
+            opened = _OPEN.get(cast("SQLiteStore", store))
+            if opened is not None:
+                for waiting in list(owners):
+                    opened.owners.add(waiting)
+        return store
+
+    task = loop.create_task(open_store(), name="logpose-store-open")
+
+    def finished(fut: asyncio.Future[SessionStore]) -> None:
+        with _GUARD:
+            if _OPENING.get(key, (None,))[0] is fut:
+                del _OPENING[key]
+        if not fut.cancelled():
+            fut.exception()  # retrieved: a caller that stopped waiting may never look
+
+    task.add_done_callback(finished)
+    with _GUARD:
+        _OPENING[key] = (task, owners)
+    return task
+
+
+def span_writer(store: SessionStore) -> SpanWriter | None:
+    """Return the span writer owned by ``store``, or ``None`` once it is closed."""
+    with _GUARD:
+        entry = _OPEN.get(cast("SQLiteStore", store))
+    return entry.writer if entry is not None else None
+
+
+async def release_stores(owner: object, run_ids: Iterable[str] = ()) -> None:
     """Drop ``owner`` from every store it used; close stores left with no owner.
 
-    A store bound to the current loop is closed here. One bound to a loop that is
-    running elsewhere is closed on that loop without waiting; one bound to a loop
-    that is stopped or closed has its connection thread stopped directly.
+    A store bound to the current loop is closed here, after its span writer has
+    written what is queued (bounded by the writer's close timeout). A store
+    still shared with other owners on this loop waits, bounded the same way,
+    only for the spans of ``run_ids`` (the owner's own runs), never for other
+    owners' spans. One bound to a loop that is running elsewhere is closed on
+    that loop without waiting; one bound to a loop that is stopped or closed has
+    its connection thread stopped directly and its leftover spans written
+    without a loop.
     """
+    from logpose.tracing.writer import CLOSE_TIMEOUT
+
     try:
         current: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
     except RuntimeError:  # pragma: no cover - always called from a coroutine
         current = None
     orphaned: list[_Entry] = []
+    shared: list[_Entry] = []
     with _GUARD:
+        for _future, waiting in _OPENING.values():
+            waiting.discard(owner)
         for key, entry in list(_ENTRIES.items()):
             if owner in entry.owners:
                 entry.owners.discard(owner)
@@ -142,35 +226,78 @@ async def release_stores(owner: object) -> None:
                     del _ENTRIES[key]
                     _CREATE_LOCKS.pop(key, None)
                     orphaned.append(entry)
+                elif entry.loop is current:
+                    shared.append(entry)
+    mine = list(run_ids)
+    for entry in shared:
+        if mine:
+            await entry.writer.flush_runs(mine, CLOSE_TIMEOUT)
     for entry in orphaned:
         if entry.loop is current:
-            await _close(entry.store)
+            await _close(entry)
         elif entry.loop.is_running() and not entry.loop.is_closed():
             with contextlib.suppress(RuntimeError):
-                asyncio.run_coroutine_threadsafe(_close(entry.store), entry.loop)
+                asyncio.run_coroutine_threadsafe(_close(entry), entry.loop)
         else:
-            _stop_now(entry.store)
+            await _abandon_async(entry)
 
 
-async def _close(store: SQLiteStore) -> None:
+async def _close(entry: _Entry) -> None:
+    """Close the writer (bounded), save any leftover spans, close the store."""
     try:
-        await store.close()
+        try:
+            await entry.writer.close()
+        finally:
+            left = entry.writer.drain()
+            if left:
+                await asyncio.to_thread(_save_leftovers, entry, left)
     finally:
-        with _GUARD:
-            _OPEN.discard(store)
+        try:
+            await entry.store.close()
+        finally:
+            with _GUARD:
+                _OPEN.pop(entry.store, None)
 
 
-def _stop_now(store: SQLiteStore) -> None:
+async def _abandon_async(entry: _Entry) -> None:
+    """:func:`_abandon` without blocking the running loop on the leftover write."""
+    left = _stop_now(entry.store)
+    if left:
+        await asyncio.to_thread(_save_leftovers, entry, left)
+
+
+def _abandon(entry: _Entry) -> None:
+    """Stop a store whose loop is gone and write its leftover spans. Best effort."""
+    left = _stop_now(entry.store)
+    if left:
+        _save_leftovers(entry, left)
+
+
+def _save_leftovers(entry: _Entry, spans: list[SpanRecord]) -> None:
+    """Write spans a writer never got to, with a stdlib connection. Never raises."""
+    from logpose.store.sqlite import write_spans_blocking
+
+    try:
+        write_spans_blocking(entry.store._path, spans)
+    except Exception as exc:  # noqa: BLE001 - best effort; reported once
+        entry.writer.warn_lost(len(spans), type(exc).__name__)
+
+
+def _stop_now(store: SQLiteStore) -> list[SpanRecord]:
     """Stop a store's connection thread without awaiting anything. Best effort.
 
     aiosqlite's worker thread is not a daemon, so an unclosed connection would
     otherwise keep the interpreter from exiting.
+
+    Returns:
+        The spans its writer still held, for a loop-free write by the caller.
     """
     with _GUARD:
-        _OPEN.discard(store)
+        entry = _OPEN.pop(store, None)
+    left = entry.writer.drain() if entry is not None else []
     db, store._db = store._db, None
     if db is None:
-        return
+        return left
     # ``stop()`` exists from aiosqlite 0.22 (the declared floor); older
     # releases only have the private ``_stop_running()``.
     stop = getattr(db, "stop", None) or getattr(db, "_stop_running", None)
@@ -180,7 +307,7 @@ def _stop_now(store: SQLiteStore) -> None:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 stop()
-            return
+            return left
         except Exception as exc:  # noqa: BLE001 - best effort; reported below
             error = exc
     global _STOP_WARNED
@@ -191,13 +318,38 @@ def _stop_now(store: SQLiteStore) -> None:
             "hang until it is closed. logpose requires aiosqlite>=0.22.",
             type(error).__name__ if error is not None else "no stop() method",
         )
+    return left
 
 
 def _shutdown() -> None:
+    """Exit hook: flush writers whose loop still runs, then stop every store.
+
+    A writer on a loop running in another thread (the sync facade's) gets a
+    bounded close on that loop; anything left, and everything held by writers
+    whose loop is gone, is written without a loop. Best effort, never raises.
+    """
     with _GUARD:
-        stores = list(_OPEN)
-    for store in stores:
-        _stop_now(store)
+        entries = list(_OPEN.values())
+    for entry in entries:
+        with contextlib.suppress(BaseException):
+            _flush_on_own_loop(entry)
+    for entry in entries:
+        with contextlib.suppress(BaseException):
+            _abandon(entry)
+
+
+def _flush_on_own_loop(entry: _Entry) -> None:
+    """Close ``entry``'s writer on its loop, if that loop is running in another thread."""
+    loop = entry.loop
+    if loop.is_closed() or not loop.is_running():
+        return
+    try:
+        if asyncio.get_running_loop() is loop:  # pragma: no cover - not from exit hook
+            return
+    except RuntimeError:
+        pass
+    future = asyncio.run_coroutine_threadsafe(entry.writer.close(_EXIT_FLUSH_TIMEOUT), loop)
+    future.result(_EXIT_FLUSH_TIMEOUT + 0.5)
 
 
 def _install_exit_hook() -> None:
@@ -235,7 +387,8 @@ def reset_stores_for_tests() -> None:
         stores = list(_OPEN)
         _ENTRIES.clear()
         _CREATE_LOCKS.clear()
+        _OPENING.clear()
         _ACTIVE_HANDLES.clear()
         _RUNNING.clear()
     for store in stores:
-        _stop_now(store)
+        _stop_now(store)  # spans still queued are discarded: tests start clean

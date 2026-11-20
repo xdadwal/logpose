@@ -180,9 +180,25 @@ config snapshot `logpose.config.*`, gate-block events, and error status with
      span has ended; a live run is never exported half-finished.
    - **Time window:** `since` and `until` are timezone-aware `datetime`s,
      matched against the **root span's start time**.
-   - **Return value:** `ExportResult(traces: int, through: datetime | None)`.
-     `through` is the latest root start exported, so callers can export
-     incrementally without duplicates.
+   - **Return value:** `ExportResult(traces: int, through: datetime | None,
+     cursor: int | None)`. `through` is the latest root start exported
+     (informational only).
+   - **Incremental export (amended 2026-11-20 after review):** a start-time or
+     end-time watermark is not exactly-once, because spans are written by a
+     background writer, possibly long after the run ends. So each span row
+     gets a write-order number `export_seq`, assigned inside the write
+     transaction. A re-write of the same span keeps its original number.
+     - Export reads roots in `export_seq` order.
+     - `cursor` is the largest `export_seq` exported, or the caller's `after`
+       when nothing was exported; it never goes backwards.
+     - Callers pass `after=result.cursor` on the next call to export each
+       completed trace exactly once.
+     - `since`/`until` remain plain filters on the root's start time.
+   - **Service name:** `Tracing.service_name` is stored on the root span and
+     becomes the resource `service.name` on export (resourceSpans are grouped
+     by it).
+   - **Purge:** `purge_spans` deletes whole traces whose root started before
+     the cutoff, plus any orphan spans older than the cutoff.
 5. **Metadata:**
    - stored on spans (`logpose.metadata.*`) and in `RuntimeContext`;
    - in `logpose_runs`, through a new `metadata TEXT` (JSON) column added by the

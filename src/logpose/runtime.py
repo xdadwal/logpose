@@ -8,9 +8,9 @@ messages, headers, and credentials have no field in this module.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 __all__ = [
@@ -27,6 +27,9 @@ class RuntimeContext:
     A context is local to the current async task (and is copied into synchronous
     tools run through :func:`asyncio.to_thread`). It is ``None`` outside an
     agent run.
+
+    ``metadata`` is the app-supplied run metadata (``run(..., metadata=...)``),
+    read-only; it never appears on :class:`RuntimeEvent`.
     """
 
     run_id: str
@@ -37,6 +40,9 @@ class RuntimeContext:
     request_id: str | None = None
     tool_call_id: str | None = None
     tool_name: str | None = None
+    metadata: Mapping[str, str | int | float | bool] | None = field(
+        default=None, hash=False, compare=False
+    )
 
 
 @dataclass(frozen=True)

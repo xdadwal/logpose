@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from logpose.agent import Conversation
 from logpose.compaction import _CompactionState, fingerprint
 from logpose.errors import LogposeError
 from logpose.messages import Message
+
+if TYPE_CHECKING:  # pragma: no cover
+    from logpose.tracing.spans import SpanRecord
 
 __all__ = ["RunRecord", "SessionHandle", "SessionStore", "validate_session_id"]
 
@@ -45,6 +48,7 @@ class RunRecord:
     cache_read_input_tokens: int
     cache_creation_input_tokens: int
     error_type: str | None = None
+    metadata: Mapping[str, str | int | float | bool] | None = None
 
 
 class SessionHandle:
@@ -147,3 +151,27 @@ class SessionStore(Protocol):
     async def delete_session(self, session_id: str) -> None: ...
 
     async def purge_expired(self, now_ms: int | None = None) -> int: ...
+
+    async def write_spans(self, spans: Sequence[SpanRecord]) -> None: ...
+
+    def read_spans(
+        self,
+        *,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
+        session_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> AsyncIterator[SpanRecord]: ...
+
+    def read_root_spans(
+        self,
+        *,
+        after_seq: int | None = None,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[tuple[int, SpanRecord]]: ...
+
+    async def purge_spans(self, older_than_ms: int) -> int: ...
+
+    async def run_id_exists(self, run_id: str) -> bool: ...
