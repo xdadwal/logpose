@@ -659,3 +659,52 @@ async def test_run_timeout_answers_tool_use_exactly_once(db: Path) -> None:
     assert [m.role for m in stored] == ["user", "assistant", "user"]
     _assert_replayable(stored, ["t1"], deadline)
     await agent.aclose()
+
+
+# --- aiosqlite worker threads are always stopped, or the failure is logged ---------
+
+
+def test_aiosqlite_floor_has_connection_stop() -> None:
+    """0.20/0.21 lack ``Connection.stop()``; an unstopped worker hangs interpreter exit."""
+    text = (ROOT / "pyproject.toml").read_text()
+    assert '"aiosqlite>=0.22"' in text
+    assert '"aiosqlite>=0.20"' not in text
+
+
+class _OldConnection:
+    """aiosqlite <0.22: no ``stop()``, only the private ``_stop_running()``."""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def _stop_running(self) -> None:
+        self.stopped = True
+
+
+class _Unstoppable:
+    pass
+
+
+def _fake_store(db: object) -> Any:
+    from logpose.store.sqlite import SQLiteStore
+
+    store = SQLiteStore.__new__(SQLiteStore)
+    store._db = db  # type: ignore[assignment]
+    return store
+
+
+def test_stop_now_falls_back_to_stop_running() -> None:
+    conn = _OldConnection()
+    manager._stop_now(_fake_store(conn))
+    assert conn.stopped
+
+
+def test_stop_now_logs_once_when_thread_cannot_be_stopped(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(manager, "_STOP_WARNED", False, raising=False)
+    with caplog.at_level("WARNING", logger="logpose"):
+        manager._stop_now(_fake_store(_Unstoppable()))
+        manager._stop_now(_fake_store(_Unstoppable()))
+    warned = [r for r in caplog.records if "could not stop" in r.getMessage()]
+    assert len(warned) == 1

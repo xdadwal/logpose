@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import threading
 import warnings
@@ -35,6 +36,9 @@ DEFAULT_DB_FILENAME = "logpose.db"
 """Database file used, in the working directory, when ``LOGPOSE_DB_PATH`` is unset."""
 
 _Key = tuple[str, asyncio.AbstractEventLoop]
+
+_LOGGER = logging.getLogger("logpose.store")
+_STOP_WARNED = False
 
 
 class _Entry:
@@ -167,9 +171,26 @@ def _stop_now(store: SQLiteStore) -> None:
     db, store._db = store._db, None
     if db is None:
         return
-    with warnings.catch_warnings(), contextlib.suppress(Exception):
-        warnings.simplefilter("ignore")
-        db.stop()
+    # ``stop()`` exists from aiosqlite 0.22 (the declared floor); older
+    # releases only have the private ``_stop_running()``.
+    stop = getattr(db, "stop", None) or getattr(db, "_stop_running", None)
+    error: Exception | None = None
+    if stop is not None:
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                stop()
+            return
+        except Exception as exc:  # noqa: BLE001 - best effort; reported below
+            error = exc
+    global _STOP_WARNED
+    if not _STOP_WARNED:
+        _STOP_WARNED = True
+        _LOGGER.warning(
+            "could not stop an aiosqlite connection thread (%s); interpreter exit may "
+            "hang until it is closed. logpose requires aiosqlite>=0.22.",
+            type(error).__name__ if error is not None else "no stop() method",
+        )
 
 
 def _shutdown() -> None:

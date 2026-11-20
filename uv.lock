@@ -464,7 +464,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiosqlite", specifier = ">=0.20" },
+    { name = "aiosqlite", specifier = ">=0.22" },
     { name = "beautifulsoup4", marker = "extra == 'web'", specifier = ">=4.12" },
     { name = "httpx" },
     { name = "pydantic", specifier = ">=2" },
