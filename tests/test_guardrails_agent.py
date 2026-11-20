@@ -1,4 +1,4 @@
-"""Input guardrails wired into the agent loop (blocking mode)."""
+"""Input guardrails wired into the agent loop (blocking and parallel modes)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from logpose import tool
 from logpose.agent import Agent, Conversation
 from logpose.errors import GuardrailTripped, LogposeError, RunTimeoutError
 from logpose.events import RunEnd, TextDelta
@@ -20,7 +21,7 @@ from logpose.guardrails import GuardrailInput, GuardrailVerdict, pattern_guard
 from logpose.messages import Message, ToolResultBlock, Usage
 from logpose.runtime import RuntimeEvent
 from logpose.store import manager
-from tests.fake_provider import FakeProvider, ScriptedTurn
+from tests.fake_provider import FakeProvider, ScriptedTurn, tool_call
 
 PROMPT = "Tell me a SECRETPROMPT story"
 REPLY = "I can only help with billing."
@@ -292,3 +293,310 @@ def test_agent_validates_guardrail_options() -> None:
     agent = Agent(provider, model="m", input_guardrails=[allow_guard])
     assert agent.input_guardrails == (allow_guard,)
     assert agent.guardrail_mode == "blocking"
+
+
+# --- Task 2 follow-ups: usage per decision, same-round decisions, no state touched
+
+
+async def test_finished_guard_usage_survives_run_timeout(db: Path) -> None:
+    async def fast_billed(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict.allow(usage=Usage(input_tokens=6, output_tokens=2))
+
+    async def slow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(5)
+        return GuardrailVerdict.allow()  # pragma: no cover
+
+    for mode in ("blocking", "parallel"):
+        agent = Agent(
+            FakeProvider(ScriptedTurn.text("never", delay=5)),
+            model="m",
+            input_guardrails=[fast_billed, slow],
+            guardrail_mode=mode,  # type: ignore[arg-type]
+            run_timeout=0.2,
+        )
+        with pytest.raises(RunTimeoutError):
+            await asyncio.wait_for(agent.run(PROMPT, session_id=f"t-{mode}"), timeout=2)
+        rows = _rows(
+            db,
+            "SELECT outcome, input_tokens, output_tokens FROM logpose_runs "
+            f"WHERE session_id = 't-{mode}'",
+        )
+        assert rows == [("run_timeout", 6, 2)], mode
+        await agent.aclose()
+
+
+async def test_guards_finishing_together_are_all_decided() -> None:
+    async def first(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict.block("first", "first reply", usage=Usage(input_tokens=3))
+
+    async def second(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict.block("second", "second reply", usage=Usage(input_tokens=5))
+
+    events: list[RuntimeEvent] = []
+    agent = Agent(
+        FakeProvider(()), model="m", input_guardrails=[first, second], observers=[events.append]
+    )
+    result = await agent.run(PROMPT)
+    decided = [e.guard_name for e in events if e.name == "guardrail.decided"]
+    assert sorted(decided) == ["first", "second"]
+    assert result.usage == Usage(input_tokens=8)
+    # Among guards decided in the same round, the first block in list order wins.
+    assert result.text == "first reply"
+    assert result.guardrail is not None and result.guardrail.guard == "first"
+
+
+async def test_blocked_run_leaves_conversation_state_untouched() -> None:
+    conv = Conversation([Message.user("earlier"), Message.assistant_text("ok")])
+    assert conv._compaction is None
+    agent = Agent(FakeProvider(()), model="m", input_guardrails=[off_topic_guard])
+    await agent.run(PROMPT, conversation=conv)
+    assert conv._compaction is None
+
+
+# --- Parallel mode
+
+
+async def test_parallel_allow_flushes_buffered_text_in_order() -> None:
+    provider = FakeProvider(ScriptedTurn.text("abc", chunks=["a", "b", "c"]))
+    state = {"resolved": False, "calls_seen": -1}
+
+    async def slow_allow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.1)
+        state["calls_seen"] = provider.call_count
+        state["resolved"] = True
+        return GuardrailVerdict.allow()
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_allow], guardrail_mode="parallel")
+    received: list[tuple[Any, bool]] = []
+    async for event in agent.stream(PROMPT):
+        received.append((event, state["resolved"]))
+    # The provider was called while the guard was still running.
+    assert state["calls_seen"] == 1
+    texts = [event for event, _ in received if isinstance(event, TextDelta)]
+    assert texts == [TextDelta("a"), TextDelta("b"), TextDelta("c")]
+    assert all(resolved for _, resolved in received)
+    assert [type(event).__name__ for event, _ in received][:3] == ["TextDelta"] * 3
+    final = received[-1][0]
+    assert isinstance(final, RunEnd)
+    assert final.result.text == "abc"
+    assert final.result.guardrail is None
+
+
+async def test_parallel_allowed_request_matches_blocking_mode() -> None:
+    requests = []
+    for mode in ("blocking", "parallel"):
+        provider = FakeProvider(ScriptedTurn.text("hello"))
+        conv = Conversation([Message.user("earlier"), Message.assistant_text("ok")])
+        agent = Agent(
+            provider,
+            model="m",
+            input_guardrails=[allow_guard],
+            guardrail_mode=mode,  # type: ignore[arg-type]
+        )
+        result = await agent.run(PROMPT, conversation=conv)
+        assert result.text == "hello"
+        assert [m.text for m in conv.messages] == ["earlier", "ok", PROMPT, "hello"]
+        assert conv._compaction is not None
+        requests.append(provider.requests)
+    assert requests[0] == requests[1]
+
+
+async def test_parallel_block_cancels_provider_and_restores_history() -> None:
+    conv = Conversation([Message.user("earlier"), Message.assistant_text("ok")])
+    before = list(conv.messages)
+    provider = FakeProvider(ScriptedTurn.text("never", delay=5))
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.block("off_topic", REPLY, usage=Usage(input_tokens=2))
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_block], guardrail_mode="parallel")
+    started = asyncio.get_running_loop().time()
+    result = await asyncio.wait_for(agent.run(PROMPT, conversation=conv), timeout=2)
+    assert asyncio.get_running_loop().time() - started < 1  # not waiting out the turn
+    assert provider.call_count == 1
+    assert result.text == REPLY
+    assert result.stop_reason == "refusal"
+    assert result.iterations == 0
+    assert result.usage == Usage(input_tokens=2)
+    assert result.guardrail is not None and result.guardrail.category == "off_topic"
+    assert conv.messages == before
+    assert result.messages == before
+    assert conv._compaction is None
+
+
+async def test_parallel_block_rolls_back_summary_state() -> None:
+    from tests.test_compaction import chat_history, small
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.text("SUMMARY-ONE", usage=Usage(input_tokens=11)),
+            ScriptedTurn.text("never", delay=5),
+        ]
+    )
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.1)
+        return GuardrailVerdict.block("off_topic", REPLY)
+
+    agent = Agent(
+        provider,
+        model="test-model",
+        tools=[small],
+        context_budget=2_000,
+        input_guardrails=[slow_block],
+        guardrail_mode="parallel",
+    )
+    conv = Conversation(chat_history(10))
+    before = list(conv.messages)
+    result = await asyncio.wait_for(agent.run(PROMPT, conversation=conv), timeout=2)
+    # The summary call ran (it never sees the new prompt) and its usage counts,
+    # but the blocked run leaves no summary state on the conversation.
+    assert provider.call_count == 2
+    assert all(PROMPT not in m.text for m in provider.requests[0].messages)
+    assert result.text == REPLY
+    assert result.usage == Usage(input_tokens=11)
+    assert conv.messages == before
+    assert conv._compaction is None
+
+
+async def test_parallel_tool_waits_for_guard() -> None:
+    called = {"tool": False}
+
+    @tool
+    def probe() -> str:
+        """Record that the tool ran."""
+        called["tool"] = True
+        return "ran"
+
+    provider = FakeProvider([ScriptedTurn.tool_use(tool_call("probe")), ScriptedTurn.text("x")])
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.1)
+        return GuardrailVerdict.block("unsafe", REPLY)
+
+    agent = Agent(
+        provider, model="m", tools=[probe], input_guardrails=[slow_block], guardrail_mode="parallel"
+    )
+    events = await asyncio.wait_for(_collect(agent, PROMPT), timeout=2)
+    assert called["tool"] is False
+    assert provider.call_count == 1
+    assert events[0] == TextDelta(REPLY)
+    assert isinstance(events[-1], RunEnd) and events[-1].result.text == REPLY
+
+
+async def test_parallel_block_emits_only_placeholder() -> None:
+    provider = FakeProvider(
+        ScriptedTurn.text("LEAKED", chunks=["LEA", "KED"], thinking="secret thoughts")
+    )
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.block("off_topic", REPLY)
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_block], guardrail_mode="parallel")
+    events = await asyncio.wait_for(_collect(agent, PROMPT), timeout=2)
+    assert provider.call_count == 1
+    assert len(events) == 2
+    assert events[0] == TextDelta(REPLY)
+    assert isinstance(events[1], RunEnd)
+    assert events[1].result.text == REPLY
+    assert events[1].result.messages == []
+
+
+async def test_parallel_block_with_output_type_raises() -> None:
+    provider = FakeProvider(ScriptedTurn.text('{"value": "x"}'))
+    conv = Conversation()
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.block("off_topic", REPLY)
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_block], guardrail_mode="parallel")
+    with pytest.raises(GuardrailTripped):
+        await agent.run(PROMPT, conversation=conv, output_type=Answer)
+    assert conv.messages == []
+
+
+async def test_parallel_timeout_before_verdict_rolls_back_prompt() -> None:
+    async def slow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(5)
+        return GuardrailVerdict.allow()  # pragma: no cover
+
+    conv = Conversation([Message.user("earlier"), Message.assistant_text("ok")])
+    before = list(conv.messages)
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("fast answer")),
+        model="m",
+        input_guardrails=[slow],
+        guardrail_mode="parallel",
+        run_timeout=0.2,
+    )
+    with pytest.raises(RunTimeoutError) as info:
+        await asyncio.wait_for(agent.run(PROMPT, conversation=conv), timeout=2)
+    assert conv.messages == before
+    assert info.value.messages == before
+    assert conv._compaction is None
+
+
+async def test_parallel_session_block_records_blocked(db: Path) -> None:
+    provider = FakeProvider([ScriptedTurn.text("hi there"), ScriptedTurn.text("never", delay=5)])
+
+    async def guard(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        if "SECRETPROMPT" in inp.message.text:
+            return GuardrailVerdict.block("off_topic", REPLY, usage=Usage(input_tokens=4))
+        return GuardrailVerdict.allow()
+
+    agent = Agent(provider, model="m", input_guardrails=[guard], guardrail_mode="parallel")
+    first = await agent.run("hello", session_id="p1")
+    assert first.text == "hi there"
+    stored = _rows(db, "SELECT seq, role FROM logpose_messages ORDER BY seq")
+    result = await asyncio.wait_for(agent.run(PROMPT, session_id="p1"), timeout=2)
+    assert result.text == REPLY
+    assert _rows(db, "SELECT seq, role FROM logpose_messages ORDER BY seq") == stored
+    rows = _rows(db, "SELECT outcome, iterations, input_tokens FROM logpose_runs")
+    assert ("blocked", 0, 4) in rows
+    await agent.aclose()
+
+
+async def test_parallel_provider_error_waits_for_block() -> None:
+    from logpose.errors import ProviderError
+
+    provider = FakeProvider(ScriptedTurn.failure(ProviderError("boom")))
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.block("off_topic", REPLY)
+
+    agent = Agent(provider, model="m", input_guardrails=[slow_block], guardrail_mode="parallel")
+    result = await asyncio.wait_for(agent.run(PROMPT), timeout=2)
+    assert result.text == REPLY
+
+
+def test_parallel_mode_through_sync_stream() -> None:
+    from logpose.sync import close_sync, stream_sync
+
+    async def slow_allow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.allow()
+
+    async def slow_block(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.block("off_topic", REPLY)
+
+    provider = FakeProvider(ScriptedTurn.text("abc", chunks=["a", "b", "c"]))
+    agent = Agent(provider, model="m", input_guardrails=[slow_allow], guardrail_mode="parallel")
+    events = list(stream_sync(agent, PROMPT))
+    assert [e for e in events if isinstance(e, TextDelta)] == [TextDelta(x) for x in "abc"]
+    close_sync(agent)
+
+    blocked = Agent(
+        FakeProvider(ScriptedTurn.text("LEAK", delay=5)),
+        model="m",
+        input_guardrails=[slow_block],
+        guardrail_mode="parallel",
+    )
+    events = list(stream_sync(blocked, PROMPT))
+    assert events[0] == TextDelta(REPLY) and len(events) == 2
+    close_sync(blocked)
