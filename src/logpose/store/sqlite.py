@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import random
 import secrets
@@ -67,9 +68,25 @@ _MIGRATIONS: list[list[str]] = [
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
 
+_SPAN_PAGE = 200
 _POLL_INTERVAL = 0.05  # seconds between lease attempts while waiting
 
 _T = TypeVar("_T")
+
+
+def _json_safe(value: Any) -> Any:
+    """Make ``value`` strictly JSON-serializable: non-finite floats become strings."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, dict):
+        return {k if isinstance(k, str) else str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _dumps_safe(value: Any) -> str:
+    return json.dumps(_json_safe(value), default=str, allow_nan=False)
 
 
 def _now_ms() -> int:
@@ -598,8 +615,8 @@ class SQLiteStore:
                         sp.end_ns,
                         sp.status_code,
                         sp.status_message,
-                        json.dumps(sp.attributes),
-                        json.dumps(sp.events),
+                        _dumps_safe(sp.attributes),
+                        _dumps_safe(sp.events),
                     ),
                 )
                 for sp in spans
@@ -614,7 +631,11 @@ class SQLiteStore:
         session_id: str | None = None,
         trace_id: str | None = None,
     ) -> AsyncIterator[SpanRecord]:
-        """Stream spans ordered by ``start_ns``; ``since_ns``/``until_ns`` are inclusive."""
+        """Stream spans ordered by ``(start_ns, trace_id, span_id)``; bounds are inclusive.
+
+        Pages of ``_SPAN_PAGE`` rows are read under the store lock, which is released
+        before records are yielded, so consumers may call the store inside the loop.
+        """
         where: list[str] = []
         params: list[Any] = []
         for clause, value in (
@@ -626,40 +647,60 @@ class SQLiteStore:
             if value is not None:
                 where.append(clause)
                 params.append(value)
-        sql = (
-            "SELECT trace_id, span_id, parent_span_id, run_id, session_id, name, kind, "
-            "start_ns, end_ns, status_code, status_message, attributes, events "
-            "FROM logpose_spans"
-            + (" WHERE " + " AND ".join(where) if where else "")
-            + " ORDER BY start_ns, span_id"
+        cols = (
+            "trace_id, span_id, parent_span_id, run_id, session_id, name, kind, "
+            "start_ns, end_ns, status_code, status_message, attributes, events"
         )
-        # Hold the store lock while the cursor is open (one connection), but fetch in
-        # batches so a large trace set is never loaded at once.
-        async with self._lock:
-            async with self._conn().execute(sql, params) as cur:
-                while True:
-                    rows = await cur.fetchmany(200)
-                    if not rows:
-                        break
-                    for r in rows:
-                        yield SpanRecord(
-                            trace_id=r[0],
-                            span_id=r[1],
-                            parent_span_id=r[2],
-                            run_id=r[3],
-                            session_id=r[4],
-                            name=r[5],
-                            kind=int(r[6]),
-                            start_ns=int(r[7]),
-                            end_ns=int(r[8]),
-                            status_code=int(r[9]),
-                            status_message=r[10],
-                            attributes=json.loads(r[11]),
-                            events=json.loads(r[12]),
-                        )
+        names = [c.strip() for c in cols.split(",")]
+        base = " AND ".join(where)
+        after: tuple[int, str, str] | None = None
+        # Keyset pagination: the lock is held per page only, never across a yield.
+        while True:
+            clauses, args = base, list(params)
+            if after is not None:
+                keyset = (
+                    "(start_ns > ? OR (start_ns = ? AND trace_id > ?) "
+                    "OR (start_ns = ? AND trace_id = ? AND span_id > ?))"
+                )
+                clauses = f"{clauses} AND {keyset}" if clauses else keyset
+                a0, a1, a2 = after
+                args += [a0, a0, a1, a0, a1, a2]
+            sql = (
+                f"SELECT {cols} FROM logpose_spans"
+                + (f" WHERE {clauses}" if clauses else "")
+                + f" ORDER BY start_ns, trace_id, span_id LIMIT {_SPAN_PAGE}"
+            )
+            async with self._lock:
+                async with self._conn().execute(sql, args) as cur:
+                    rows = list(await cur.fetchall())
+            for r in rows:
+                d = dict(zip(names, r, strict=True))
+                yield SpanRecord(
+                    trace_id=d["trace_id"],
+                    span_id=d["span_id"],
+                    parent_span_id=d["parent_span_id"],
+                    run_id=d["run_id"],
+                    session_id=d["session_id"],
+                    name=d["name"],
+                    kind=int(d["kind"]),
+                    start_ns=int(d["start_ns"]),
+                    end_ns=int(d["end_ns"]),
+                    status_code=int(d["status_code"]),
+                    status_message=d["status_message"],
+                    attributes=json.loads(d["attributes"]),
+                    events=json.loads(d["events"]),
+                )
+            if len(rows) < _SPAN_PAGE:
+                return
+            last = rows[-1]
+            after = (int(last[7]), str(last[0]), str(last[1]))
 
     async def purge_spans(self, older_than_ms: int) -> int:
-        """Delete spans that started before the Unix-millisecond cutoff; return the count."""
+        """Delete spans that started before the Unix-millisecond cutoff; return the count.
+
+        Deletes by start time regardless of session. ``logpose_runs`` rows are kept,
+        so :meth:`run_id_exists` stays true for purged runs.
+        """
         counts = await self._write(
             [("DELETE FROM logpose_spans WHERE start_ns < ?", (older_than_ms * 1_000_000,))]
         )

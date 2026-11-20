@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import sqlite3
-import subprocess
 from pathlib import Path
 
 from logpose.store.base import RunRecord
@@ -177,13 +177,88 @@ async def test_run_id_exists(tmp_path: Path) -> None:
 
 def test_semconv_is_single_source() -> None:
     src = Path(__file__).resolve().parent.parent / "src"
-    out = subprocess.run(
-        ["grep", "-rlE", "[\"']gen_ai\\.", str(src), "--include=*.py"],
-        capture_output=True,
-        text=True,
-    ).stdout.split()
-    assert [Path(x).name for x in out] == ["semconv.py"]
+    pattern = re.compile(r"[\"']gen_ai\.")
+    hits = [p.name for p in src.rglob("*.py") if pattern.search(p.read_text(encoding="utf-8"))]
+    assert hits == ["semconv.py"]
     from logpose.tracing import semconv
 
     assert semconv.SCHEMA_URL == f"https://opentelemetry.io/schemas/{semconv.SEMCONV_VERSION}"
     assert semconv.GEN_AI_OPERATION_NAME == "gen_ai.operation.name"
+
+
+async def test_store_calls_inside_read_loop_do_not_deadlock(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        await s.write_spans([_span("t1", f"s{i}", start=i) for i in range(450)])
+
+        async def consume() -> int:
+            n = 0
+            async for _sp in s.read_spans():
+                assert await s.run_id_exists("nope") is False
+                if n == 0:
+                    await s.write_spans([_span("tx", "extra", start=10_000)])
+                n += 1
+            return n
+
+        assert await asyncio.wait_for(consume(), 2) >= 450
+
+
+async def test_abandoned_read_releases_store(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        await s.write_spans([_span("t1", f"s{i}", start=i) for i in range(300)])
+        it = s.read_spans()
+        async for _ in it:
+            break
+        await asyncio.wait_for(s.write_spans([_span("t2", "new")]), 2)
+
+
+async def test_read_pages_with_identical_start_ns_exactly_once(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        spans = [_span(f"t{i % 7}", f"s{i:04d}", start=5) for i in range(530)]
+        await s.write_spans(spans)
+        got = await _read(s)
+        keys = [(x.start_ns, x.trace_id, x.span_id) for x in got]
+        assert len(keys) == 530
+        assert keys == sorted(set(keys))
+
+
+async def test_unserializable_values_never_fail_the_batch(tmp_path: Path) -> None:
+    import datetime
+
+    bad = _span("t1", "bad")
+    object.__setattr__(
+        bad,
+        "attributes",
+        {
+            "b": b"xy",
+            "d": datetime.datetime(2020, 1, 1),
+            "set": {1},
+            "nan": float("nan"),
+            "inf": float("inf"),
+            "ninf": float("-inf"),
+            "nested": [{"x": float("nan")}],
+            1: "intkey",
+        },
+    )
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        await s.write_spans([bad, _span("t2", "ok")])
+        got = {x.span_id: x for x in await _read(s)}
+    a = got["bad"].attributes
+    assert a["nan"] == "NaN" and a["inf"] == "Infinity" and a["ninf"] == "-Infinity"
+    assert a["nested"] == [{"x": "NaN"}]
+    assert isinstance(a["b"], str) and isinstance(a["d"], str) and isinstance(a["set"], str)
+    assert "ok" in got
+
+
+async def test_json_round_trip_fidelity(tmp_path: Path) -> None:
+    attrs = {
+        "f": 1.5,
+        "t": True,
+        "i": 3,
+        "n": None,
+        "nest": {"a": [1, {"b": None}], "u": "h\u00e9llo \u4e16\u754c"},
+    }
+    sp = _span()
+    object.__setattr__(sp, "attributes", attrs)
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        await s.write_spans([sp])
+        assert (await _read(s))[0].attributes == attrs
