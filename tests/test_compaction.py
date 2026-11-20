@@ -966,3 +966,292 @@ async def test_failed_summary_not_retried_within_the_run() -> None:
     await agent.run("again", conversation=conv)
     assert is_summary_call(provider.requests[3])
     assert summary_messages(provider.requests[4])
+
+
+# -- Task 3: persisted summaries and the reactive context-length retry ----------
+
+
+@pytest.fixture
+def session_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from logpose.store import manager
+
+    db = tmp_path / "s.db"
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(db))
+    manager.reset_stores_for_tests()
+    yield db
+    manager.reset_stores_for_tests()
+
+
+async def test_summary_persists_across_requests(session_db: Path) -> None:
+    from logpose.store import manager
+
+    provider = FakeProvider([ScriptedTurn.text("SUMMARY-ONE"), ScriptedTurn.text("answer")])
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    async with agent.session("chat-1") as handle:
+        handle.conversation.extend(chat_history(10))
+        await agent.run("latest", session=handle)
+    await agent.aclose()
+    assert is_summary_call(provider.requests[0])
+    first_turn = provider.requests[1]
+    with sqlite3.connect(session_db) as conn:
+        rows = list(conn.execute("SELECT session_id, upto_seq, text FROM logpose_summaries"))
+    # upto_seq is the stored seq of the last summarized message (cut index - 1).
+    # The request was [first turn, summary, *history[cut:]] over 21 messages.
+    cut = 21 - (len(first_turn.messages) - 2)
+    assert first_turn.messages[2] == Message(
+        role="user", content=[TextBlock(text=f"<q{cut // 2}> " + "x" * 400)]
+    )
+    assert rows == [("chat-1", cut - 1, "SUMMARY-ONE")]
+
+    # A new process: fresh stores, agent and provider.
+    manager.reset_stores_for_tests()
+    provider_b = FakeProvider([ScriptedTurn.text("answer B")])
+    agent_b = Agent(provider_b, model="test-model", context_budget=2_000)
+    result = await agent_b.run("follow up", session_id="chat-1")
+    await agent_b.aclose()
+    assert result.text == "answer B"
+    assert provider_b.call_count == 1
+    request = provider_b.requests[0]
+    assert not is_summary_call(request)
+    assert [m.text for m in summary_messages(request)] == [SUMMARY_PREFIX + "SUMMARY-ONE"]
+    # Same prefix as run A's turn, so prompt caching survives the new process.
+    assert request.messages[: len(first_turn.messages)] == first_turn.messages
+    assert request.messages[-1].text == "follow up"
+    assert_request_valid(request)
+
+
+async def test_persisted_summary_survives_structured_output_rollback(session_db: Path) -> None:
+    from pydantic import BaseModel
+
+    from logpose.store import manager
+
+    class Answer(BaseModel):
+        value: int
+
+    provider = FakeProvider(
+        [ScriptedTurn.text("S"), ScriptedTurn.text("not json"), ScriptedTurn.text('{"value": 3}')]
+    )
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    async with agent.session("chat-2") as handle:
+        handle.conversation.extend(chat_history(10))
+        result = await agent.run("latest", session=handle, output_type=Answer, output_retries=1)
+        assert result.output == Answer(value=3)
+    await agent.aclose()
+
+    manager.reset_stores_for_tests()
+    provider_b = FakeProvider([ScriptedTurn.text("B")])
+    agent_b = Agent(provider_b, model="test-model", context_budget=2_000)
+    async with agent_b.session("chat-2") as handle:
+        # The invalid answer and its correction were dropped before saving.
+        assert len(handle.conversation.messages) == 22
+        state = handle.conversation._compaction
+        assert state is not None and state.summary == "S"
+        await agent_b.run("next", session=handle)
+    await agent_b.aclose()
+    assert provider_b.call_count == 1
+    assert [m.text for m in summary_messages(provider_b.requests[0])] == [SUMMARY_PREFIX + "S"]
+    assert_request_valid(provider_b.requests[0])
+
+
+async def test_extended_summary_is_persisted(session_db: Path) -> None:
+    from logpose.store import manager
+
+    provider = FakeProvider([ScriptedTurn.text("SUMMARY-ONE"), ScriptedTurn.text("answer")])
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    async with agent.session("chat-3") as handle:
+        handle.conversation.extend(chat_history(10))
+        await agent.run("latest", session=handle)
+    await agent.aclose()
+
+    manager.reset_stores_for_tests()
+    provider_b = FakeProvider([ScriptedTurn.text("SUMMARY-TWO"), ScriptedTurn.text("more")])
+    agent_b = Agent(provider_b, model="test-model", context_budget=2_000)
+    async with agent_b.session("chat-3") as handle:
+        handle.conversation.extend(chat_history(6, tag="b"))
+        await agent_b.run("follow up", session=handle)
+    await agent_b.aclose()
+    extend_call = provider_b.requests[0]
+    assert is_summary_call(extend_call)
+    assert "SUMMARY-ONE" in all_text(extend_call.messages)
+    with sqlite3.connect(session_db) as conn:
+        latest = conn.execute(
+            "SELECT text FROM logpose_summaries ORDER BY upto_seq DESC LIMIT 1"
+        ).fetchone()
+    assert latest == ("SUMMARY-TWO",)
+
+
+CONTEXT_ERROR = (
+    "This model's maximum context length is 8192 tokens. However, your messages "
+    "resulted in 9000 tokens. Please reduce the length of the messages."
+)
+
+
+async def test_reactive_context_length_retry() -> None:
+    events: list[RuntimeEvent] = []
+    rejection = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider(
+        [ScriptedTurn.failure(rejection), ScriptedTurn.text("S"), ScriptedTurn.text("ok")]
+    )
+    agent = Agent(provider, model="test-model", observers=[events.append])
+    conv = Conversation(chat_history(4))
+    result = await agent.run("latest", conversation=conv)
+
+    assert result.text == "ok"
+    assert result.iterations == 1
+    assert provider.call_count == 3
+    # The first request was below the threshold: sent whole.
+    assert provider.requests[0].messages == conv.messages[:-1]
+    assert sum(is_summary_call(r) for r in provider.requests) == 1
+    assert is_summary_call(provider.requests[1])
+    retried = provider.requests[2]
+    assert [m.text for m in summary_messages(retried)] == [SUMMARY_PREFIX + "S"]
+    assert retried.messages[-1].text == "latest"
+    assert_request_valid(retried)
+    assert conv._compaction is not None and conv._compaction.summary == "S"
+    assert any(e.name == "context.compacted" and e.summarized for e in events)
+
+
+async def test_second_context_length_rejection_propagates() -> None:
+    first = ProviderError(CONTEXT_ERROR, status_code=400)
+    second = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider(
+        [ScriptedTurn.failure(first), ScriptedTurn.text("S"), ScriptedTurn.failure(second)]
+    )
+    agent = Agent(provider, model="test-model")
+    with pytest.raises(ProviderError) as info:
+        await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert not isinstance(info.value, ContextOverflowError)
+    assert info.value is second
+    assert provider.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Error: context_length_exceeded",
+        "prompt exceeds the model's CONTEXT WINDOW",
+        "Maximum Context Length reached",
+    ],
+)
+async def test_context_length_phrasings_detected(message: str) -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError(message, status_code=400)),
+            ScriptedTurn.text("S"),
+            ScriptedTurn.text("ok"),
+        ]
+    )
+    agent = Agent(provider, model="test-model")
+    result = await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert result.text == "ok"
+    assert provider.call_count == 3
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ProviderError("invalid request", status_code=400),
+        ProviderError(CONTEXT_ERROR, status_code=500),
+        ProviderError(CONTEXT_ERROR),
+    ],
+)
+async def test_other_errors_are_not_reactive(error: ProviderError) -> None:
+    provider = FakeProvider([ScriptedTurn.failure(error)])
+    agent = Agent(provider, model="test-model")
+    with pytest.raises(ProviderError) as info:
+        await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert info.value is error
+    assert provider.call_count == 1
+
+
+async def test_structured_output_unsupported_is_not_reactive() -> None:
+    from pydantic import BaseModel
+
+    from logpose.errors import StructuredOutputUnsupportedError
+
+    class Answer(BaseModel):
+        value: int
+
+    error = StructuredOutputUnsupportedError(
+        "response_format json_schema unsupported (context window)", status_code=400
+    )
+    provider = FakeProvider([ScriptedTurn.failure(error)])
+    agent = Agent(provider, model="test-model")
+    with pytest.raises(StructuredOutputUnsupportedError) as info:
+        await agent.run("latest", conversation=Conversation(chat_history(4)), output_type=Answer)
+    assert info.value is error
+    assert provider.call_count == 1
+
+
+async def test_context_length_without_anything_to_summarize_propagates() -> None:
+    rejection = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider([ScriptedTurn.failure(rejection)])
+    agent = Agent(provider, model="test-model")
+    with pytest.raises(ProviderError) as info:
+        await agent.run("x" * 400)
+    assert info.value is rejection
+    assert provider.call_count == 1
+
+
+async def test_context_length_with_custom_policy_propagates() -> None:
+    def passthrough(context):
+        return PreparedContext(context.messages, context.system)
+
+    rejection = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider([ScriptedTurn.failure(rejection)])
+    agent = Agent(provider, model="test-model", context_policy=passthrough)
+    with pytest.raises(ProviderError) as info:
+        await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert info.value is rejection
+    assert provider.call_count == 1
+
+
+async def test_context_length_when_summary_fails_propagates_rejection() -> None:
+    rejection = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider(
+        [ScriptedTurn.failure(rejection), ScriptedTurn.failure(ProviderError("down"))]
+    )
+    agent = Agent(provider, model="test-model")
+    with pytest.raises(ProviderError) as info:
+        await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert info.value is rejection
+    assert provider.call_count == 2
+
+
+async def test_reactive_retry_respects_run_deadline() -> None:
+    from logpose import RunTimeoutError
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError(CONTEXT_ERROR, status_code=400)),
+            ScriptedTurn.text("S", delay=5.0),
+        ]
+    )
+    agent = Agent(provider, model="test-model", run_timeout=0.2)
+    with pytest.raises(RunTimeoutError):
+        await agent.run("latest", conversation=Conversation(chat_history(4)))
+    assert provider.call_count == 2
+
+
+async def test_reactive_retry_once_per_turn_not_per_run() -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.failure(ProviderError(CONTEXT_ERROR, status_code=400)),
+            ScriptedTurn.text("S1"),
+            ScriptedTurn.tool_use(tool_call("small", id="c1")),
+            ScriptedTurn.failure(ProviderError(CONTEXT_ERROR, status_code=400)),
+            ScriptedTurn.text("S2"),
+            ScriptedTurn.text("done"),
+        ]
+    )
+    agent = Agent(provider, model="test-model", tools=[small], max_iterations=2)
+    conv = Conversation(chat_history(6))
+    result = await agent.run("latest", conversation=conv)
+    assert result.text == "done"
+    assert result.iterations == 2
+    assert provider.call_count == 6
+    assert is_summary_call(provider.requests[1]) and is_summary_call(provider.requests[4])
+    # The second forced summary extends the first.
+    assert "S1" in all_text(provider.requests[4].messages)
+    assert [m.text for m in summary_messages(provider.requests[5])] == [SUMMARY_PREFIX + "S2"]
+    assert_request_valid(provider.requests[5])

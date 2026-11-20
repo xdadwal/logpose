@@ -130,6 +130,7 @@ from logpose.errors import (
     OutputValidationError,
     ProviderError,
     RunTimeoutError,
+    StructuredOutputUnsupportedError,
     ToolExecutionError,
 )
 from logpose.events import (
@@ -1405,28 +1406,50 @@ class Agent:
                     request_id=self._runtime_id("request"),
                 )
                 done: CompletionDone | None = None
-                async with _run_budget(run_deadline):
-                    request, estimate = await self._prepare_request(
-                        history,
-                        response_format,
-                        current_start=current_start,
-                        compaction=compaction,
-                        run_compaction=run_compaction,
-                        context=turn_context,
-                        run_deadline=run_deadline,
-                        add_usage=add_usage,
-                    )
-                turn_stream = self._provider_turn(request, turn_context, run_deadline)
-                try:
-                    async for event in turn_stream:
-                        if isinstance(event, ProviderTextDelta):
-                            yield TextDelta(text=event.text)
-                        elif isinstance(event, ProviderThinkingDelta):
-                            yield ThinkingDelta(text=event.text)
-                        else:
-                            done = event
-                finally:
-                    await _aclose(turn_stream)
+                # A context-length rejection forces a summary and retries this
+                # turn once, within the same iteration.
+                rejection: ProviderError | None = None
+                while True:
+                    shape = _summary_shape(compaction)
+                    async with _run_budget(run_deadline):
+                        request, estimate = await self._prepare_request(
+                            history,
+                            response_format,
+                            current_start=current_start,
+                            compaction=compaction,
+                            run_compaction=run_compaction,
+                            context=turn_context,
+                            run_deadline=run_deadline,
+                            add_usage=add_usage,
+                            force_summary=rejection is not None,
+                        )
+                    if rejection is not None and shape == _summary_shape(compaction):
+                        # Nothing more could be summarized (or the summary call
+                        # failed): the same request would be rejected again.
+                        raise rejection
+                    turn_stream = self._provider_turn(request, turn_context, run_deadline)
+                    try:
+                        async for event in turn_stream:
+                            if isinstance(event, ProviderTextDelta):
+                                yield TextDelta(text=event.text)
+                            elif isinstance(event, ProviderThinkingDelta):
+                                yield ThinkingDelta(text=event.text)
+                            else:
+                                done = event
+                    except ProviderError as exc:
+                        if (
+                            rejection is not None
+                            or compaction is None
+                            or not _is_context_length_error(exc)
+                        ):
+                            raise
+                        rejection = exc
+                        request_id = self._runtime_id("request")
+                        turn_context = replace(turn_context, request_id=request_id)
+                        continue
+                    finally:
+                        await _aclose(turn_stream)
+                    break
 
                 if done is None:
                     raise ProviderError(
@@ -1786,6 +1809,7 @@ class Agent:
         context: RuntimeContext | None = None,
         run_deadline: float | None = None,
         add_usage: Callable[[Usage], None] | None = None,
+        force_summary: bool = False,
     ) -> tuple[CompletionRequest, int]:
         """Await selection before inference; isolate policy mutation from canonical data.
 
@@ -1802,6 +1826,9 @@ class Agent:
                 ``context.compacted`` event.
             run_deadline: Bounds the summary call's retries.
             add_usage: Receives the summary call's token usage.
+            force_summary: Summarize (or extend the summary) even below the
+                threshold; set after the provider rejected the request for
+                exceeding its context length.
 
         Returns:
             The request to send, and its raw (uncalibrated) token estimate on
@@ -1821,6 +1848,7 @@ class Agent:
                 context=context,
                 run_deadline=run_deadline,
                 add_usage=add_usage,
+                force=force_summary,
             )
         if self.context_policy is None:
             return request, 0
@@ -1875,6 +1903,7 @@ class Agent:
         context: RuntimeContext | None,
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
+        force: bool = False,
     ) -> tuple[CompletionRequest, int]:
         """Shape a request with the built-in policy: pointers, then the summary.
 
@@ -1883,7 +1912,10 @@ class Agent:
         of the input budget, replaces older turns with one model-written summary
         (cached on ``state`` and reused while it still fits). Cuts fall only on
         caller turn starts, never inside the current run, and never touch the
-        first user turn.
+        first user turn. ``force`` runs step 2 whatever the estimate, aiming at
+        ``compaction_target`` of the smaller of the input budget and the
+        current estimate (the provider just rejected that request, so the
+        estimate itself is too high a target).
 
         Returns:
             The request to send and its raw token estimate.
@@ -1929,7 +1961,7 @@ class Agent:
         attempted = False
 
         if (
-            calibrated(raw) >= self.compaction_threshold * self.input_budget
+            (force or calibrated(raw) >= self.compaction_threshold * self.input_budget)
             and first >= 0
             and not run_state.summary_failed
         ):
@@ -1946,7 +1978,8 @@ class Agent:
                     candidates,
                     fixed_chars=prefix_chars + placeholder + overhead_chars(system, tools),
                     ratio=state.ratio,
-                    target_tokens=self.compaction_target * self.input_budget,
+                    target_tokens=self.compaction_target
+                    * min(self.input_budget, calibrated(raw) if force else self.input_budget),
                 )
                 floor = calibrated(estimate_tokens(compose("", cut), system, tools))
                 if floor > window:
@@ -2544,6 +2577,31 @@ def _check_output_retries(output_retries: object) -> None:
         or output_retries < 0
     ):
         raise LogposeError(f"output_retries must be an int >= 0, got {output_retries!r}.")
+
+
+def _summary_shape(state: _CompactionState | None) -> tuple[str | None, int] | None:
+    """The cached summary and its cut, to tell whether a forced summary changed them."""
+    return (state.summary, state.cut_index) if state is not None else None
+
+
+_CONTEXT_LENGTH_MARKERS = ("context_length", "maximum context length", "context window")
+
+
+def _is_context_length_error(error: ProviderError) -> bool:
+    """Whether ``error`` is a provider rejecting a request as too long for its context.
+
+    An HTTP 400 whose message (or error code) mentions ``context_length``,
+    ``maximum context length`` or ``context window``, case-insensitively. A
+    structured-output rejection or a failure after output was delivered never is.
+    """
+    if (
+        isinstance(error, StructuredOutputUnsupportedError)
+        or error.status_code != 400
+        or error.partial
+    ):
+        return False
+    text = f"{error.message} {error.error_code or ''}".lower()
+    return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
 
 
 @dataclass

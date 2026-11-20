@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from logpose.agent import Conversation
+from logpose.compaction import _CompactionState, fingerprint
 from logpose.errors import LogposeError
 from logpose.messages import Message
 
@@ -58,6 +59,15 @@ class SessionHandle:
         loaded_count: How many messages were loaded on enter. Messages after this
             index in ``conversation.messages`` are new and are saved on exit.
         next_seq: The stored ``seq`` the first new message will get.
+        stored_summary: The latest stored summary as ``(upto_seq, text)``, if any.
+
+    Stored messages are append-only from ``seq`` 0 with no gaps, so a loaded
+    message's ``seq`` equals its index in ``conversation.messages``. A summary's
+    ``upto_seq`` is the ``seq`` of the last message it covers; the built-in
+    context policy's cut index (the first message sent verbatim after the
+    summary) is therefore ``upto_seq + 1``. A stored summary that fits the
+    loaded history seeds the conversation's compaction state on enter, with a
+    calibration ratio of 1.0 (the ratio is not persisted).
     """
 
     def __init__(
@@ -69,6 +79,7 @@ class SessionHandle:
         lost: bool = False,
         loaded_count: int = 0,
         next_seq: int = 0,
+        stored_summary: tuple[int, str] | None = None,
     ) -> None:
         self.id = id
         self.conversation = conversation
@@ -77,6 +88,33 @@ class SessionHandle:
         self.lost = lost
         self.loaded_count = loaded_count
         self.next_seq = next_seq
+        self.stored_summary = stored_summary
+        if stored_summary is not None and next_seq == loaded_count:
+            upto_seq, text = stored_summary
+            cut = upto_seq + 1
+            if 0 < cut <= loaded_count:
+                conversation._compaction = _CompactionState(
+                    summary=text,
+                    cut_index=cut,
+                    fingerprint=fingerprint(conversation.messages[:cut]),
+                )
+
+    def summary_to_save(self) -> tuple[int, str] | None:
+        """Return ``(upto_seq, text)`` for a summary to store on exit, else ``None``.
+
+        Only a summary that differs from ``stored_summary`` and still matches
+        the history it was made from (its fingerprint) is returned, and only
+        when stored ``seq`` values equal message indices.
+        """
+        state = self.conversation._compaction
+        if state is None or state.summary is None or self.next_seq != self.loaded_count:
+            return None
+        messages = self.conversation.messages
+        cut = state.cut_index
+        if not 0 < cut <= len(messages) or fingerprint(messages[:cut]) != state.fingerprint:
+            return None
+        pending = (cut - 1, state.summary)
+        return None if pending == self.stored_summary else pending
 
     def new_messages(self) -> list[Message]:
         """Return the messages appended to ``conversation`` since it was loaded."""
@@ -101,6 +139,10 @@ class SessionStore(Protocol):
     async def load_messages(self, session_id: str) -> list[Message]: ...
 
     async def record_run(self, record: RunRecord) -> None: ...
+
+    async def save_summary(self, session_id: str, upto_seq: int, text: str) -> None: ...
+
+    async def load_summary(self, session_id: str) -> tuple[int, str] | None: ...
 
     async def delete_session(self, session_id: str) -> None: ...
 
