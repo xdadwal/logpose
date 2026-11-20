@@ -936,6 +936,14 @@ up to 10,000 spans or 64 MiB; beyond that new spans are dropped and one `WARNING
 is logged on the `logpose.trace` logger. Tracing never fails or changes a run: a
 store or writer error is logged and the run continues.
 
+If another process holds the database write lock, a traced run without a session
+does not wait for it. Opening the store for the first time (per database path and
+event loop) and checking a caller-supplied `run_id` against stored traces share a
+wait of at most `max(flush_timeout, 0.25)` seconds. When the open takes longer, the
+run is untraced and the open continues in the background for later runs; when the
+check takes longer, it is skipped. Each logs one `WARNING` per agent on
+`logpose.trace`. Session runs wait for their lease as usual.
+
 ### Run IDs and metadata (evals)
 
 Give a run your own ID and labels to join traces to eval results:
@@ -946,9 +954,18 @@ await agent.run(
 )
 ```
 
-`run_id` matches `[A-Za-z0-9._-]{1,128}`; reusing an ID that is already recorded
-(in a run record or in stored spans) raises `LogposeError` before any provider
-call. `metadata` takes at most 64 keys, keys up to 128 characters, string values
+`run_id` matches `[A-Za-z0-9._-]{1,128}`. With tracing on or a session, reusing an
+ID that is already recorded (in a run record or in stored spans) or in use by a
+running run in this process raises `LogposeError` before any provider call. With
+neither, reuse is not detected. Known gaps:
+
+- Several worker processes: traced runs without a session see other processes'
+  runs only once those are stored, so two workers starting the same `run_id` at
+  once can both write a trace with that ID.
+- When the database is busy (see above) the check against stored traces is skipped
+  for that run, with a `WARNING`; runs in this process are still checked.
+
+`metadata` takes at most 64 keys, keys up to 128 characters, string values
 up to 1,024 characters, and `str`, `int`, `float` (finite) or `bool` values. It
 appears on spans as `logpose.metadata.<key>`, on `RuntimeContext`, and on the
 session `RunRecord`, but not on `RuntimeEvent`.
@@ -1010,7 +1027,9 @@ service:
 
 ### Purging
 
-logpose never deletes spans on its own.
+logpose never deletes spans on a schedule. Deleting a session also deletes its
+spans: `delete_session`, `purge_expired_sessions`, and an expired session being
+reset on its next use. Export first if you keep eval traces.
 
 ```python
 from datetime import timedelta
