@@ -89,6 +89,56 @@ def _dumps_safe(value: Any) -> str:
     return json.dumps(_json_safe(value), default=str, allow_nan=False)
 
 
+_SPAN_INSERT = (
+    "INSERT OR REPLACE INTO logpose_spans (trace_id, span_id, parent_span_id, "
+    "run_id, session_id, name, kind, start_ns, end_ns, status_code, "
+    "status_message, attributes, events) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _span_row(sp: SpanRecord) -> tuple[Any, ...]:
+    return (
+        sp.trace_id,
+        sp.span_id,
+        sp.parent_span_id,
+        sp.run_id,
+        sp.session_id,
+        sp.name,
+        sp.kind,
+        sp.start_ns,
+        sp.end_ns,
+        sp.status_code,
+        sp.status_message,
+        _dumps_safe(sp.attributes),
+        _dumps_safe(sp.events),
+    )
+
+
+def write_spans_blocking(
+    path: str | os.PathLike[str], spans: Sequence[SpanRecord], *, timeout: float = 1.0
+) -> None:
+    """Write ``spans`` with a short-lived stdlib connection, without an event loop.
+
+    The store manager's last resort for spans left queued when their writer's
+    loop is gone (interpreter exit, a finished ``asyncio.run``). The schema must
+    already exist; ``timeout`` bounds the wait for a database lock.
+    """
+    if not spans:
+        return
+    conn = sqlite3.connect(os.fspath(path), timeout=timeout, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.executemany(_SPAN_INSERT, [_span_row(sp) for sp in spans])
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -608,32 +658,7 @@ class SQLiteStore:
         """Store spans in one transaction; a repeated ``(trace_id, span_id)`` is replaced."""
         if not spans:
             return
-        await self._write(
-            [
-                (
-                    "INSERT OR REPLACE INTO logpose_spans (trace_id, span_id, parent_span_id, "
-                    "run_id, session_id, name, kind, start_ns, end_ns, status_code, "
-                    "status_message, attributes, events) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        sp.trace_id,
-                        sp.span_id,
-                        sp.parent_span_id,
-                        sp.run_id,
-                        sp.session_id,
-                        sp.name,
-                        sp.kind,
-                        sp.start_ns,
-                        sp.end_ns,
-                        sp.status_code,
-                        sp.status_message,
-                        _dumps_safe(sp.attributes),
-                        _dumps_safe(sp.events),
-                    ),
-                )
-                for sp in spans
-            ]
-        )
+        await self._write([(_SPAN_INSERT, _span_row(sp)) for sp in spans])
 
     async def read_spans(
         self,

@@ -42,8 +42,39 @@ def add(a: int, b: int) -> str:
     return str(a + b)
 
 
+class _MemorySink:
+    """Test-only span sink: keeps spans in memory instead of the store's writer."""
+
+    def __init__(self) -> None:
+        self.spans: list[SpanRecord] = []
+
+    def submit(self, span: SpanRecord) -> None:
+        self.spans.append(span)
+
+    async def run_id_exists(self, run_id: str) -> bool:
+        return any(span.run_id == run_id for span in self.spans)
+
+    async def flush(self, run_id: str | None, timeout: float) -> bool:
+        return True
+
+
+@pytest.fixture(autouse=True)
+def _memory_sink(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route each traced agent's spans to its own in-memory sink (no store writes)."""
+
+    async def open_sink(self: Agent) -> _MemorySink | None:
+        if self.tracing is None:
+            return None
+        sink = self.__dict__.get("_test_sink")
+        if sink is None:
+            sink = self.__dict__["_test_sink"] = _MemorySink()
+        return sink
+
+    monkeypatch.setattr(Agent, "_open_trace_sink", open_sink)
+
+
 def spans_of(agent: Agent) -> list[SpanRecord]:
-    sink = agent._trace_sink
+    sink = agent.__dict__.get("_test_sink")
     assert sink is not None
     return list(sink.spans)
 
@@ -533,7 +564,6 @@ async def test_tracing_off_by_default_and_none_forces_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert Agent(FakeProvider(), model="m").tracing is None
-    assert Agent(FakeProvider(), model="m")._trace_sink is None
     monkeypatch.setenv("LOGPOSE_TRACE", "  ")
     assert Agent(FakeProvider(), model="m").tracing is None
     monkeypatch.setenv("LOGPOSE_TRACE_CONTENT", "1")
@@ -548,7 +578,7 @@ async def test_tracing_off_by_default_and_none_forces_off(
     assert Agent(FakeProvider(), model="m", tracing=explicit).tracing is explicit
     agent = Agent(FakeProvider(ScriptedTurn.text("x")), model="m", tracing=None)
     await agent.run("hi")
-    assert agent._trace_sink is None
+    assert "_test_sink" not in agent.__dict__
 
 
 def test_tracing_validates_its_fields() -> None:

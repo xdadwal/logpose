@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from pydantic import BaseModel
 
-from logpose.agent import _UNSET, Agent, Conversation, _Unset
+from logpose.agent import _UNSET, Agent, Conversation, RunMetadata, _Unset
 from logpose.errors import LogposeError
 from logpose.events import Event, RunResult
 from logpose.messages import Message
@@ -353,6 +353,16 @@ def _session_kwargs(
     return kwargs
 
 
+def _run_kwargs(metadata: RunMetadata | None, run_id: str | None) -> dict[str, Any]:
+    """Collect only the run-labelling keywords the caller actually passed."""
+    kwargs: dict[str, Any] = {}
+    if metadata is not None:
+        kwargs["metadata"] = metadata
+    if run_id is not None:
+        kwargs["run_id"] = run_id
+    return kwargs
+
+
 def run_sync(
     agent: Agent,
     prompt: str | Message | None = None,
@@ -363,6 +373,8 @@ def run_sync(
     session_id: str | None = None,
     session_metadata: Mapping[str, str] | None = None,
     session: SessionHandle | None = None,
+    metadata: RunMetadata | None = None,
+    run_id: str | None = None,
 ) -> RunResult[Any]:
     """Run ``agent`` to completion, blocking until it finishes.
 
@@ -381,6 +393,9 @@ def run_sync(
         session_id: Persist this run in the named stored session.
         session_metadata: String metadata merged into the session's metadata.
         session: An already-leased handle from :meth:`SyncAgent.session`.
+        metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
+        run_id: Use this run ID instead of a generated one, as for
+            :meth:`~logpose.agent.Agent.run`.
 
     Returns:
         The completed :class:`~logpose.events.RunResult`.
@@ -395,6 +410,7 @@ def run_sync(
     runner = _runner_for(agent)
     kwargs = _output_kwargs(output_type, output_retries)
     kwargs.update(_session_kwargs(session_id, session_metadata, session))
+    kwargs.update(_run_kwargs(metadata, run_id))
     return runner.run(agent.run(prompt, conversation=conversation, **kwargs))
 
 
@@ -408,6 +424,8 @@ def stream_sync(
     session_id: str | None = None,
     session_metadata: Mapping[str, str] | None = None,
     session: SessionHandle | None = None,
+    metadata: RunMetadata | None = None,
+    run_id: str | None = None,
 ) -> Iterator[Event]:
     """Run ``agent``, yielding events as they happen.
 
@@ -433,6 +451,9 @@ def stream_sync(
         session_id: Persist this run in the named stored session.
         session_metadata: String metadata merged into the session's metadata.
         session: An already-leased handle from :meth:`SyncAgent.session`.
+        metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
+        run_id: Use this run ID instead of a generated one, as for
+            :meth:`~logpose.agent.Agent.run`.
 
     Returns:
         An iterator of :data:`~logpose.events.Event` values, ending with
@@ -449,6 +470,7 @@ def stream_sync(
     # should surface here rather than at the first `next()`.
     kwargs = _output_kwargs(output_type, output_retries)
     kwargs.update(_session_kwargs(session_id, session_metadata, session))
+    kwargs.update(_run_kwargs(metadata, run_id))
     events = agent.stream(prompt, conversation=conversation, **kwargs)
     return _drive(runner, events)
 
@@ -456,8 +478,9 @@ def stream_sync(
 def close_sync(agent: Agent) -> None:
     """Release the sync runtime and provider resources held by ``agent``.
 
-    Closes the agent's provider (only if the agent built it) and stops the
-    private loop thread. Safe to call on an agent that never ran synchronously,
+    Writes trace spans still queued on the private loop (bounded), closes the
+    agent's provider (only if the agent built it) and stops the private loop
+    thread. Safe to call on an agent that never ran synchronously,
     and safe to call twice. A later sync call on the same agent transparently
     starts a fresh loop.
 
@@ -545,6 +568,8 @@ class SyncAgent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> RunResult[Any]:
         """Run to completion, blocking until it finishes.
 
@@ -558,6 +583,9 @@ class SyncAgent:
             session_id: Persist this run in the named stored session.
             session_metadata: String metadata merged into the session's metadata.
             session: An already-leased handle from :meth:`session`.
+            metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
+            run_id: Use this run ID instead of a generated one, as for
+                :meth:`~logpose.agent.Agent.run`.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -577,6 +605,8 @@ class SyncAgent:
             session_id=session_id,
             session_metadata=session_metadata,
             session=session,
+            metadata=metadata,
+            run_id=run_id,
         )
 
     def stream(
@@ -589,6 +619,8 @@ class SyncAgent:
         session_id: str | None = None,
         session_metadata: Mapping[str, str] | None = None,
         session: SessionHandle | None = None,
+        metadata: RunMetadata | None = None,
+        run_id: str | None = None,
     ) -> Iterator[Event]:
         """Run, yielding events as they happen.
 
@@ -602,6 +634,9 @@ class SyncAgent:
             session_id: Persist this run in the named stored session.
             session_metadata: String metadata merged into the session's metadata.
             session: An already-leased handle from :meth:`session`.
+            metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
+            run_id: Use this run ID instead of a generated one, as for
+                :meth:`~logpose.agent.Agent.run`.
 
         Returns:
             An iterator of :data:`~logpose.events.Event` values, ending with
@@ -620,6 +655,8 @@ class SyncAgent:
             session_id=session_id,
             session_metadata=session_metadata,
             session=session,
+            metadata=metadata,
+            run_id=run_id,
         )
 
     def session(
@@ -650,7 +687,11 @@ class SyncAgent:
         return _SyncSession(runner, self.agent.session(session_id, metadata=metadata))
 
     def close(self) -> None:
-        """Close the provider and stop the private loop. Idempotent."""
+        """Write queued trace spans, close the provider, stop the private loop.
+
+        Spans are written by the store's background writer on the private loop;
+        closing waits (bounded) for them before the loop stops. Idempotent.
+        """
         close_sync(self.agent)
 
     def __enter__(self) -> SyncAgent:

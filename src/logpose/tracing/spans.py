@@ -1,9 +1,9 @@
 """Span records, the tracing settings, and the per-run span builder.
 
 No database or OpenTelemetry imports. The agent loop drives one private
-:class:`_SpanBuilder` per traced run; finished spans go to a :class:`_SpanSink`.
-Until the background store writer lands, the sink is an in-memory
-:class:`_MemorySink`; the store writer replaces it without touching the builder.
+:class:`_SpanBuilder` per traced run; finished spans go to a :class:`_SpanSink`,
+in production the store's background
+:class:`~logpose.tracing.writer.SpanWriter`.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import math
 import os
 import secrets
 import time
-from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, Protocol, TypeVar
@@ -164,18 +163,7 @@ class _SpanSink(Protocol):
 
     async def run_id_exists(self, run_id: str) -> bool: ...
 
-
-class _MemorySink:
-    """Bounded in-memory sink (the interim hand-off until the store writer)."""
-
-    def __init__(self, maxlen: int = 10_000) -> None:
-        self.spans: deque[SpanRecord] = deque(maxlen=maxlen)
-
-    def submit(self, span: SpanRecord) -> None:
-        self.spans.append(span)
-
-    async def run_id_exists(self, run_id: str) -> bool:
-        return any(span.run_id == run_id for span in self.spans)
+    async def flush(self, run_id: str | None, timeout: float) -> bool: ...
 
 
 # -- content helpers -----------------------------------------------------------

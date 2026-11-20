@@ -194,7 +194,6 @@ from logpose.tracing.spans import (
     _NO_TRACE,
     SUMMARY_PURPOSE,
     Tracing,
-    _MemorySink,
     _SpanBuilder,
     _SpanSink,
     tracing_from_env,
@@ -860,8 +859,7 @@ class Agent:
         self.guardrail_mode: GuardrailMode = guardrail_mode
         self._uses_store = False
         self.tracing: Tracing | None = resolved_tracing
-        # Where finished spans go. In-memory until the store writer replaces it.
-        self._trace_sink: _SpanSink | None = _MemorySink() if resolved_tracing is not None else None
+        self._trace_open_warned = False
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -1244,7 +1242,12 @@ class Agent:
         # Before the lease: a duplicate run ID touches nothing. Released only
         # after the run record is written, so a concurrent duplicate cannot
         # slip in between the run ending and its record existing.
-        reserved = await self._reserve_run_id(run_id, store)
+        sink = None
+        if self.tracing is not None:
+            from logpose.store import manager
+
+            sink = manager.span_writer(store)
+        reserved = await self._reserve_run_id(run_id, store, sink)
         claim = _RunIdClaim(run_id if reserved else None)
         inner = self._session_run(
             first,
@@ -1501,14 +1504,18 @@ class Agent:
 
     # -- tracing ------------------------------------------------------------
 
-    async def _reserve_run_id(self, run_id: str | None, store: SessionStore | None) -> bool:
+    async def _reserve_run_id(
+        self, run_id: str | None, store: SessionStore | None, sink: _SpanSink | None
+    ) -> bool:
         """Claim a caller-supplied ``run_id`` for this run, or raise if it is taken.
 
         The in-process claim is checked and taken synchronously, before the
-        first await, so concurrent runs cannot both pass; then the store and
-        the tracing sink are asked about finished runs. Checked only with a
-        session store or tracing; generated IDs are unique. A tracing sink that
-        cannot answer is logged and treated as "not found".
+        first await, so concurrent runs cannot both pass; then the session
+        store and the tracing sink (the store's span writer: spans still queued,
+        then ``logpose_runs`` and ``logpose_spans``) are asked about finished
+        runs. Checked only with a session store or tracing; generated IDs are
+        unique. A tracing sink that cannot answer is logged and treated as
+        "not found".
 
         Returns:
             ``True`` if this call claimed the ID: the caller must release it
@@ -1521,9 +1528,9 @@ class Agent:
         _ACTIVE_RUN_IDS.add(run_id)
         try:
             exists = await store.run_id_exists(run_id) if store is not None else False
-            if not exists and self._trace_sink is not None:
+            if not exists and sink is not None:
                 try:
-                    exists = await self._trace_sink.run_id_exists(run_id)
+                    exists = await sink.run_id_exists(run_id)
                 except Exception as exc:  # noqa: BLE001 - tracing never fails a run
                     _TRACE_LOGGER.warning(
                         "could not check run_id against stored traces: %s", type(exc).__name__
@@ -1579,20 +1586,56 @@ class Agent:
             "input_budget": self.input_budget,
         }
 
+    async def _open_trace_sink(self) -> _SpanSink | None:
+        """The span writer of this loop's store, or ``None`` when tracing is off.
+
+        Opens the store (shared with sessions, one per database path and event
+        loop) on first use. If it cannot be opened the run proceeds untraced;
+        the first such failure per agent logs one WARNING to ``logpose.trace``.
+        """
+        if self.tracing is None:
+            return None
+        from logpose.store import manager
+
+        try:
+            writer = manager.span_writer(await self._store())
+            if writer is None:  # pragma: no cover - closed by a concurrent aclose
+                raise LogposeError("the trace store was closed")
+        except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+            if not self._trace_open_warned:
+                self._trace_open_warned = True
+                _TRACE_LOGGER.warning(
+                    "tracing disabled: could not open the trace store (%s); runs proceed "
+                    "untraced until it can be opened",
+                    type(exc).__name__,
+                )
+            return None
+        return writer
+
+    async def _flush_trace(self, sink: _SpanSink | None, run_id: str) -> None:
+        """Wait, bounded by ``flush_timeout``, for this run's spans to be written."""
+        if sink is None or self.tracing is None:
+            return
+        try:
+            await sink.flush(run_id, self.tracing.flush_timeout)
+        except Exception as exc:  # noqa: BLE001 - tracing never fails a run
+            _TRACE_LOGGER.warning("span flush failed for run %s: %s", run_id, type(exc).__name__)
+
     def _new_trace(
         self,
         run_id: str,
         session_id: str | None,
         metadata: Mapping[str, str | int | float | bool] | None,
         model: str,
+        sink: _SpanSink | None,
     ) -> _SpanBuilder:
         """A span builder for one run, or the do-nothing one when tracing is off."""
-        if self.tracing is None or self._trace_sink is None:
+        if self.tracing is None or sink is None:
             return _NO_TRACE
         try:
             return _SpanBuilder(
                 tracing=self.tracing,
-                sink=self._trace_sink,
+                sink=sink,
                 run_id=run_id,
                 session_id=session_id,
                 provider=self.provider_name,
@@ -1629,9 +1672,10 @@ class Agent:
         path already did), opens the span before anything else happens, and
         closes it with the run's outcome however the run ends.
         """
+        sink = await self._open_trace_sink()
         reserved = False
-        if not run_id_checked and self._trace_sink is not None:
-            reserved = await self._reserve_run_id(run_id, None)
+        if not run_id_checked and sink is not None:
+            reserved = await self._reserve_run_id(run_id, None, sink)
         claim = _RunIdClaim(run_id if reserved else None)
         inner = self._traced_loop(
             prompt,
@@ -1643,6 +1687,7 @@ class Agent:
             run_id=run_id,
             run_metadata=run_metadata,
             session_id=session_id,
+            sink=sink,
         )
         try:
             async for event in inner:
@@ -1666,15 +1711,21 @@ class Agent:
         run_id: str | None,
         run_metadata: Mapping[str, str | int | float | bool] | None,
         session_id: str | None,
+        sink: _SpanSink | None = None,
     ) -> AsyncIterator[Event]:
-        """Open the ``invoke_agent`` span, drive :meth:`_loop_body`, close it."""
+        """Open the ``invoke_agent`` span, drive :meth:`_loop_body`, close it.
+
+        Before ``RunEnd`` is yielded (or an error propagates) the run waits at
+        most ``tracing.flush_timeout`` for its spans to be written. A cancelled
+        or abandoned run does not wait; its spans are written in the background.
+        """
         resolved_id = run_id or self._runtime_id("run")
         if stats is None:
             stats = _RunStats()
         run_stats = stats
         # Resolved first: a model error is the run's own error, not a tracing one.
         model = self._model()
-        trace = self._new_trace(resolved_id, session_id, run_metadata, model)
+        trace = self._new_trace(resolved_id, session_id, run_metadata, model, sink)
         trace.start_run()
         body = self._loop_body(
             prompt,
@@ -1697,6 +1748,7 @@ class Agent:
                         iterations=run_stats.iterations,
                         usage=run_stats.usage,
                     )
+                    await self._flush_trace(sink, resolved_id)
                 yield event
         except BaseException as exc:
             error = exc
@@ -1708,6 +1760,8 @@ class Agent:
             trace.end_run(
                 outcome=outcome, iterations=run_stats.iterations, usage=run_stats.usage, error=error
             )
+            if isinstance(error, Exception):
+                await self._flush_trace(sink, resolved_id)
 
     async def _loop_body(
         self,
