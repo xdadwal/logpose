@@ -60,10 +60,16 @@ _MIGRATIONS: list[list[str]] = [
         "trace_id TEXT, span_id TEXT, parent_span_id TEXT NULL, run_id TEXT, "
         "session_id TEXT NULL, name TEXT, kind INTEGER, start_ns INTEGER, end_ns INTEGER, "
         "status_code INTEGER, status_message TEXT NULL, attributes TEXT, events TEXT, "
+        "export_seq INTEGER NOT NULL, "
         "PRIMARY KEY (trace_id, span_id))",
         "CREATE INDEX logpose_spans_run ON logpose_spans (run_id)",
         "CREATE INDEX logpose_spans_session ON logpose_spans (session_id)",
         "CREATE INDEX logpose_spans_start ON logpose_spans (start_ns)",
+        "CREATE INDEX logpose_spans_seq ON logpose_spans (export_seq)",
+        "CREATE INDEX logpose_spans_root_seq ON logpose_spans (export_seq) "
+        "WHERE parent_span_id IS NULL",
+        "CREATE INDEX logpose_spans_root_start ON logpose_spans (start_ns) "
+        "WHERE parent_span_id IS NULL",
     ],
 ]
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -89,12 +95,20 @@ def _dumps_safe(value: Any) -> str:
     return json.dumps(_json_safe(value), default=str, allow_nan=False)
 
 
-_SPAN_INSERT = (
-    "INSERT OR REPLACE INTO logpose_spans (trace_id, span_id, parent_span_id, "
-    "run_id, session_id, name, kind, start_ns, end_ns, status_code, "
-    "status_message, attributes, events) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+_SPAN_COLS = (
+    "trace_id, span_id, parent_span_id, run_id, session_id, name, kind, "
+    "start_ns, end_ns, status_code, status_message, attributes, events"
 )
+_SPAN_UPDATE = ", ".join(
+    f"{c} = excluded.{c}" for c in (x.strip() for x in _SPAN_COLS.split(",")[2:])
+)
+# A re-write of an existing (trace_id, span_id) keeps its original export_seq.
+_SPAN_INSERT = (
+    f"INSERT INTO logpose_spans ({_SPAN_COLS}, export_seq) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    f"ON CONFLICT(trace_id, span_id) DO UPDATE SET {_SPAN_UPDATE}"
+)
+_MAX_SEQ = "SELECT COALESCE(MAX(export_seq), 0) FROM logpose_spans"
 
 
 def _span_row(sp: SpanRecord) -> tuple[Any, ...]:
@@ -130,13 +144,35 @@ def write_spans_blocking(
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.executemany(_SPAN_INSERT, [_span_row(sp) for sp in spans])
+            base = conn.execute(_MAX_SEQ).fetchone()[0]
+            conn.executemany(
+                _SPAN_INSERT,
+                [(*_span_row(sp), base + i) for i, sp in enumerate(spans, 1)],
+            )
             conn.execute("COMMIT")
         except BaseException:
             conn.execute("ROLLBACK")
             raise
     finally:
         conn.close()
+
+
+def _span_from_row(r: Sequence[Any]) -> SpanRecord:
+    return SpanRecord(
+        trace_id=r[0],
+        span_id=r[1],
+        parent_span_id=r[2],
+        run_id=r[3],
+        session_id=r[4],
+        name=r[5],
+        kind=int(r[6]),
+        start_ns=int(r[7]),
+        end_ns=int(r[8]),
+        status_code=int(r[9]),
+        status_message=r[10],
+        attributes=json.loads(r[11]),
+        events=json.loads(r[12]),
+    )
 
 
 def _now_ms() -> int:
@@ -655,14 +691,22 @@ class SQLiteStore:
     # --- spans ----------------------------------------------------------------------------
 
     async def write_spans(self, spans: Sequence[SpanRecord]) -> None:
-        """Store spans in one transaction; a repeated ``(trace_id, span_id)`` is replaced."""
+        """Store spans in one transaction, numbering each new span with the next ``export_seq``.
+
+        A repeated ``(trace_id, span_id)`` is updated in place and keeps its number.
+        """
         if not spans:
             return
         rows = [_span_row(sp) for sp in spans]
 
         async def run(db: aiosqlite.Connection) -> None:
-            cur = await db.executemany(_SPAN_INSERT, rows)
-            await cur.close()
+            async with db.execute(_MAX_SEQ) as cur:
+                row = await cur.fetchone()
+            base = int(row[0]) if row else 0
+            cur2 = await db.executemany(
+                _SPAN_INSERT, [(*r, base + i) for i, r in enumerate(rows, 1)]
+            )
+            await cur2.close()
 
         await self._transaction(run)
 
@@ -690,11 +734,7 @@ class SQLiteStore:
             if value is not None:
                 where.append(clause)
                 params.append(value)
-        cols = (
-            "trace_id, span_id, parent_span_id, run_id, session_id, name, kind, "
-            "start_ns, end_ns, status_code, status_message, attributes, events"
-        )
-        names = [c.strip() for c in cols.split(",")]
+        cols = _SPAN_COLS
         base = " AND ".join(where)
         after: tuple[int, str, str] | None = None
         # Keyset pagination: the lock is held per page only, never across a yield.
@@ -717,35 +757,74 @@ class SQLiteStore:
                 async with self._conn().execute(sql, args) as cur:
                     rows = list(await cur.fetchall())
             for r in rows:
-                d = dict(zip(names, r, strict=True))
-                yield SpanRecord(
-                    trace_id=d["trace_id"],
-                    span_id=d["span_id"],
-                    parent_span_id=d["parent_span_id"],
-                    run_id=d["run_id"],
-                    session_id=d["session_id"],
-                    name=d["name"],
-                    kind=int(d["kind"]),
-                    start_ns=int(d["start_ns"]),
-                    end_ns=int(d["end_ns"]),
-                    status_code=int(d["status_code"]),
-                    status_message=d["status_message"],
-                    attributes=json.loads(d["attributes"]),
-                    events=json.loads(d["events"]),
-                )
+                yield _span_from_row(r)
             if len(rows) < _SPAN_PAGE:
                 return
             last = rows[-1]
             after = (int(last[7]), str(last[0]), str(last[1]))
 
-    async def purge_spans(self, older_than_ms: int) -> int:
-        """Delete spans that started before the Unix-millisecond cutoff; return the count.
+    async def read_root_spans(
+        self,
+        *,
+        after_seq: int | None = None,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[tuple[int, SpanRecord]]:
+        """Stream root spans (no parent) as ``(export_seq, span)`` in write order.
 
-        Deletes by start time regardless of session. ``logpose_runs`` rows are kept,
-        so :meth:`run_id_exists` stays true for purged runs.
+        Only roots with ``export_seq > after_seq`` are returned; ``since_ns`` and
+        ``until_ns`` bound the root's start (inclusive). The lock is not held across
+        yields.
         """
+        where = ["parent_span_id IS NULL"]
+        params: list[Any] = []
+        for clause, value in (
+            ("export_seq > ?", after_seq),
+            ("start_ns >= ?", since_ns),
+            ("start_ns <= ?", until_ns),
+            ("session_id = ?", session_id),
+        ):
+            if value is not None:
+                where.append(clause)
+                params.append(value)
+        cursor = after_seq if after_seq is not None else 0
+        while True:
+            sql = (
+                f"SELECT {_SPAN_COLS}, export_seq FROM logpose_spans WHERE "
+                + " AND ".join(where)
+                + " AND export_seq > ?"
+                + f" ORDER BY export_seq LIMIT {_SPAN_PAGE}"
+            )
+            async with self._lock:
+                async with self._conn().execute(sql, [*params, cursor]) as cur:
+                    rows = list(await cur.fetchall())
+            for r in rows:
+                yield int(r[13]), _span_from_row(r)
+            if len(rows) < _SPAN_PAGE:
+                return
+            cursor = int(rows[-1][13])
+
+    async def purge_spans(self, older_than_ms: int) -> int:
+        """Delete whole traces whose root started before the Unix-millisecond cutoff.
+
+        Also deletes orphan spans (their trace has no root row) that started before
+        the cutoff. Any session; returns the span count. ``logpose_runs`` rows are
+        kept, so :meth:`run_id_exists` stays true for purged runs.
+        """
+        cutoff = older_than_ms * 1_000_000
         counts = await self._write(
-            [("DELETE FROM logpose_spans WHERE start_ns < ?", (older_than_ms * 1_000_000,))]
+            [
+                (
+                    "DELETE FROM logpose_spans WHERE trace_id IN ("
+                    "SELECT trace_id FROM logpose_spans "
+                    "WHERE parent_span_id IS NULL AND start_ns < ?) "
+                    "OR (start_ns < ? AND NOT EXISTS ("
+                    "SELECT 1 FROM logpose_spans r WHERE r.trace_id = logpose_spans.trace_id "
+                    "AND r.parent_span_id IS NULL))",
+                    (cutoff, cutoff),
+                )
+            ]
         )
         return counts[0]
 

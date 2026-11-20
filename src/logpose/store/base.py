@@ -163,6 +163,15 @@ class SessionStore(Protocol):
         trace_id: str | None = None,
     ) -> AsyncIterator[SpanRecord]: ...
 
+    def read_root_spans(
+        self,
+        *,
+        after_seq: int | None = None,
+        since_ns: int | None = None,
+        until_ns: int | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[tuple[int, SpanRecord]]: ...
+
     async def purge_spans(self, older_than_ms: int) -> int: ...
 
     async def run_id_exists(self, run_id: str) -> bool: ...

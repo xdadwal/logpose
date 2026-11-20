@@ -36,12 +36,15 @@ class ExportResult:
     Attributes:
         traces: Number of traces written.
         through: Start time (UTC, microsecond precision) of the latest root span
-            exported, or ``None`` when nothing was exported. Pass it as ``since``
-            to continue an incremental export.
+            exported, or ``None`` when nothing was exported. Informational.
+        cursor: Write-order position of the latest root exported. Pass it as
+            ``after`` to continue an incremental export. When nothing was
+            exported it is the ``after`` you passed (``None`` if you passed none).
     """
 
     traces: int
     through: datetime | None
+    cursor: int | None = None
 
 
 def _any_value(value: Any) -> dict[str, Any] | None:
@@ -102,7 +105,13 @@ def _span_json(span: SpanRecord) -> dict[str, Any]:
     return out
 
 
-def _request(spans: list[SpanRecord], version: str, service_name: str) -> dict[str, Any]:
+def _request(spans: list[SpanRecord], version: str) -> dict[str, Any]:
+    service_name = SERVICE_NAME
+    for span in spans:
+        if span.parent_span_id is None:
+            value = span.attributes.get(sc.LOGPOSE_SERVICE_NAME)
+            if isinstance(value, str) and value:
+                service_name = value
     resource = {
         "service.name": service_name,
         "telemetry.sdk.name": "logpose",
@@ -138,23 +147,25 @@ async def export_traces(
     since: datetime | None = None,
     until: datetime | None = None,
     session_id: str | None = None,
-    service_name: str = SERVICE_NAME,
+    after: int | None = None,
 ) -> ExportResult:
     """Write finished traces from the span store to ``path`` as OTLP/JSON lines.
 
-    Only traces whose root ``invoke_agent`` span has ended are exported. The
-    window matches the root span's start time at microsecond resolution:
-    ``since`` is exclusive and ``until`` inclusive, so
-    ``export_traces(path, since=previous.through)`` never repeats a trace. The file
-    is replaced atomically (written to a temporary file, then renamed).
+    Only traces whose root ``invoke_agent`` span has ended are exported. ``since``
+    (exclusive) and ``until`` (inclusive) match the root span's start at
+    microsecond resolution. For incremental export use ``after``: roots are
+    selected in the order they were written to the store, so a run that ends late
+    is still picked up. ``export_traces(path, after=previous.cursor)`` exports each
+    trace exactly once. The file is replaced atomically (written to a temporary
+    file, then renamed).
 
     Args:
         path: Output file; any existing file is replaced.
         since: Export roots that started after this timezone-aware time.
         until: Export roots that started at or before this timezone-aware time.
         session_id: Only export traces of this session.
-        service_name: The ``service.name`` resource attribute. Spans do not store
-            it, so it is chosen at export time.
+        after: Only export roots written after this ``ExportResult.cursor``.
+            ``service.name`` is taken from the root span (``Tracing.service_name``).
 
     Raises:
         LogposeError: A naive ``since`` or ``until``.
@@ -170,27 +181,27 @@ async def export_traces(
     store = await manager.get_store()
     count = 0
     last_start: int | None = None
+    cursor = after
     fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            async for root in store.read_spans(
-                since_ns=since_ns, until_ns=until_ns, session_id=session_id
+            async for seq, root in store.read_root_spans(
+                after_seq=after, since_ns=since_ns, until_ns=until_ns, session_id=session_id
             ):
-                if root.parent_span_id is not None:
-                    continue
                 spans = [s async for s in store.read_spans(trace_id=root.trace_id)]
                 line = json.dumps(
-                    _request(spans, version, service_name),
+                    _request(spans, version),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
                 handle.write(line + "\n")
                 count += 1
                 last_start = root.start_ns
+                cursor = seq
         os.replace(tmp_name, target)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
         raise
     through = None if last_start is None else _EPOCH + timedelta(microseconds=last_start // 1000)
-    return ExportResult(traces=count, through=through)
+    return ExportResult(traces=count, through=through, cursor=cursor)

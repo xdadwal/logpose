@@ -40,6 +40,7 @@ ERROR_TYPE = "error.type"
 # logpose's own attributes
 LOGPOSE_SEMCONV_VERSION = "logpose.semconv.version"
 LOGPOSE_RUN_ID = "logpose.run.id"
+LOGPOSE_SERVICE_NAME = "logpose.service.name"
 LOGPOSE_RUN_ITERATIONS = "logpose.run.iterations"
 LOGPOSE_RUN_OUTCOME = "logpose.run.outcome"
 LOGPOSE_USAGE_INPUT_TOKENS = "logpose.usage.input_tokens"

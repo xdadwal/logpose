@@ -969,22 +969,27 @@ one trace per line) for traces whose root span has finished; runs still in
 progress are skipped until they end. `since` (exclusive) and `until` (inclusive)
 are timezone-aware datetimes compared with the root span's start at microsecond
 resolution; naive datetimes raise `LogposeError`. `session_id=` limits the export
-to one session. The file is replaced atomically (written to a temporary file in
-the same directory, then renamed), so use a new path per incremental batch.
-`service_name=` sets `service.name`
-(default `"logpose"`; it is not stored on spans).
+to one session. The resource `service.name` is the run's `Tracing.service_name`
+(stored on the root span as `logpose.service.name`; `"logpose"` if absent). Metadata
+values are exported as strings on spans. The file is replaced atomically (written
+to a temporary file in the same directory, then renamed), so use a new path per
+incremental batch.
 
-Export incrementally by passing the previous `through`, the start of the latest
-root exported:
+For incremental export pass the previous `cursor`. It is a position in the order
+roots were written to the store, not a start time, so a run that finishes after a
+later-started run is still exported exactly once, and re-writing a root never
+re-exports it. When a batch exports nothing, `cursor` is the `after` you passed:
 
 ```python
 first = await export_traces("batch-1.jsonl")
-second = await export_traces("batch-2.jsonl", since=first.through)  # no repeats
+second = await export_traces("batch-2.jsonl", after=first.cursor)  # no repeats, no gaps
 ```
 
-Because the cursor is a start time, a run that began before `through` but ended
-after the export is not picked up by `since=through`; export a wider window
-(or no `since`) when long runs may overlap.
+`through` (the latest root start exported) is informational.
+
+A trace is exported as the spans stored at that moment. If a batch of child spans
+fails to write while the root's batch succeeds (rare; the writer logs a `WARNING`),
+the exported trace is partial.
 
 Feed the files to an OpenTelemetry Collector with the `otlpjsonfile` receiver:
 
@@ -1013,8 +1018,9 @@ from datetime import timedelta
 deleted = await agent.purge_traces(older_than=timedelta(days=30))
 ```
 
-`purge_traces` deletes spans that started more than `older_than` ago, in every
-session, and returns the count. Run records stay, so a purged `run_id` still
+`purge_traces` deletes whole traces whose root span started more than `older_than`
+ago, in every session, plus orphan spans (no root stored) that started before the
+cutoff, and returns the span count. Run records stay, so a purged `run_id` still
 cannot be reused.
 
 ### Convention status

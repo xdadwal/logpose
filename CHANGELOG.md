@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (schema v3, migrated automatically) by a background writer with bounded queues.
 - `export_traces()` and `ExportResult`: OTLP/JSON export (one trace per line,
   Collector `otlpjsonfile` compatible) with `since`/`until`/`session_id` and an
-  incremental cursor; `Agent.purge_traces(older_than)` to delete old spans.
+  exactly-once incremental `after=result.cursor`; `Agent.purge_traces(older_than)` to delete old spans.
 - `run(..., run_id=..., metadata=...)` for caller-chosen run IDs and run labels,
   recorded on spans, `RuntimeContext` and `RunRecord`.
 - Input guardrails: `Agent(input_guardrails=[...], guardrail_mode="blocking" | "parallel")`

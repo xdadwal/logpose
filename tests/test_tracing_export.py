@@ -158,22 +158,54 @@ async def test_export_skips_live_traces_and_is_incremental(db: Path, tmp_path: P
     out = tmp_path / "o.jsonl"
     first = await export_traces(out)
     assert first.traces == 1 and _trace_ids(out) == [_tid(1)]
-    assert first.through is not None
+    assert first.cursor is not None
 
-    # Trace 2 ends. Trace 3 starts later still.
     await _put(_span(_tid(2), _sid(2), start=T0 + 1_000_000))
     await _put(_span(_tid(3), _sid(3), start=T0 + 2_000_000))
-    second = await export_traces(out, since=first.through)
+    second = await export_traces(out, after=first.cursor)
     assert sorted(_trace_ids(out)) == [_tid(2), _tid(3)]
     assert second.traces == 2
 
-    again = await export_traces(out, since=second.through)
-    assert again.traces == 0 and again.through is None
+    again = await export_traces(out, after=second.cursor)
+    assert again.traces == 0 and again.cursor == second.cursor
     assert out.read_text() == ""
 
 
+async def test_live_run_that_ends_after_a_later_run_is_not_lost(db: Path, tmp_path: Path) -> None:
+    # Run A's child is written, its root is not; run B starts later and completes.
+    await _put(_span(_tid(1), _sid(10), parent=_sid(1), start=T0))
+    await _put(_span(_tid(2), _sid(2), start=T0 + 1_000_000))
+    out = tmp_path / "o.jsonl"
+    first = await export_traces(out)
+    assert _trace_ids(out) == [_tid(2)]
+    await _put(_span(_tid(1), _sid(1), start=T0))  # A's root lands late
+    second = await export_traces(out, after=first.cursor)
+    assert second.traces == 1 and _trace_ids(out) == [_tid(1)]
+    third = await export_traces(out, after=second.cursor)
+    assert third.traces == 0
+
+
+async def test_rewritten_root_is_not_reexported(db: Path, tmp_path: Path) -> None:
+    await _put(_span(_tid(1), _sid(1)))
+    out = tmp_path / "o.jsonl"
+    first = await export_traces(out)
+    await _put(_span(_tid(2), _sid(2), start=T0 + 5_000_000))
+    await _put(_span(_tid(1), _sid(1), attrs={"again": 1}))  # re-write keeps its position
+    second = await export_traces(out, after=first.cursor)
+    assert _trace_ids(out) == [_tid(2)]
+    third = await export_traces(out, after=second.cursor)
+    assert third.traces == 0
+
+
+async def test_empty_export_keeps_cursor(db: Path, tmp_path: Path) -> None:
+    out = tmp_path / "o.jsonl"
+    empty = await export_traces(out)
+    assert empty.traces == 0 and empty.cursor is None and empty.through is None
+    again = await export_traces(out, after=7)
+    assert again.cursor == 7 and again.through is None
+
+
 async def test_incremental_never_repeats_equal_start_times(db: Path, tmp_path: Path) -> None:
-    # Three roots in the same microsecond (distinct ns): one pass, then nothing.
     await _put(
         _span(_tid(1), _sid(1), start=T0 + 1),
         _span(_tid(2), _sid(2), start=T0 + 2),
@@ -182,8 +214,37 @@ async def test_incremental_never_repeats_equal_start_times(db: Path, tmp_path: P
     out = tmp_path / "o.jsonl"
     r1 = await export_traces(out)
     assert r1.traces == 3
-    r2 = await export_traces(out, since=r1.through)
+    r2 = await export_traces(out, after=r1.cursor)
     assert r2.traces == 0
+
+
+async def test_service_name_comes_from_the_root_span(db: Path, tmp_path: Path) -> None:
+    await _put(
+        _span(_tid(1), _sid(1), attrs={sc.LOGPOSE_SERVICE_NAME: "billing"}),
+        _span(_tid(2), _sid(2), start=T0 + 1),
+    )
+    out = tmp_path / "o.jsonl"
+    await export_traces(out)
+    names = {}
+    for req in _lines(out):
+        rs = req["resourceSpans"][0]
+        res = {a["key"]: a["value"] for a in rs["resource"]["attributes"]}
+        names[rs["scopeSpans"][0]["spans"][0]["traceId"]] = res["service.name"]["stringValue"]
+    assert names == {_tid(1): "billing", _tid(2): "logpose"}
+
+
+async def test_tracing_service_name_reaches_the_root_span(db: Path, tmp_path: Path) -> None:
+    from logpose import Tracing
+
+    agent = Agent(
+        FakeProvider([ScriptedTurn.text("x")]), model="m", tracing=Tracing(service_name="svc")
+    )
+    await agent.run("q")
+    out = tmp_path / "o.jsonl"
+    await export_traces(out)
+    res = _lines(out)[0]["resourceSpans"][0]["resource"]["attributes"]
+    assert {"key": "service.name", "value": {"stringValue": "svc"}} in res
+    await agent.aclose()
 
 
 async def test_export_filters_by_session_and_window(db: Path, tmp_path: Path) -> None:
@@ -231,14 +292,20 @@ async def test_export_replaces_file_atomically(db: Path, tmp_path: Path) -> None
 
 async def test_purge_traces(db: Path) -> None:
     now_ns = int(datetime.now(UTC).timestamp() * 1e9)
+    old = now_ns - 10 * 86_400 * 10**9
     await _put(
-        _span(_tid(1), _sid(1), start=now_ns - 10 * 86_400 * 10**9),
+        _span(_tid(1), _sid(1), start=old),
         _span(_tid(2), _sid(2), start=now_ns),
+        # a child that started after the cutoff goes with its old root
+        _span(_tid(1), _sid(11), parent=_sid(1), start=now_ns),
+        # an orphan (no root) older than the cutoff goes; a newer orphan stays
+        _span(_tid(3), _sid(30), parent=_sid(3), start=old),
+        _span(_tid(4), _sid(40), parent=_sid(4), start=now_ns),
     )
     agent = Agent(FakeProvider([ScriptedTurn.text("x")]), model="m")
-    assert await agent.purge_traces(timedelta(days=1)) == 1
+    assert await agent.purge_traces(timedelta(days=1)) == 3
     store = await manager.get_store()
-    assert [s.trace_id async for s in store.read_spans()] == [_tid(2)]
+    assert sorted([s.trace_id async for s in store.read_spans()]) == [_tid(2), _tid(4)]
     with pytest.raises(LogposeError):
         await agent.purge_traces(timedelta(days=-1))
     await agent.aclose()

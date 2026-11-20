@@ -435,6 +435,7 @@ class _SpanBuilder:
         attrs[sc.GEN_AI_REQUEST_MODEL] = self._model
         attrs[sc.GEN_AI_AGENT_NAME] = AGENT_NAME
         attrs[sc.LOGPOSE_RUN_ID] = self.run_id
+        attrs[sc.LOGPOSE_SERVICE_NAME] = self._tracing.service_name
         if self._session_id is not None:
             attrs[sc.GEN_AI_CONVERSATION_ID] = self._session_id
         for key, value in self._metadata.items():
