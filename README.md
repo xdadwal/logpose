@@ -512,14 +512,53 @@ Entering the block takes the lease and loads the history, so a busy session rais
 possible:
 
 ```python
+from fastapi import HTTPException
+from logpose import SessionBusyError
+
 @app.post("/chat/{sid}")
 async def chat(sid: str, body: ChatIn):
     try:
         async with agent.session(sid) as handle:
             result = await agent.run(body.text, session=handle)
     except SessionBusyError:
-        raise HTTPException(status_code=409, detail="session is busy")
+        raise HTTPException(status_code=409, detail="session is busy") from None
     return {"text": result.text}
+```
+
+To stream the reply, the session must stay open until the body has been sent. Do
+not `return StreamingResponse(...)` from inside `async with agent.session(...)`:
+the block exits (saving and releasing the session) before the first chunk is
+streamed, and the stream then fails. Enter the session before building the
+response, so a busy session is still a 409 before any headers go out, and leave it
+when the body finishes:
+
+```python
+from contextlib import AsyncExitStack
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
+from logpose import SessionBusyError, TextDelta
+
+@app.post("/chat/{sid}/stream")
+async def chat_stream(sid: str, body: ChatIn):
+    stack = AsyncExitStack()
+    try:
+        handle = await stack.enter_async_context(agent.session(sid))
+    except SessionBusyError:
+        raise HTTPException(status_code=409, detail="session is busy") from None
+
+    async def chunks():
+        try:
+            async for event in agent.stream(body.text, session=handle):
+                if isinstance(event, TextDelta):
+                    yield event.text
+        finally:
+            await stack.aclose()  # saves and releases, also when the client leaves
+
+    # The background task covers a body that is never iterated (the client left
+    # before streaming began); closing the stack a second time does nothing.
+    return StreamingResponse(chunks(), background=BackgroundTask(stack.aclose))
 ```
 
 For a single call, the convenience form does the same in one step:
@@ -533,9 +572,13 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
 
 - **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
   The file is created on first session use; runs without a session never touch disk.
+- **Lease:** a lease lasts 60 seconds and is renewed every 20 seconds while its run
+  or block is active, so a crashed process frees its sessions within a minute.
 - **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
-- **Expiry:** idle sessions expire; call `await agent.purge_expired_sessions()` to
-  delete them, or `await agent.delete_session(sid)` to remove one.
+- **Expiry:** a session expires after 30 days without use; an expired session starts
+  empty on its next use. logpose never deletes rows on its own: call
+  `await agent.purge_expired_sessions()` to delete expired sessions, or
+  `await agent.delete_session(sid)` to remove one.
 - **Run records:** each run writes a row to `logpose_runs`. Token counts cover
   completed turns only.
 

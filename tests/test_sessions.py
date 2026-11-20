@@ -708,3 +708,108 @@ def test_stop_now_logs_once_when_thread_cannot_be_stopped(
         manager._stop_now(_fake_store(_Unstoppable()))
     warned = [r for r in caplog.records if "could not stop" in r.getMessage()]
     assert len(warned) == 1
+
+
+# --- the README's streaming-endpoint pattern ----------------------------------------
+
+
+def _streaming_endpoint(agent: Agent) -> Any:
+    """Mirror of the README FastAPI streaming example, minus FastAPI.
+
+    Returns ``(409, None, None)`` for a busy session, else ``(200, body, background)``
+    where ``background`` is what the README passes as ``BackgroundTask(stack.aclose)``.
+    """
+    from contextlib import AsyncExitStack
+
+    async def chat_stream(sid: str, text: str) -> tuple[int, Any, Any]:
+        stack = AsyncExitStack()
+        try:
+            handle = await stack.enter_async_context(agent.session(sid))
+        except SessionBusyError:
+            return 409, None, None  # README: raise HTTPException(409, ...) from None
+
+        async def body() -> Any:
+            try:
+                async for event in agent.stream(text, session=handle):
+                    if isinstance(event, TextDelta):
+                        yield event.text
+            finally:
+                await stack.aclose()  # save and release once streaming ends
+
+        return 200, body(), stack.aclose
+
+    return chat_stream
+
+
+async def test_naive_streaming_response_exits_the_session_before_streaming() -> None:
+    """Why the README pattern exists: returning from inside the block closes it."""
+    agent = Agent(FakeProvider(ScriptedTurn.text("hi")), model="m")
+
+    async def naive(sid: str) -> Any:
+        async with agent.session(sid) as handle:
+
+            async def body() -> Any:
+                async for event in agent.stream("hello", session=handle):
+                    yield event
+
+            return body()
+
+    response = await naive("s1")
+    with pytest.raises(LogposeError, match="open 'async with agent.session"):
+        async for _ in response:
+            pass
+    await agent.aclose()
+
+
+async def test_readme_streaming_pattern_holds_lease_until_body_finishes(db: Path) -> None:
+    provider = FakeProvider(
+        [
+            ScriptedTurn.text("hello there", chunks=["hello", " there"]),
+            ScriptedTurn.text("again"),
+        ]
+    )
+    agent = Agent(provider, model="m")
+    chat_stream = _streaming_endpoint(agent)
+
+    status, body, background = await chat_stream("s1", "hi")
+    assert status == 200
+    # Lease is held from before the response is built: a concurrent request is a 409
+    # answered before any body is streamed.
+    assert (await chat_stream("s1", "too soon"))[0] == 409
+    assert [chunk async for chunk in body] == ["hello", " there"]
+    await background()  # the server's background task: a no-op after the body closed it
+    # Released and saved once the body finished.
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(2,)]
+
+    status, body, background = await chat_stream("s1", "more")
+    assert status == 200
+    assert [chunk async for chunk in body] == ["again"]
+    await background()
+    assert [m.text for m in provider.requests[1].messages] == ["hi", "hello there", "more"]
+    await agent.aclose()
+
+
+async def test_readme_streaming_pattern_releases_on_client_disconnect(db: Path) -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.text("hello there", chunks=["hello", " there"]), ScriptedTurn.text("x")]
+    )
+    agent = Agent(provider, model="m")
+    chat_stream = _streaming_endpoint(agent)
+
+    _, body, background = await chat_stream("s1", "hi")
+    assert await body.__anext__() == "hello"
+    await body.aclose()  # the server closes the body iterator when the client leaves
+    await background()
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+
+    # A body that is never iterated (client gone before streaming began) is released
+    # by the background task alone.
+    status, body, background = await chat_stream("s1", "back")
+    assert status == 200
+    await body.aclose()  # closing an unstarted generator runs no finally
+    assert _rows(db, "SELECT lease_token IS NOT NULL FROM logpose_sessions") == [(1,)]
+    await background()
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await agent.aclose()
