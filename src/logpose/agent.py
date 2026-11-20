@@ -274,6 +274,11 @@ otherwise fail the *next* request rather than its own.
 TRACE_STORE_RETRY_SECONDS = 60.0
 """Seconds after a failed trace-store open before a run tries to open it again."""
 
+TRACE_MIN_WAIT = 0.25
+"""Least time, in seconds, a sessionless traced run gives the first trace-store open
+and the ``run_id`` check together (its budget is ``max(flush_timeout, this)``), so
+``flush_timeout=0`` does not leave every first run untraced."""
+
 SESSION_EXIT_TIMEOUT = 5.0
 """Seconds a session run's exit (record the run, save, release) may take once shielded."""
 
@@ -281,6 +286,9 @@ _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
 _TRACE_LOGGER = logging.getLogger("logpose.trace")
 
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+_TRACE_BACKGROUND: set[asyncio.Future[Any]] = set()
+"""Trace-store checks a run stopped waiting for; kept referenced until they finish."""
 
 _ACTIVE_RUN_IDS: set[str] = set()
 """Caller-supplied run IDs of runs in flight in this process, across all agents
@@ -865,6 +873,9 @@ class Agent:
         self.tracing: Tracing | None = resolved_tracing
         self._trace_open_warned = False
         self._trace_open_retry_at = 0.0  # monotonic; no store attempt before then
+        self._trace_slow_warned: set[str] = set()  # "open" / "check" timeouts, warned once
+        # A store open this agent stopped waiting for: its failure still backs off.
+        self._trace_opening: asyncio.Future[SessionStore] | None = None
         # Run IDs this agent traced whose spans may still be queued; aclose
         # waits for these only, never for other agents' spans.
         self._trace_run_ids: set[str] = set()
@@ -1526,7 +1537,12 @@ class Agent:
     # -- tracing ------------------------------------------------------------
 
     async def _reserve_run_id(
-        self, run_id: str | None, store: SessionStore | None, sink: _SpanSink | None
+        self,
+        run_id: str | None,
+        store: SessionStore | None,
+        sink: _SpanSink | None,
+        *,
+        timeout: float | None = None,
     ) -> bool:
         """Claim a caller-supplied ``run_id`` for this run, or raise if it is taken.
 
@@ -1537,6 +1553,11 @@ class Agent:
         runs. Checked only with a session store or tracing; generated IDs are
         unique. A tracing sink that cannot answer is logged and treated as
         "not found".
+
+        With ``timeout`` (the sessionless path) the store is asked for at most
+        that long: another process holding the database write lock must not
+        hold the run up. On timeout the check is skipped with one WARNING per
+        agent; the in-process claim still rules out duplicates in this process.
 
         Returns:
             ``True`` if this call claimed the ID: the caller must release it
@@ -1551,7 +1572,7 @@ class Agent:
             exists = await store.run_id_exists(run_id) if store is not None else False
             if not exists and sink is not None:
                 try:
-                    exists = await sink.run_id_exists(run_id)
+                    exists = await self._sink_has_run_id(sink, run_id, timeout)
                 except Exception as exc:  # noqa: BLE001 - tracing never fails a run
                     _TRACE_LOGGER.warning(
                         "could not check run_id against stored traces: %s", type(exc).__name__
@@ -1564,6 +1585,39 @@ class Agent:
             _ACTIVE_RUN_IDS.discard(run_id)
             raise
         return True
+
+    async def _sink_has_run_id(self, sink: _SpanSink, run_id: str, timeout: float | None) -> bool:
+        """Ask ``sink`` about ``run_id``, waiting at most ``timeout`` (``None``: no bound).
+
+        The bounded query runs as its own task and is abandoned, never
+        cancelled, on timeout, so the store is not interrupted mid-statement.
+        """
+        if timeout is None:
+            return await sink.run_id_exists(run_id)
+        if sink.pending_for(run_id) > 0:
+            return True
+        task = asyncio.ensure_future(sink.run_id_exists(run_id))
+        _TRACE_BACKGROUND.add(task)
+        task.add_done_callback(_settle_background)
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            self._warn_trace_slow(
+                "check",
+                "run_id check against stored traces timed out after %.2gs (database busy); "
+                "checked only against runs in this process",
+                timeout,
+            )
+            return False
+        return task.result()
+
+    def _warn_trace_slow(self, key: str, message: str, *args: object) -> None:
+        if key not in self._trace_slow_warned:
+            self._trace_slow_warned.add(key)
+            _TRACE_LOGGER.warning(message, *args)
+
+    def _trace_wait_budget(self) -> float:
+        """Seconds a sessionless traced run may wait to open the store and check its ID."""
+        return 0.0 if self.tracing is None else max(self.tracing.flush_timeout, TRACE_MIN_WAIT)
 
     def _trace_secrets(self) -> tuple[str, ...]:
         """Configured credentials to scrub from captured content."""
@@ -1611,8 +1665,12 @@ class Agent:
         """The span writer of this loop's store, or ``None`` when tracing is off.
 
         Opens the store (shared with sessions, one per database path and event
-        loop) on first use. If it cannot be opened the run proceeds untraced;
-        the first such failure per agent logs one WARNING to ``logpose.trace``,
+        loop) on first use, waiting at most :meth:`_trace_wait_budget`: if the
+        open takes longer (another process holds the database write lock) this
+        run proceeds untraced with one WARNING per agent, and the open carries
+        on in the background for later runs. If it cannot be opened the run
+        proceeds untraced; the first such failure per agent logs one WARNING to
+        ``logpose.trace``,
         and runs within :data:`TRACE_STORE_RETRY_SECONDS` of a failure do not
         try again (they stay untraced without touching disk).
         """
@@ -1621,7 +1679,29 @@ class Agent:
         from logpose.store import manager
 
         try:
-            writer = manager.span_writer(await self._store())
+            self._uses_store = True
+            opening = self._trace_opening
+            if (
+                opening is None
+                or opening.get_loop() is not asyncio.get_running_loop()
+                or opening.cancelled()
+                or (opening.done() and opening.exception() is None)
+            ):
+                opening = manager.store_opening(owner=self)
+            self._trace_opening = None
+            if not opening.done():
+                budget = self._trace_wait_budget()
+                await asyncio.wait({opening}, timeout=budget)
+                if not opening.done():
+                    self._trace_opening = opening
+                    self._warn_trace_slow(
+                        "open",
+                        "trace store not open after %.2gs (database busy); this run is "
+                        "untraced, later runs use the store once it is open",
+                        budget,
+                    )
+                    return None
+            writer = manager.span_writer(opening.result())
             if writer is None:  # pragma: no cover - closed by a concurrent aclose
                 raise LogposeError("the trace store was closed")
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
@@ -1636,12 +1716,15 @@ class Agent:
             return None
         return writer
 
-    async def _flush_trace(self, sink: _SpanSink | None, run_id: str) -> None:
-        """Wait, bounded by ``flush_timeout``, for this run's spans to be written."""
+    async def _flush_trace(
+        self, sink: _SpanSink | None, run_id: str, timeout: float | None = None
+    ) -> None:
+        """Wait, bounded by ``timeout`` (default ``flush_timeout``), for this run's spans."""
         if sink is None or self.tracing is None:
             return
         try:
-            if await sink.flush(run_id, self.tracing.flush_timeout):
+            wait = self.tracing.flush_timeout if timeout is None else timeout
+            if await sink.flush(run_id, wait):
                 self._trace_run_ids.discard(run_id)
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
             _TRACE_LOGGER.warning("span flush failed for run %s: %s", run_id, type(exc).__name__)
@@ -1705,10 +1788,18 @@ class Agent:
         path already did), opens the span before anything else happens, and
         closes it with the run's outcome however the run ends.
         """
+        # Opening the store and checking the ID share one budget; the run-end
+        # flush gets what is left of flush_timeout, so a busy database delays
+        # the run by about max(flush_timeout, TRACE_MIN_WAIT) at most.
+        started = monotonic()
         sink = await self._open_trace_sink()
         reserved = False
         if not run_id_checked and sink is not None:
-            reserved = await self._reserve_run_id(run_id, None, sink)
+            left = max(self._trace_wait_budget() - (monotonic() - started), 0.0)
+            reserved = await self._reserve_run_id(run_id, None, sink, timeout=left)
+        flush_timeout = None
+        if self.tracing is not None:
+            flush_timeout = max(self.tracing.flush_timeout - (monotonic() - started), 0.0)
         claim = _RunIdClaim(run_id if reserved else None)
         inner = self._traced_loop(
             prompt,
@@ -1721,6 +1812,7 @@ class Agent:
             run_metadata=run_metadata,
             session_id=session_id,
             sink=sink,
+            flush_timeout=flush_timeout,
         )
         try:
             async for event in inner:
@@ -1745,6 +1837,7 @@ class Agent:
         run_metadata: Mapping[str, str | int | float | bool] | None,
         session_id: str | None,
         sink: _SpanSink | None = None,
+        flush_timeout: float | None = None,
     ) -> AsyncIterator[Event]:
         """Open the ``invoke_agent`` span, drive :meth:`_loop_body`, close it.
 
@@ -1783,7 +1876,7 @@ class Agent:
                         iterations=run_stats.iterations,
                         usage=run_stats.usage,
                     )
-                    await self._flush_trace(sink, resolved_id)
+                    await self._flush_trace(sink, resolved_id, flush_timeout)
                 yield event
         except BaseException as exc:
             error = exc
@@ -1796,7 +1889,7 @@ class Agent:
                 outcome=outcome, iterations=run_stats.iterations, usage=run_stats.usage, error=error
             )
             if isinstance(error, Exception):
-                await self._flush_trace(sink, resolved_id)
+                await self._flush_trace(sink, resolved_id, flush_timeout)
 
     async def _loop_body(
         self,
@@ -3659,6 +3752,13 @@ class _RunIdClaim:
         if self.run_id is not None:
             _ACTIVE_RUN_IDS.discard(self.run_id)
             self.run_id = None
+
+
+def _settle_background(task: asyncio.Future[Any]) -> None:
+    """Forget a finished background trace check, retrieving any error it raised."""
+    _TRACE_BACKGROUND.discard(task)
+    if not task.cancelled():
+        task.exception()
 
 
 def _check_run_id(run_id: str | None) -> None:

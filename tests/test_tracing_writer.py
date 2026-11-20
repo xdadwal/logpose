@@ -577,3 +577,129 @@ def test_submit_without_a_loop_counts_nothing(caplog: pytest.LogCaptureFixture) 
     writer.submit(_span("r"))  # no running loop: dropped, never raised
     assert writer.pending == 0
     assert len(_warnings(caplog)) == 1
+
+
+# -- another process holding the database write lock --------------------------------
+
+
+def _hold_write_lock(path: Path) -> sqlite3.Connection:
+    """A second connection (as another process would) holding the write lock."""
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def _same_result(a: Any, b: Any) -> None:
+    assert a.text == b.text
+    assert a.stop_reason == b.stop_reason
+    assert a.iterations == b.iterations
+    assert a.usage == b.usage
+    assert [m.model_dump() for m in a.messages] == [m.model_dump() for m in b.messages]
+
+
+async def _until(predicate: Any, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, "condition not reached"
+        await asyncio.sleep(0.02)
+
+
+async def test_run_id_check_is_bounded_while_another_process_holds_the_lock(
+    db: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    timeout = 0.5
+    provider = FakeProvider(ScriptedTurn.text("ok"), repeat_last=True)
+    expected = await Agent(provider, model="m", tracing=None).run("x")
+    agent = Agent(provider, model="m", tracing=Tracing(flush_timeout=timeout))
+    await agent.run("warm-up")  # the store is open and its schema checked
+    caplog.set_level(logging.WARNING)
+    blocker = _hold_write_lock(db)
+    try:
+        await agent.run("x")  # its spans' batch now waits in SQLite's busy handler
+        start = time.monotonic()
+        result = await agent.run("x", run_id="custom-1")
+        elapsed = time.monotonic() - start
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert elapsed < timeout + 0.4, elapsed
+    _same_result(result, expected)
+    checks = [r for r in _warnings(caplog) if "run_id" in r.getMessage()]
+    assert len(checks) == 1 and checks[0].name == "logpose.trace"
+    # Lock released: later runs are checked and traced normally.
+    await agent.run("x", run_id="custom-2")
+    with pytest.raises(LogposeError, match="run_id"):
+        await agent.run("x", run_id="custom-2")
+    await agent.aclose()
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'custom-1'") == [(2,)]
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'custom-2'") == [(2,)]
+
+
+async def test_first_store_open_is_bounded_while_another_process_holds_the_lock(
+    db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with SQLiteStore(db):  # an existing database (WAL, current schema)
+        pass
+    opens: list[int] = []
+    original = SQLiteStore.open
+
+    async def counted(self: SQLiteStore) -> None:
+        opens.append(1)
+        await original(self)
+
+    monkeypatch.setattr(SQLiteStore, "open", counted)
+    timeout = 0.5
+    provider = FakeProvider(ScriptedTurn.text("ok"), repeat_last=True)
+    expected = await Agent(provider, model="m", tracing=None).run("x")
+    agent = Agent(provider, model="m", tracing=Tracing(flush_timeout=timeout))
+    caplog.set_level(logging.WARNING)
+    blocker = _hold_write_lock(db)
+    try:
+        start = time.monotonic()
+        first = await agent.run("x", run_id="locked-1")
+        elapsed = time.monotonic() - start
+        second = await agent.run("x", run_id="locked-2")  # still opening: untraced too
+    finally:
+        blocker.execute("ROLLBACK")
+        blocker.close()
+    assert elapsed < timeout + 0.4, elapsed
+    _same_result(first, expected)
+    _same_result(second, expected)
+    (warning,) = _warnings(caplog)
+    assert warning.name == "logpose.trace"
+    # The open carried on in the background; the next run uses it.
+    await _until(lambda: manager._open_count() == 1)
+    await agent.run("x", run_id="after-lock")
+    assert len(opens) == 1
+    assert len(_warnings(caplog)) == 1
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'after-lock'") == [(2,)]
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id LIKE 'locked-%'") == [(0,)]
+    await agent.aclose()
+    assert manager._open_count() == 0
+
+
+async def test_slow_open_that_then_fails_still_backs_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    attempts: list[int] = []
+
+    async def slow_then_broken(*, owner: object | None = None) -> Any:
+        attempts.append(1)
+        await asyncio.sleep(0.4)
+        raise LogposeError("cannot open")
+
+    monkeypatch.setattr(manager, "get_store", slow_then_broken)
+    caplog.set_level(logging.WARNING)
+    agent = Agent(
+        FakeProvider(ScriptedTurn.text("ok"), repeat_last=True),
+        model="m",
+        tracing=Tracing(flush_timeout=0.3),
+    )
+    start = time.monotonic()
+    await agent.run("a")  # gives up waiting; the open goes on and fails
+    assert time.monotonic() - start < 0.7
+    await asyncio.sleep(0.3)
+    await agent.run("b")  # sees the failure: backs off
+    await agent.run("c")
+    assert len(attempts) == 1
+    assert [r.name for r in _warnings(caplog)] == ["logpose.trace", "logpose.trace"]

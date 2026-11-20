@@ -70,6 +70,8 @@ _CREATE_LOCKS: dict[_Key, asyncio.Lock] = {}
 # Every opened, not yet closed store, with its span writer (for exit cleanup).
 _OPEN: dict[SQLiteStore, _Entry] = {}
 _EXIT_HOOK_INSTALLED = False
+# Background opens started by store_opening(), with the owners waiting on each.
+_OPENING: dict[_Key, tuple[asyncio.Future[SessionStore], weakref.WeakSet[object]]] = {}
 
 # Handles currently inside a session block, mapped to the store that leased them.
 _ACTIVE_HANDLES: weakref.WeakKeyDictionary[SessionHandle, SessionStore] = (
@@ -138,6 +140,55 @@ async def get_store(*, owner: object | None = None) -> SessionStore:
     return entry.store
 
 
+def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
+    """Return a future for the store of the current path and loop, opening it in the background.
+
+    For callers that must not wait longer than they choose (a traced run waits
+    at most its tracing budget): the open runs as its own task, shared by every
+    caller on this path and loop, so a caller that stops waiting neither
+    cancels it nor starts a second one. ``owner`` is registered on the store
+    once it is open (as :func:`get_store` does). A failed open is not retried
+    by the same future; the next call after it finished starts a new one.
+    """
+    loop = asyncio.get_running_loop()
+    key: _Key = (str(db_path()), loop)
+    with _GUARD:
+        entry = _ENTRIES.get(key)
+        if entry is not None:
+            entry.owners.add(owner)
+            done: asyncio.Future[SessionStore] = loop.create_future()
+            done.set_result(entry.store)
+            return done
+        pending = _OPENING.get(key)
+        if pending is not None and not pending[0].done():
+            pending[1].add(owner)
+            return pending[0]
+        owners: weakref.WeakSet[object] = weakref.WeakSet([owner])
+
+    async def open_store() -> SessionStore:
+        store = await get_store()
+        with _GUARD:
+            opened = _OPEN.get(cast("SQLiteStore", store))
+            if opened is not None:
+                for waiting in list(owners):
+                    opened.owners.add(waiting)
+        return store
+
+    task = loop.create_task(open_store(), name="logpose-store-open")
+
+    def finished(fut: asyncio.Future[SessionStore]) -> None:
+        with _GUARD:
+            if _OPENING.get(key, (None,))[0] is fut:
+                del _OPENING[key]
+        if not fut.cancelled():
+            fut.exception()  # retrieved: a caller that stopped waiting may never look
+
+    task.add_done_callback(finished)
+    with _GUARD:
+        _OPENING[key] = (task, owners)
+    return task
+
+
 def span_writer(store: SessionStore) -> SpanWriter | None:
     """Return the span writer owned by ``store``, or ``None`` once it is closed."""
     with _GUARD:
@@ -166,6 +217,8 @@ async def release_stores(owner: object, run_ids: Iterable[str] = ()) -> None:
     orphaned: list[_Entry] = []
     shared: list[_Entry] = []
     with _GUARD:
+        for _future, waiting in _OPENING.values():
+            waiting.discard(owner)
         for key, entry in list(_ENTRIES.items()):
             if owner in entry.owners:
                 entry.owners.discard(owner)
@@ -334,6 +387,7 @@ def reset_stores_for_tests() -> None:
         stores = list(_OPEN)
         _ENTRIES.clear()
         _CREATE_LOCKS.clear()
+        _OPENING.clear()
         _ACTIVE_HANDLES.clear()
         _RUNNING.clear()
     for store in stores:
