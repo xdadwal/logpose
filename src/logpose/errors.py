@@ -54,15 +54,23 @@ class GuardrailTripped(LogposeError):
 
 
 class SessionBusyError(LogposeError):
-    """Raised when a session already has a run in flight and cannot take another."""
+    """Raised when a session's lease cannot be taken or was lost.
+
+    On enter, the session is leased elsewhere (a run is in flight). On exit, the
+    lease was lost (it expired and another holder took it) and the messages were
+    not saved. Also raised when a run starts on a handle whose lease lapsed while
+    idle and was taken by another holder.
+    """
 
 
 class ContextOverflowError(LogposeError):
     """Raised when a request cannot be made to fit the model's context window.
 
-    The built-in context policy raises it when, after compaction (or when the
-    summary call failed), the estimated request is still larger than
-    ``context_window − max_tokens``. A failed summary call is chained as
+    The built-in context policy raises it before sending, and only when
+    ``context_window`` was passed to the agent explicitly: when, after
+    compaction (or when the summary call failed), the estimated request is
+    still larger than ``context_window − max_tokens``. With the default window
+    nothing is refused before sending. A failed summary call is chained as
     ``__cause__``.
 
     Attributes:

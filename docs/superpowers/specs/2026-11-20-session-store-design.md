@@ -146,6 +146,11 @@ lease TTL is a crash-detection window, not a cap on run length. Runs with
 `run_timeout=None` or long tool calls keep their lease, and a crashed worker's
 lease frees within `lease_ttl`. A renewal that finds the token changed marks the
 handle lost, and the final save is refused as below.
+Renewal stops once the handle has had no run in progress for `3 × lease_ttl`
+(the handle is then `lapsed`; a new run on it re-extends the lease only if the
+stored token is still its own, else raises `SessionBusyError`), so a block that is never
+exited, for example a dropped streaming response kept alive by a reference
+cycle, frees its lease when it expires.
 
 
 - Acquire in one transaction (`BEGIN IMMEDIATE` on SQLite):

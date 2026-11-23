@@ -15,8 +15,8 @@ models fail.
   that field name and never under both.
 - `Agent(max_tokens=...)`, the 16384 default, and their precedence are unchanged;
   only the wire field name changes.
-- A value in `extra_body` or `Agent(extra=...)` for either field still overrides
-  as today. Merge order is unchanged.
+- A value in `extra_body` or `Agent(extra=...)` for either field replaces the
+  ceiling: logpose omits its own field and only the caller's field is sent.
 
 **Approaches considered:** (B) the same setting defaulting to `max_tokens`
 breaks OpenAI reasoning models by default. (C) auto-selecting by host
@@ -25,8 +25,8 @@ reintroduces provider-specific guessing and misses OpenAI-compatible proxies.
 **Non-goals:** auto-detection, sending both fields, or a fallback retry when a
 server rejects the field.
 
-**Docs:** the README says which field is sent and how to switch. It flags that
-older Ollama and LM Studio builds may only accept `max_tokens`, and that a
-server which silently ignores the field applies no output cap (time limits still
+**Docs:** the README says which field is sent and how to switch. It flags that a
+server which only understands `max_tokens` may reject the new field or silently
+ignore it and apply no output cap (time limits still
 bound the turn). The CHANGELOG gets a breaking entry: the field sent by default
 changes.

@@ -19,7 +19,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from logpose.agent import Conversation
+from logpose.agent import Conversation, _now_ms
 from logpose.errors import LogposeError, SessionBusyError
 from logpose.messages import Message
 from logpose.store.base import RunRecord, SessionHandle, validate_session_id
@@ -58,10 +58,6 @@ SCHEMA_VERSION = len(_MIGRATIONS)
 _POLL_INTERVAL = 0.05  # seconds between lease attempts while waiting
 
 _T = TypeVar("_T")
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 def _message_row(session_id: str, seq: int, m: Message, now: int) -> tuple[str, Sequence[Any]]:
@@ -315,14 +311,44 @@ class SQLiteStore:
     ) -> AsyncIterator[SessionHandle]:
         validate_session_id(session_id)
         handle, token = await self._acquire(session_id, wait, metadata)
-        renewal = asyncio.create_task(self._renewal_loop(handle, token))
+        renewal = [asyncio.create_task(self._renewal_loop(handle, token))]
+        closing = False
+
+        async def stop_renewal() -> None:
+            nonlocal closing
+            closing = True
+            for task in renewal:
+                await self._stop(task)
+
+        async def revive() -> bool:
+            counts = await self._write(
+                [
+                    (
+                        "UPDATE logpose_sessions SET lease_expires_at = ? "
+                        "WHERE id = ? AND lease_token = ?",
+                        (_now_ms() + self._lease_ttl_ms, session_id, token),
+                    )
+                ]
+            )
+            if counts[0] == 0:
+                handle.lost = True
+                return False
+            if closing:
+                # The block exited while this revive waited for the store:
+                # its release clears the lease, so start no new renewal.
+                return False
+            handle.lapsed = False
+            renewal.append(asyncio.create_task(self._renewal_loop(handle, token)))
+            return True
+
+        handle.revive = revive
         try:
             yield handle
         except BaseException as exc:
-            await self._stop(renewal)
+            await stop_renewal()
             await self._release(handle, token, exc)
             raise
-        await self._stop(renewal)
+        await stop_renewal()
         await self._release(handle, token, None)
 
     async def _acquire(
@@ -332,7 +358,14 @@ class SQLiteStore:
         while True:
             got = await self._transaction(lambda db: self._try_acquire(db, session_id, metadata))
             if got is not None:
-                return got
+                handle, token = got
+                if not handle.created:
+                    try:
+                        await self._load_history(handle)
+                    except BaseException:
+                        await self._abandon(handle.id, token)
+                        raise
+                return handle, token
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionBusyError(f"session {session_id!r} is in use")
@@ -390,29 +423,59 @@ class SQLiteStore:
             "WHERE id = ?",
             (json.dumps(merged), token, lease_expires, session_id),
         )
-        messages = await _fetch_messages(db, session_id)
-        async with db.execute(
-            "SELECT COALESCE(MAX(seq) + 1, 0) FROM logpose_messages WHERE session_id = ?",
-            (session_id,),
-        ) as cur:
-            seq_row = await cur.fetchone()
-        next_seq = int(seq_row[0]) if seq_row else 0
-        handle = SessionHandle(
-            session_id,
-            Conversation(messages),
-            merged,
-            created=False,
-            loaded_count=len(messages),
-            next_seq=next_seq,
-            stored_summary=await _fetch_summary(db, session_id),
-        )
-        return handle, token
+        # History is loaded after COMMIT (see _load_history): the lease protects it,
+        # so the write lock is not held while a long history is read.
+        return SessionHandle(session_id, Conversation(), merged, created=False), token
+
+    async def _load_history(self, handle: SessionHandle) -> None:
+        """Fill a freshly leased handle with its stored history."""
+        async with self._lock:
+            db = self._conn()
+            messages = await _fetch_messages(db, handle.id)
+            async with db.execute(
+                "SELECT COALESCE(MAX(seq) + 1, 0) FROM logpose_messages WHERE session_id = ?",
+                (handle.id,),
+            ) as cur:
+                seq_row = await cur.fetchone()
+            summary = await _fetch_summary(db, handle.id)
+        handle.conversation = Conversation(messages)
+        handle.loaded_count = len(messages)
+        handle.next_seq = int(seq_row[0]) if seq_row else 0
+        handle.stored_summary = summary
+        handle._seed_summary()
+
+    async def _abandon(self, session_id: str, token: str) -> None:
+        """Free a lease taken by this holder without saving anything. Best effort."""
+        with contextlib.suppress(Exception):
+            await self._write(
+                [
+                    (
+                        "UPDATE logpose_sessions SET lease_token = NULL, lease_expires_at = NULL "
+                        "WHERE id = ? AND lease_token = ?",
+                        (session_id, token),
+                    )
+                ]
+            )
 
     async def _renewal_loop(self, handle: SessionHandle, token: str) -> None:
-        """Extend the lease every ``lease_ttl / 3`` while the token still matches."""
+        """Extend the lease every ``lease_ttl / 3`` while the token still matches.
+
+        Renewal stops once the handle has had no run in progress for three lease
+        TTLs (``handle.idle_since``): a block whose response was dropped without
+        ever running, and is kept alive by a reference cycle, then frees its lease
+        when it expires instead of holding the session until garbage collection.
+        The handle is marked ``lapsed``; a new run on it calls ``handle.revive``,
+        which takes the lease back only if nobody else has taken it meanwhile. Its
+        exit likewise still saves if the lease was not taken.
+        """
         interval = self._lease_ttl / 3
+        idle_limit = 3 * self._lease_ttl
         while True:
             await asyncio.sleep(interval)
+            idle_since = handle.idle_since
+            if idle_since is not None and time.monotonic() - idle_since >= idle_limit:
+                handle.lapsed = True
+                return
             try:
                 counts = await self._write(
                     [
@@ -546,13 +609,16 @@ class SQLiteStore:
 
     async def purge_expired(self, now_ms: int | None = None) -> int:
         now = _now_ms() if now_ms is None else now_ms
-        expired = "SELECT id FROM logpose_sessions WHERE expires_at < ?"
+        # A session under a live lease is never purged, even past expires_at: its
+        # holder is about to save (and extend) it.
+        cond = "expires_at < ? AND (lease_token IS NULL OR lease_expires_at < ?)"
+        expired = f"SELECT id FROM logpose_sessions WHERE {cond}"
         counts = await self._write(
             [
-                (f"DELETE FROM logpose_messages WHERE session_id IN ({expired})", (now,)),
-                (f"DELETE FROM logpose_runs WHERE session_id IN ({expired})", (now,)),
-                (f"DELETE FROM logpose_summaries WHERE session_id IN ({expired})", (now,)),
-                ("DELETE FROM logpose_sessions WHERE expires_at < ?", (now,)),
+                (f"DELETE FROM logpose_messages WHERE session_id IN ({expired})", (now, now)),
+                (f"DELETE FROM logpose_runs WHERE session_id IN ({expired})", (now, now)),
+                (f"DELETE FROM logpose_summaries WHERE session_id IN ({expired})", (now, now)),
+                (f"DELETE FROM logpose_sessions WHERE {cond}", (now, now)),
             ]
         )
         return counts[3]

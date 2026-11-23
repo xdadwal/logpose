@@ -128,6 +128,11 @@ class Provider(Protocol):
     has a sane fallback — but when present, an ``Agent`` constructed without an
     explicit ``max_tokens=`` will honour it.
 
+    Likewise an optional ``preserve_reasoning: bool`` attribute says whether the
+    provider re-sends earlier turns' reasoning (thinking blocks). The built-in
+    context policy counts reasoning toward its token estimate only when it is
+    true; when absent, reasoning is treated as not sent.
+
     Attributes:
         name: Short identifier for the provider, e.g. ``"openai-compat"``.
     """

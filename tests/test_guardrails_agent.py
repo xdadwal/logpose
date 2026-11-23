@@ -460,6 +460,46 @@ async def test_parallel_block_rolls_back_summary_state() -> None:
     assert conv._compaction is None
 
 
+async def test_parallel_block_does_not_record_summary_failure() -> None:
+    # A summary that fails during a discarded parallel turn must not start the
+    # conversation's backoff: the next allowed message may still summarize.
+    from tests.test_compaction import chat_history, is_summary_call
+
+    def failed_summary() -> ScriptedTurn:
+        return ScriptedTurn.text("", thinking="t" * 100, stop_reason="max_tokens")
+
+    provider = FakeProvider([failed_summary(), ScriptedTurn.text("never", delay=5)])
+    verdicts = ["block", "allow"]
+
+    async def slow_guard(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.1)
+        if verdicts.pop(0) == "block":
+            return GuardrailVerdict.block("off_topic", REPLY)
+        return GuardrailVerdict.allow()
+
+    agent = Agent(
+        provider,
+        model="test-model",
+        context_budget=2_000,
+        input_guardrails=[slow_guard],
+        guardrail_mode="parallel",
+    )
+    conv = Conversation(chat_history(10))
+    result = await asyncio.wait_for(agent.run(PROMPT, conversation=conv), timeout=2)
+    assert result.guardrail is not None
+    assert sum(is_summary_call(r) for r in provider.requests) == 1
+    assert conv._compaction is None
+    # Allowed parallel run: the summary is attempted again (no backoff), and its
+    # failure is committed to the conversation with the working copy.
+    provider.turns += [failed_summary(), ScriptedTurn.text("ok")]
+    result = await asyncio.wait_for(agent.run("q2", conversation=conv), timeout=2)
+    assert result.text == "ok"
+    assert sum(is_summary_call(r) for r in provider.requests) == 2
+    assert conv._compaction is not None
+    assert conv._compaction.failures == 1
+    assert conv._compaction.failed_turns is not None
+
+
 async def test_parallel_tool_waits_for_guard() -> None:
     called = {"tool": False}
 
