@@ -611,6 +611,10 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   record (logged) but not the block's messages; such an exit can take up to about
   24 s. Wrapping the stream in `contextlib.aclosing(...)` closes it before the
   block exits and avoids this.
+- **Exit and cancellation:** the exit's save runs past a cancellation, so a server
+  cancelling the handler on client disconnect does not shorten it. If streams may
+  be left open on a handle, set the ASGI server's graceful-shutdown timeout to at
+  least 25 s, or use `aclosing`.
 
 Known limits:
 

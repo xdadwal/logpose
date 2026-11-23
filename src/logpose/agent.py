@@ -2270,14 +2270,19 @@ async def _close_streams(handle: SessionHandle) -> bool:
             _RUNTIME_LOGGER.warning(
                 "closing a session stream failed: %s", type(task.exception()).__name__
             )
-    pending = [task for task in leftovers if not task.done()]
-    if pending:
-        cancelled = await _wait_shielded(pending, _LEFTOVER_WAIT) or cancelled
-        if not all(task.done() for task in pending):
+    # Re-check until a fixed deadline: a stream still closing in the background
+    # can abandon its run record (adding to ``leftovers``) after this starts.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LEFTOVER_WAIT
+    while pending := [task for task in leftovers if not task.done()]:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
             _RUNTIME_LOGGER.warning(
                 "abandoned session stream work still running after %ss; saving anyway",
                 _LEFTOVER_WAIT,
             )
+            break
+        cancelled = await _wait_shielded(pending, remaining) or cancelled
     return cancelled
 
 
@@ -2340,7 +2345,13 @@ async def _finish_session(
     budget starts only once closing is over.
     """
     cancelled = await _close_streams(close) if close is not None else False
-    task = asyncio.ensure_future(work)
+    # The work task must not inherit a block's collector: only this exit's own
+    # abandonment (below, in the closing stream's context) belongs there.
+    token = _EXIT_LEFTOVERS.set(None)
+    try:
+        task = asyncio.ensure_future(work)
+    finally:
+        _EXIT_LEFTOVERS.reset(token)
     cancelled = await _wait_shielded({task}, SESSION_EXIT_TIMEOUT) or cancelled
     quiet = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
     if not task.done():
