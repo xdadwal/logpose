@@ -397,3 +397,53 @@ async def test_missing_export_counter_raises_instead_of_reusing_seqs(db: Path) -
     with pytest.raises(LogposeError, match="export_seq"):
         await store.write_spans([_span(_tid(1), _sid(1))])
     assert [r async for r in store.read_root_spans()] == []
+
+
+async def test_filtered_export_cursor_never_skips_unexported_traces(
+    db: Path, tmp_path: Path
+) -> None:
+    # Review repro: a session-filtered export used to return the cursor of the last
+    # root it saw, stepping over session b's root written between them.
+    await _put(_span(_tid(1), _sid(1), session="a"))
+    await _put(_span(_tid(2), _sid(2), session="b"))
+    await _put(_span(_tid(3), _sid(3), session="a"))
+    out = tmp_path / "o.jsonl"
+    filtered = await export_traces(out, session_id="a")
+    assert filtered.traces == 2
+    assert filtered.cursor is None  # only an unfiltered export yields a cursor
+    full = await export_traces(out)
+    assert sorted(_trace_ids(out)) == [_tid(1), _tid(2), _tid(3)]
+    assert full.cursor == 3
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"session_id": "a"},
+        {"since": datetime(2020, 1, 1, tzinfo=UTC)},
+        {"until": datetime(2030, 1, 1, tzinfo=UTC)},
+    ],
+)
+async def test_after_with_a_filter_is_rejected(
+    db: Path, tmp_path: Path, kwargs: dict[str, Any]
+) -> None:
+    await _put(_span(_tid(1), _sid(1), session="a"))
+    with pytest.raises(LogposeError, match="after"):
+        await export_traces(tmp_path / "o.jsonl", after=0, **kwargs)
+    assert not (tmp_path / "o.jsonl").exists()
+
+
+async def test_purging_a_sessionless_trace_frees_its_run_id(db: Path) -> None:
+    from logpose.tracing.spans import Tracing
+
+    agent = Agent(
+        FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b"), ScriptedTurn.text("c")]),
+        model="m",
+        tracing=Tracing(),
+    )
+    await agent.run("one", run_id="eval-1")
+    with pytest.raises(LogposeError, match="run_id"):
+        await agent.run("two", run_id="eval-1")
+    assert await agent.purge_traces(timedelta(0)) > 0
+    await agent.run("three", run_id="eval-1")  # documented: the ID is free again
+    await agent.aclose()

@@ -40,6 +40,9 @@ class ExportResult:
         cursor: Write-order position of the latest root exported. Pass it as
             ``after`` to continue an incremental export. When nothing was
             exported it is the ``after`` you passed (``None`` if you passed none).
+            ``None`` for an export filtered by ``since``, ``until`` or
+            ``session_id``: such a cursor would step over the filtered-out
+            roots, and they would never be exported incrementally.
     """
 
     traces: int
@@ -156,8 +159,10 @@ async def export_traces(
     microsecond resolution. For incremental export use ``after``: roots are
     selected in the order they were written to the store, so a run that ends late
     is still picked up. ``export_traces(path, after=previous.cursor)`` exports each
-    trace exactly once. The file is replaced atomically (written to a temporary
-    file, then renamed).
+    trace exactly once. ``after`` cannot be combined with ``since``, ``until`` or
+    ``session_id`` (the cursor is a position in the unfiltered write order), and a
+    filtered export returns ``cursor=None``. The file is replaced atomically
+    (written to a temporary file, then renamed).
 
     Args:
         path: Output file; any existing file is replaced.
@@ -168,8 +173,15 @@ async def export_traces(
             ``service.name`` is taken from the root span (``Tracing.service_name``).
 
     Raises:
-        LogposeError: A naive ``since`` or ``until``.
+        LogposeError: A naive ``since`` or ``until``, or ``after`` combined with
+            ``since``, ``until`` or ``session_id``.
     """
+    filtered = since is not None or until is not None or session_id is not None
+    if after is not None and filtered:
+        raise LogposeError(
+            "after= cannot be combined with since=, until= or session_id=: the cursor "
+            "is a position in the unfiltered write order."
+        )
     import logpose
     from logpose.store import manager
 
@@ -209,4 +221,4 @@ async def export_traces(
             os.unlink(tmp_name)
         raise
     through = None if last_start is None else _EPOCH + timedelta(microseconds=last_start // 1000)
-    return ExportResult(traces=count, through=through, cursor=cursor)
+    return ExportResult(traces=count, through=through, cursor=None if filtered else cursor)

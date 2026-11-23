@@ -883,7 +883,8 @@ class SQLiteStore:
 
         Also deletes orphan spans (their trace has no root row) that started before
         the cutoff. Any session; returns the span count. ``logpose_runs`` rows are
-        kept, so :meth:`run_id_exists` stays true for purged runs.
+        kept, so :meth:`run_id_exists` stays true for purged session runs; a
+        sessionless run (spans only) is no longer found once purged.
         """
         cutoff = older_than_ms * 1_000_000
         counts = await self._write(

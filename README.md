@@ -1028,6 +1028,12 @@ neither, reuse is not detected. Known gaps:
   once can both write a trace with that ID.
 - When the database is busy (see above) the check against stored traces is skipped
   for that run, with a `WARNING`; runs in this process are still checked.
+- Session runs in several worker processes: a `run_id` another process is running
+  right now (not yet recorded) is caught only when this run's record is written,
+  at the end of the run, after its work is done; the run then raises
+  `LogposeError`.
+- Reuse is rejected only while a run record or stored spans exist: purging a
+  sessionless run's trace (`purge_traces`) frees its `run_id`.
 
 `metadata` takes at most 64 keys, keys up to 128 characters, string values
 up to 1,024 characters, and `str`, `int`, `float` (finite) or `bool` values. It
@@ -1059,7 +1065,10 @@ incremental batch.
 For incremental export pass the previous `cursor`. It is a position in the order
 roots were written to the store, not a start time, so a run that finishes after a
 later-started run is still exported exactly once, and re-writing a root never
-re-exports it. When a batch exports nothing, `cursor` is the `after` you passed:
+re-exports it. When a batch exports nothing, `cursor` is the `after` you passed.
+`after=` cannot be combined with `since=`, `until=` or `session_id=` (that raises
+`LogposeError`), and a filtered export returns `cursor=None`: a cursor taken from a
+filtered export would step over the traces the filter left out:
 
 ```python
 first = await export_traces("batch-1.jsonl")
@@ -1103,8 +1112,10 @@ deleted = await agent.purge_traces(older_than=timedelta(days=30))
 
 `purge_traces` deletes whole traces whose root span started more than `older_than`
 ago, in every session, plus orphan spans (no root stored) that started before the
-cutoff, and returns the span count. Run records stay, so a purged `run_id` still
-cannot be reused. A cutoff shorter than a still-running run can remove that run's
+cutoff, and returns the span count. Session run records stay, so a purged session
+run's `run_id` still cannot be reused. A run without a session has no run record:
+its stored spans are the only trace of its `run_id`, so purging them frees that ID
+for reuse. A cutoff shorter than a still-running run can remove that run's
 already-written child spans, leaving a partial trace.
 
 ### Convention status

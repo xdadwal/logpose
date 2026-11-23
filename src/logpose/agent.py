@@ -1246,8 +1246,10 @@ class Agent:
     async def purge_traces(self, older_than: timedelta) -> int:
         """Delete stored spans that started more than ``older_than`` ago; return the count.
 
-        Applies to every session in the store. Run records are kept, so a purged
-        ``run_id`` still cannot be reused. logpose never purges on its own.
+        Applies to every session in the store. Session run records are kept, so a
+        purged session run's ``run_id`` still cannot be reused; a run without a
+        session has no run record, so purging its trace frees its ``run_id``.
+        logpose never purges on its own.
         """
         if not isinstance(older_than, timedelta) or older_than < timedelta(0):
             raise LogposeError(f"older_than must be a non-negative timedelta, got {older_than!r}.")
