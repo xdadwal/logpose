@@ -164,7 +164,15 @@ class SessionStore(Protocol):
         *,
         wait: float = 0.0,
         metadata: Mapping[str, str] | None = None,
-    ) -> AbstractAsyncContextManager[SessionHandle]: ...
+        ttl: float | None = None,
+    ) -> AbstractAsyncContextManager[SessionHandle]:
+        """Lease ``session_id`` for an ``async with`` block.
+
+        ``ttl`` is the caller's session time-to-live in seconds, ``None`` for the
+        store's default: creating the session and each save stamp
+        ``expires_at = now + ttl``.
+        """
+        ...
 
     async def load_messages(self, session_id: str) -> list[Message]: ...
 

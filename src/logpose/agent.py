@@ -101,6 +101,7 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
+from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -228,6 +229,7 @@ __all__ = [
     "DEFAULT_PROVIDER_TURN_TIMEOUT",
     "DEFAULT_RUN_TIMEOUT",
     "DEFAULT_TOOL_TIMEOUT",
+    "DEFAULT_SESSION_TTL",
     "EMPTY_TOOL_RESULT",
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",
@@ -272,6 +274,9 @@ DEFAULT_MAX_CONCURRENT_TOOLS = 8
 
 DEFAULT_TOOL_TIMEOUT = 30.0
 """Default execution deadline, in seconds, for one tool after queueing."""
+
+DEFAULT_SESSION_TTL = 30 * 86400.0
+"""Seconds a stored session lives after its last write, unless ``session_ttl`` says otherwise."""
 
 EMPTY_TOOL_RESULT = "(no output)"
 """Stand-in for a tool result that is empty or only whitespace.
@@ -643,6 +648,8 @@ class Agent:
         input_guardrails: Sequence[InputGuardrail] = (),
         guardrail_mode: GuardrailMode = "blocking",
         tracing: Tracing | None | _Unset = _UNSET,
+        db_path: str | os.PathLike[str] | None = None,
+        session_ttl: timedelta | float | None = None,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -758,6 +765,19 @@ class Agent:
                 environment decides: ``LOGPOSE_TRACE`` (``1``/``true``/``yes``)
                 turns it on and ``LOGPOSE_TRACE_CONTENT`` adds content capture.
                 ``None`` turns tracing off whatever the environment says.
+            db_path: The SQLite file holding this agent's sessions, run records
+                and traces. Omitted or blank, ``LOGPOSE_DB_PATH`` decides
+                (when set and not blank), then ``logpose.db`` in the working
+                directory. ``~`` is expanded and the path made absolute once,
+                here; :attr:`db_path` holds the result. Nothing is opened until
+                the first session or traced run.
+            session_ttl: How long a stored session lives after its last write
+                by this agent, as a :class:`~datetime.timedelta` or seconds
+                (default 30 days). Creating a session and every save stamp
+                ``expires_at = now + session_ttl``; expiry and
+                :meth:`purge_expired_sessions` read the stored time, so agents
+                with different TTLs can share one database: whichever wrote last
+                sets the expiry. Must be positive and finite.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -777,7 +797,9 @@ class Agent:
             ``output_retries`` is not an int >= 0, or if a context setting is
             invalid, or if, with the built-in context path, the input budget
             (``min(context_window - max_tokens, context_budget)``) is not
-            positive or an app tool is named ``recall_tool_output``.
+            positive or an app tool is named ``recall_tool_output``, or if
+            ``db_path`` is not a string or path, or ``session_ttl`` is not a
+            positive, finite number of seconds or timedelta.
         """
         _check_output_type(output_type)
         _check_output_retries(output_retries)
@@ -856,6 +878,11 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        resolved_ttl = _check_session_ttl(session_ttl)
+        if db_path is not None and not isinstance(db_path, (str, os.PathLike)):
+            raise LogposeError(
+                f"db_path must be a str, os.PathLike or None, got {type(db_path).__name__}."
+            )
         self._window_explicit = context_window is not None
         if context_window is None:
             context_window = DEFAULT_CONTEXT_WINDOW
@@ -925,6 +952,10 @@ class Agent:
         self.output_type = output_type
         self.output_retries = output_retries
         self.session_wait = float(session_wait)
+        from logpose.store import manager as _manager
+
+        self.db_path: Path = _manager.db_path(db_path)
+        self.session_ttl: float = resolved_ttl
         self.input_guardrails: tuple[InputGuardrail, ...] = tuple(input_guardrails)
         self.guardrail_mode: GuardrailMode = guardrail_mode
         self._uses_store = False
@@ -1256,7 +1287,9 @@ class Agent:
         from logpose.store import manager
 
         store = await self._store()
-        cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+        cm = store.session(
+            session_id, wait=self.session_wait, metadata=metadata, ttl=self.session_ttl
+        )
         handle = await cm.__aenter__()
         manager._ACTIVE_HANDLES[handle] = store
         try:
@@ -1304,7 +1337,7 @@ class Agent:
         from logpose.store import manager
 
         self._uses_store = True
-        return await manager.get_store(owner=self)
+        return await manager.get_store(owner=self, path=self.db_path)
 
     @staticmethod
     def _active_store(handle: SessionHandle) -> SessionStore:
@@ -1394,7 +1427,9 @@ class Agent:
         cm: AbstractAsyncContextManager[SessionHandle] | None = None
         if handle is None:
             assert session_id is not None
-            cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+            cm = store.session(
+                session_id, wait=self.session_wait, metadata=metadata, ttl=self.session_ttl
+            )
             handle = await cm.__aenter__()
             manager._ACTIVE_HANDLES[handle] = store
             if first is None and not handle.conversation.messages:
@@ -1780,7 +1815,7 @@ class Agent:
                 or opening.cancelled()
                 or (opening.done() and opening.exception() is None)
             ):
-                opening = manager.store_opening(owner=self)
+                opening = manager.store_opening(owner=self, path=self.db_path)
             self._trace_opening = None
             if not opening.done():
                 budget = self._trace_wait_budget()
@@ -3736,6 +3771,23 @@ def _check_positive_int(label: str, value: object) -> None:
     """Raise unless ``value`` is an ``int`` (not a ``bool``) of at least 1."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise LogposeError(f"{label} must be a positive int, got {value!r}.")
+
+
+def _check_session_ttl(session_ttl: timedelta | float | None) -> float:
+    """Return ``session_ttl`` in seconds (default 30 days), or raise ``LogposeError``."""
+    if session_ttl is None:
+        return DEFAULT_SESSION_TTL
+    if isinstance(session_ttl, timedelta):
+        seconds = session_ttl.total_seconds()
+    elif isinstance(session_ttl, (int, float)) and not isinstance(session_ttl, bool):
+        seconds = float(session_ttl)
+    else:
+        raise LogposeError(
+            f"session_ttl must be a timedelta, a number of seconds or None, got {session_ttl!r}."
+        )
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise LogposeError(f"session_ttl must be positive and finite, got {session_ttl!r}.")
+    return seconds
 
 
 def _check_output_retries(output_retries: object) -> None:

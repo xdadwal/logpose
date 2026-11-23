@@ -2,8 +2,9 @@
 
 One opened :class:`~logpose.store.sqlite.SQLiteStore` exists per (absolute
 database path, running event loop): an aiosqlite connection is bound to the
-loop that awaits it, and the sync facade runs its own private loop. Stores are
-created lazily on first session use, shared by every :class:`~logpose.agent.Agent`
+loop that awaits it, and the sync facade runs its own private loop. The path is
+each agent's :attr:`~logpose.agent.Agent.db_path`. Stores are created lazily on
+first session use, shared by every :class:`~logpose.agent.Agent` with that path
 on that loop, and closed by :meth:`~logpose.agent.Agent.aclose` of the last
 agent using them, or at interpreter exit (best effort).
 
@@ -85,18 +86,25 @@ _STREAMS: weakref.WeakKeyDictionary[SessionHandle, weakref.WeakSet[AsyncIterator
 )
 
 
-def db_path() -> Path:
+def db_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Return the absolute session database path.
 
-    ``LOGPOSE_DB_PATH`` wins when set and not blank; otherwise ``logpose.db`` in
-    the current working directory.
+    Resolution order: ``explicit`` when given and not blank, then
+    ``LOGPOSE_DB_PATH`` when set and not blank, then ``logpose.db`` in the
+    current working directory. ``~`` is expanded and a relative path is made
+    absolute against the current working directory.
+
+    Args:
+        explicit: A path chosen by the caller (normally ``Agent(db_path=...)``).
     """
-    raw = os.environ.get(DB_PATH_ENV, "").strip()
+    raw = "" if explicit is None else os.fspath(explicit).strip()
+    if not raw:
+        raw = os.environ.get(DB_PATH_ENV, "").strip()
     return Path(os.path.abspath(os.path.expanduser(raw or DEFAULT_DB_FILENAME)))
 
 
-async def get_store(*, owner: object | None = None) -> SessionStore:
-    """Return the opened store for the current path and running loop.
+async def get_store(*, owner: object | None = None, path: Path | None = None) -> SessionStore:
+    """Return the opened store for ``path`` and the running loop.
 
     Creates and opens it (migrating the schema) on first use; creation is
     serialized per key. The parent directory of the database is created if
@@ -106,9 +114,12 @@ async def get_store(*, owner: object | None = None) -> SessionStore:
         owner: The object (normally an :class:`~logpose.agent.Agent`) using the
             store. When the last owner releases it with :func:`release_stores`,
             the store is closed.
+        path: The database file. ``None`` resolves it with :func:`db_path`
+            (``LOGPOSE_DB_PATH``, then ``./logpose.db``). Different paths on the
+            same loop get different stores.
     """
     loop = asyncio.get_running_loop()
-    path = db_path()
+    path = db_path() if path is None else Path(os.path.abspath(path))
     key: _Key = (str(path), loop)
     with _GUARD:
         # A store whose loop has closed can never be matched again (for example a
@@ -144,8 +155,8 @@ async def get_store(*, owner: object | None = None) -> SessionStore:
     return entry.store
 
 
-def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
-    """Return a future for the store of the current path and loop, opening it in the background.
+def store_opening(*, owner: object, path: Path | None = None) -> asyncio.Future[SessionStore]:
+    """Return a future for the store of ``path`` and the current loop, opening it in the background.
 
     For callers that must not wait longer than they choose (a traced run waits
     at most its tracing budget): the open runs as its own task, shared by every
@@ -153,9 +164,11 @@ def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
     cancels it nor starts a second one. ``owner`` is registered on the store
     once it is open (as :func:`get_store` does). A failed open is not retried
     by the same future; the next call after it finished starts a new one.
+    ``path`` is resolved as by :func:`get_store`.
     """
     loop = asyncio.get_running_loop()
-    key: _Key = (str(db_path()), loop)
+    resolved = db_path() if path is None else Path(os.path.abspath(path))
+    key: _Key = (str(resolved), loop)
     with _GUARD:
         entry = _ENTRIES.get(key)
         if entry is not None:
@@ -170,7 +183,7 @@ def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
         owners: weakref.WeakSet[object] = weakref.WeakSet([owner])
 
     async def open_store() -> SessionStore:
-        store = await get_store()
+        store = await get_store(path=resolved)
         with _GUARD:
             opened = _OPEN.get(cast("SQLiteStore", store))
             if opened is not None:
