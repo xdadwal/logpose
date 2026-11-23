@@ -816,8 +816,6 @@ They are configured on the agent, so `run`, `stream` and the sync facade need no
 extra arguments:
 
 ```python
-import os
-
 import httpx
 
 from logpose import Agent, openai_decision_guard, pattern_guard
@@ -836,7 +834,7 @@ agent = Agent(
                 "off_topic": "I can only help with Acme billing.",
                 "unsafe": "I can't help with that.",
             },
-            api_key=os.environ["GUARD_OPENAI_API_KEY"],  # required, never read from env
+            # key: LOGPOSE_GUARD_API_KEY env var, or pass api_key= explicitly
             client=shared_httpx_client,  # one httpx.AsyncClient for the app
         ),
     ],
@@ -898,10 +896,10 @@ backtrack catastrophically on adversarial input, so set `max_chars`.
 OpenAI's Decisions API (`POST /v1/decisions`, model `gpt-6-luna`), billed for
 input tokens only. It is OpenAI-specific: for other providers, write a custom
 guard. It opens a new httpx client per call unless you pass a shared `client=`,
-which is recommended in web apps for connection reuse. `api_key` is required:
-a missing or blank key raises `LogposeError` at construction. It never falls
-back to `LOGPOSE_API_KEY` (which may be another server's key) or
-`OPENAI_API_KEY`. `timeout` (default 5 s) bounds the whole call. Pass `name=`
+which is recommended in web apps for connection reuse. The key is
+`api_key=` if non-blank, else the `LOGPOSE_GUARD_API_KEY` environment variable;
+if neither is set, construction raises `LogposeError`. It never falls back to
+`LOGPOSE_API_KEY` (which may be another server's key) or `OPENAI_API_KEY`. `timeout` (default 5 s) bounds the whole call. Pass `name=`
 to tell two decision guards apart in results and events. `on_error` is `"block"` (the default, fail closed)
 or `"allow"`. A fail-open allow is observable: the verdict has
 `category="fail_open"` and the failure `reason` (no body text), and the

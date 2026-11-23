@@ -140,7 +140,7 @@ openai_decision_guard(
     domain: str,
     *,
     replies: Mapping[str, str],              # keys "off_topic", "unsafe"; both required
-    api_key: str | None = None,              # required; no environment fallback
+    api_key: str | None = None,              # else LOGPOSE_GUARD_API_KEY; required
     name: str = "openai_decision_guard",     # guard name in results and events
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-6-luna",
@@ -174,10 +174,12 @@ openai_decision_guard(
   a reason naming the failure type. Response bodies are never logged or echoed.
 - **Usage:** see resolution 6.
 - **Validation:**
-  - `api_key` is required: missing or blank raises `LogposeError` at
-    construction. There is no environment fallback (amended 2026-11-23: falling
-    back to `LOGPOSE_API_KEY` sent the main provider's key to OpenAI when the
-    app used another server);
+  - the key is `api_key` if non-blank, else the dedicated `LOGPOSE_GUARD_API_KEY`
+    environment variable if non-blank (both stripped); neither raises
+    `LogposeError` at construction naming both options. `LOGPOSE_API_KEY` and
+    `OPENAI_API_KEY` are never read (amended 2026-11-23: falling back to
+    `LOGPOSE_API_KEY` sent the main provider's key to OpenAI when the app used
+    another server);
   - thresholds must lie in [0, 1];
   - `replies` must contain both keys (missing ones raise `LogposeError` at
     construction).

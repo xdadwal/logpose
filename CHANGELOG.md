@@ -74,8 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RunResult.guardrail`, and leaves the conversation and session history
   untouched. Emits the content-free `guardrail.decided` event; guard usage on
   `GuardrailVerdict.usage` counts in run usage.
-  `openai_decision_guard` requires an explicit `api_key=` (no environment
-  fallback), takes `name=`, and bounds the whole call by `timeout`. Guards see
+  `openai_decision_guard` takes its key from `api_key=` or the dedicated
+  `LOGPOSE_GUARD_API_KEY` variable (never `LOGPOSE_API_KEY` or
+  `OPENAI_API_KEY`; missing raises at construction), takes `name=`, and bounds the whole call by `timeout`. Guards see
   the prompt text exactly as sent; a guarded prompt with non-text content is
   blocked as `"error"` ("unsupported content"). A parallel-mode block counts
   the usage of a first turn that already finished.
