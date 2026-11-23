@@ -40,13 +40,15 @@ SUMMARY_PREFIX = "[Summary of earlier conversation]\n"
 """Text that starts the assistant-role message carrying the summary."""
 
 SUMMARY_MAX_TOKENS = 2048
-"""Floor for the summary call's output ceiling."""
+"""Floor for the summary call's output ceiling (the agent's ``max_tokens`` if larger)."""
 
 SUMMARY_BUDGET_FRACTION = 0.15
-"""Largest share of the input budget the summary call may spend on output.
+"""Largest share of the input budget the summary text may take.
 
 The summary is sent on every later request, so an unbounded one would fill the
-budget by itself and force a new summary on every run."""
+budget by itself and force a new summary on every run. The summary call is
+asked to stay under it and its text is truncated to it; the call's output
+ceiling is not reduced, because a reasoning model thinks out of that ceiling."""
 
 SUMMARY_INSTRUCTION = (
     "You compress the earlier part of a conversation between a user and an AI "
@@ -85,12 +87,15 @@ class _CompactionState:
         cut_index: Index of the first message sent verbatim after the summary.
         fingerprint: Identifies ``messages[:cut_index]`` the summary was made
             from; a mismatch means the caller edited history.
+        failed_turns: Caller turns in the history when a summary call last
+            failed, or ``None``. Unforced attempts wait for a new caller turn.
     """
 
     ratio: float = 1.0
     summary: str | None = None
     cut_index: int = 0
     fingerprint: str = ""
+    failed_turns: int | None = None
 
     def calibrate(self, reported: int, estimate: int) -> None:
         """Fold one turn's reported input tokens into the ratio.
@@ -344,25 +349,29 @@ def message_chars(message: Message, *, reasoning: bool = False) -> int:
     return len(_dumps(_message_json(message, reasoning)))
 
 
-def summary_output_tokens(max_tokens: int, input_budget: int) -> int:
-    """Output ceiling for the summary call.
+def summary_word_limit(input_budget: int) -> int:
+    """Words the summary is asked to stay under: its token share at 0.75 words/token."""
+    return max(1, int(SUMMARY_BUDGET_FRACTION * input_budget * 0.75))
 
-    The agent's ``max_tokens`` (room for a reasoning model to think), capped at
-    :data:`SUMMARY_BUDGET_FRACTION` of the input budget so the summary cannot
-    crowd out the turns it is sent with, and never below
-    :data:`SUMMARY_MAX_TOKENS`.
+
+def summary_char_limit(input_budget: int) -> int:
+    """Characters a summary is truncated to: its token share at 4 chars/token."""
+    return max(1, int(SUMMARY_BUDGET_FRACTION * input_budget * _CHARS_PER_TOKEN))
+
+
+def truncate_summary(text: str, max_chars: int) -> str:
+    """Cut ``text`` to at most ``max_chars``, ending with ``…`` when cut.
+
+    Prefers the last line or sentence end in the second half of the allowed
+    length, so a truncated summary does not stop mid-fact.
     """
-    cap = max(SUMMARY_MAX_TOKENS, int(SUMMARY_BUDGET_FRACTION * input_budget))
-    return min(max(SUMMARY_MAX_TOKENS, max_tokens), cap)
-
-
-def summary_word_limit(output_tokens: int) -> int:
-    """Words the summary is asked to stay under.
-
-    Half the output ceiling, at about 0.75 words per token: the rest is left
-    for a reasoning model's thinking, which spends the same ceiling.
-    """
-    return max(100, output_tokens // 2 * 3 // 4)
+    if len(text) <= max_chars:
+        return text
+    head = text[: max(0, max_chars - 1)]
+    boundary = max(head.rfind("\n"), head.rfind(". ") + 1)
+    if boundary >= len(head) // 2:
+        head = head[:boundary]
+    return head.rstrip() + "\u2026"
 
 
 def choose_cut(

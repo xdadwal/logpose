@@ -109,6 +109,7 @@ from logpose.cancellation import (
 from logpose.compaction import (
     RECALL_TOOL_NAME,
     SUMMARY_INSTRUCTION,
+    SUMMARY_MAX_TOKENS,
     _CompactionState,
     apply_pointers,
     choose_cut,
@@ -118,9 +119,10 @@ from logpose.compaction import (
     message_chars,
     overhead_chars,
     render_transcript,
+    summary_char_limit,
     summary_message,
-    summary_output_tokens,
     summary_word_limit,
+    truncate_summary,
     turn_starts,
 )
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
@@ -2029,6 +2031,8 @@ class Agent:
             (force or calibrated(raw) >= self.compaction_threshold * self.input_budget)
             and first >= 0
             and not run_state.summary_failed
+            # After a failed summary, wait for a new caller turn (unless forced).
+            and (force or state.failed_turns is None or len(starts) > state.failed_turns)
         ):
             # The span must be non-empty and must end at or before the current
             # run's own first message, which is always sent verbatim.
@@ -2091,6 +2095,7 @@ class Agent:
                     # fits the window. Not retried again this run: every later
                     # turn would pay for the same failing call.
                     run_state.summary_failed = True
+                    state.failed_turns = len(starts)
                     needed = calibrated(raw)
                     if needed > window and refuse:
                         raise ContextOverflowError(
@@ -2101,10 +2106,11 @@ class Agent:
                             input_budget=self.input_budget,
                         ) from failure
                 else:
-                    state.summary = summary
+                    state.summary = truncate_summary(summary, summary_char_limit(self.input_budget))
+                    state.failed_turns = None
                     state.cut_index = cut
                     state.fingerprint = fingerprint(history[:cut])
-                    sent = compose(summary, cut)
+                    sent = compose(state.summary, cut)
                     raw = estimate(sent)
 
         after = calibrated(raw)
@@ -2153,12 +2159,13 @@ class Agent:
         caller bounds it by the run deadline; each attempt is also bounded by
         the provider turn timeout.
 
-        Its output ceiling is the agent's per-turn ``max_tokens`` (a reasoning
-        model spends output tokens thinking before it writes), capped at
-        :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION` of the input budget
-        and never below :data:`~logpose.compaction.SUMMARY_MAX_TOKENS` (see
-        :func:`~logpose.compaction.summary_output_tokens`). The request asks
-        for a summary under half that ceiling, leaving the rest for thinking.
+        Its output ceiling is the larger of
+        :data:`~logpose.compaction.SUMMARY_MAX_TOKENS` and the agent's per-turn
+        ``max_tokens``: a reasoning model spends output tokens thinking before
+        it writes. The summary's length is bounded instead by the request
+        (a word limit from :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION`
+        of the input budget) and by truncation in the caller. Text from a
+        response cut off at ``max_tokens`` is still used (truncated likewise).
 
         Returns:
             The summary text, or ``None`` if the model answered with no text
@@ -2167,12 +2174,13 @@ class Agent:
         Raises:
             ProviderError: If every allowed attempt failed.
         """
-        ceiling = summary_output_tokens(self._max_tokens(), self.input_budget)
-        transcript = render_transcript(span, previous, max_words=summary_word_limit(ceiling))
+        transcript = render_transcript(
+            span, previous, max_words=summary_word_limit(self.input_budget)
+        )
         request = CompletionRequest(
             messages=[Message(role="user", content=[TextBlock(text=transcript)])],
             model=self._model(),
-            max_tokens=ceiling,
+            max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
             system=SUMMARY_INSTRUCTION,
             tools=[],
             extra={k: v for k, v in self.extra.items() if k not in _TURN_ONLY_EXTRA},

@@ -52,9 +52,11 @@ class SessionBusyError(LogposeError):
 class ContextOverflowError(LogposeError):
     """Raised when a request cannot be made to fit the model's context window.
 
-    The built-in context policy raises it when, after compaction (or when the
-    summary call failed), the estimated request is still larger than
-    ``context_window − max_tokens``. A failed summary call is chained as
+    The built-in context policy raises it before sending, and only when
+    ``context_window`` was passed to the agent explicitly: when, after
+    compaction (or when the summary call failed), the estimated request is
+    still larger than ``context_window − max_tokens``. With the default window
+    nothing is refused before sending. A failed summary call is chained as
     ``__cause__``.
 
     Attributes:

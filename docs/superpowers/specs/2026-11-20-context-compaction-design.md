@@ -110,20 +110,27 @@ model is shaped.
      estimate falls to `compaction_target × input_budget`. Cut points fall only
      on turn boundaries, so tool pairs are never split.
   2. Make one extra model call (same provider and model, no tools, `max_tokens`
-     = min(max(2,048, the agent's resolved per-turn `max_tokens`),
-     max(2,048, 15% of the input budget)) — amended 2026-11-20: a fixed 2,048
-     let reasoning models spend the whole budget thinking; amended 2026-11-23:
-     capped at 15% of the budget, because an uncapped summary (up to 16,384
-     tokens, half the default budget) filled the budget by itself and forced a
-     new summary every run) with a fixed summarization instruction and the
-     span's text (pointers, not full outputs). The request asks for a summary
-     under half that ceiling in words (about 0.75 words per token), leaving the
-     rest for a reasoning model's thinking. The instruction treats the
-     transcript as data: instructions found in it (notably in tool output) are
-     not followed or carried forward, only reported as attributed facts. The
-     output is the summary. A response with no text counts as a failed summary
-     (not retried). A metadata-only `context.summarizing` event is emitted just
-     before the call, so a streaming UI can show the pause.
+     = max(2,048, the agent's resolved per-turn `max_tokens`) — amended
+     2026-11-20: a fixed 2,048 let reasoning models spend the whole budget
+     thinking) with a fixed summarization instruction and the span's text
+     (pointers, not full outputs). The instruction treats the transcript as
+     data: instructions found in it (notably in tool output) are not followed
+     or carried forward, only reported as attributed facts. A metadata-only
+     `context.summarizing` event is emitted just before the call, so a
+     streaming UI can show the pause.
+     **Summary length** (amended 2026-11-23): the summary may take at most 15%
+     of the input budget. The request asks for at most `0.15 × budget × 0.75`
+     words, and the returned text is truncated to `0.15 × budget × 4`
+     characters (at a line or sentence end where possible, ending with `…`).
+     The output ceiling is not reduced, since reasoning models think out of it.
+     Without this bound an uncapped summary (up to 16,384 tokens, half the
+     default budget) filled the budget by itself and forced a new summary every
+     run. Text from a response cut off at `max_tokens` is used, truncated
+     likewise. A response with no text counts as a failed summary.
+     **After a failure** (amended 2026-11-23): not retried within the run, and
+     not attempted again (unless forced by the reactive fallback) until the
+     history has gained a caller turn since the failure. This is kept on the
+     `Conversation`'s compaction state, not persisted with sessions.
   - **Skip when it cannot help** (amended 2026-11-23): unless forced by the
     reactive fallback, no summary is made when the kept part alone (system,
     tools, pinned first turn, empty summary, the turns after the chosen cut)

@@ -672,9 +672,10 @@ characters / 4, multiplied by a calibration ratio learned from the usage the
 provider reports (smoothed, clamped to [0.5, 2.0]). When the estimate reaches 85%
 of the budget (`compaction_threshold`), older turns are summarized down to about
 60% (`compaction_target`): one extra model call (no tools, output ceiling the
-agent's `max_tokens` so reasoning models have room to think, capped at 15% of the
-input budget and never below 2,048, counted in the run's usage) whose result is
-inserted as an assistant message after the first user turn, which stays pinned.
+larger of 2,048 and the agent's `max_tokens` so reasoning models have room to think,
+counted in the run's usage) whose result is inserted as an assistant message after
+the first user turn, which stays pinned. The summary is asked to stay under 15% of
+the input budget and is truncated to that length (ending with `…`) if it does not.
 Recent turns, and everything from the current run, are sent verbatim. The summary
 is cached and reused until the threshold is reached again. Estimates leave out
 reasoning (thinking) blocks unless the provider re-sends them
@@ -704,7 +705,9 @@ still hits.
 
 If the summary call fails or returns no text, the request is sent uncompacted when
 it fits the window (`context_window - max_tokens`) or when `context_window` is not
-set; otherwise the run raises `ContextOverflowError`. A failed summary is not retried again within the same run.
+set; otherwise the run raises `ContextOverflowError`. A failed summary is not
+retried within the same run, nor in later runs until the conversation has a new
+user turn (the reactive retry below still forces one).
 If the provider rejects a request with an HTTP 400 that mentions the context length
 (`context_length`, `maximum context length`, `context window`, `context size`,
 `context length` or `exceed_context`, covering OpenAI-style servers, vLLM,
@@ -726,7 +729,10 @@ agent = Agent(
 summary publishes a metadata-only `context.compacted` runtime event (pointer count,
 whether a summary is in use, estimated tokens before and after, input budget). A
 `context.summarizing` event (estimated tokens, input budget) fires just before a
-summary call, so a streaming UI can show why the reply is paused.
+summary call, so a streaming UI can show why the reply is paused. Like every
+runtime event it goes to `observers` (and logging), not to the `stream()` iterator:
+pass an observer that forwards it to your UI, for example
+`Agent(..., observers=[lambda e: e.name == "context.summarizing" and notify(e.run_id)])`.
 `agent.last_context_diagnostics` holds the same numbers for the latest request.
 
 **Opting out.** `context_policy=None` disables all of this and sends full history.
