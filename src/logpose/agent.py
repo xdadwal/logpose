@@ -1405,7 +1405,8 @@ class Agent:
 
         Returns:
             The saved messages, oldest first; ``[]`` for a session that does not
-            exist or has expired (an expired session is left untouched).
+            exist or has expired (an expired session is left untouched; a session
+            still under a live lease is not treated as expired).
 
         Raises:
             LogposeError: If ``session_id`` is invalid.

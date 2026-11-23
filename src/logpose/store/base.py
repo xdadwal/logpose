@@ -178,7 +178,8 @@ class SessionStore(Protocol):
         """Return a live session's stored messages, oldest first, as a new list.
 
         A read only: no lease is taken and nothing is written. A missing session,
-        or one past its ``expires_at`` but not yet purged, returns ``[]`` and is
+        or one past its ``expires_at`` but not yet purged (a session still under a
+        live lease is not treated as expired), returns ``[]`` and is
         neither deleted, reset nor extended. Messages saved by a run still in
         progress are not included until that run saves.
         """

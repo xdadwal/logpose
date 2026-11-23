@@ -190,8 +190,8 @@ async def test_delete_session_removes_messages_and_runs(tmp_path: Path) -> None:
         await s.record_run(_run("s1", "r1"))
         await s.record_run(_run("s2", "r2"))
         await s.delete_session("s1")
-        assert await s.load_messages("s1") == []
         assert len(await s.load_messages("s2")) == 1
+    assert await _scalar(p, "SELECT count(*) FROM logpose_messages WHERE session_id='s1'") == 0
     assert await _scalar(p, "SELECT count(*) FROM logpose_runs") == 1
 
 
@@ -211,8 +211,8 @@ async def test_purge_expired_counts_and_deletes(tmp_path: Path) -> None:
             await s.append_messages(sid, [_msg(sid)], start_seq=0)
             await s.record_run(_run(sid, "r-" + sid))
         assert await s.purge_expired(now_ms=5000) == 1
-        assert await s.load_messages("old") == []
         assert len(await s.load_messages("new")) == 1
+    assert await _scalar(p, "SELECT count(*) FROM logpose_messages WHERE session_id='old'") == 0
     assert await _scalar(p, "SELECT count(*) FROM logpose_runs") == 1
     assert await _scalar(p, "SELECT id FROM logpose_sessions") == "new"
 

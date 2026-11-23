@@ -15,7 +15,14 @@ import random
 import secrets
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
@@ -214,6 +221,10 @@ async def _fetch_messages(db: aiosqlite.Connection, session_id: str) -> list[Mes
         (session_id,),
     ) as cur:
         rows = await cur.fetchall()
+    return _decode_messages(rows)
+
+
+def _decode_messages(rows: Iterable[Any]) -> list[Message]:
     return [
         Message.model_validate({"role": role, "content": json.loads(content)})
         for role, content in rows
@@ -707,10 +718,7 @@ class SQLiteStore:
                 (session_id, now, now),
             ) as cur:
                 rows = await cur.fetchall()
-        return [
-            Message.model_validate({"role": role, "content": json.loads(content)})
-            for role, content in rows
-        ]
+        return _decode_messages(rows)
 
     async def append_messages(
         self, session_id: str, messages: Sequence[Message], *, start_seq: int

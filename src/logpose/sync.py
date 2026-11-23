@@ -717,7 +717,8 @@ class SyncAgent:
 
         Returns:
             The saved messages, oldest first; ``[]`` if the session does not
-            exist or has expired.
+            exist or has expired (a session still under a live lease is not
+            treated as expired).
 
         Raises:
             LogposeError: If called from a thread with a running event loop, or

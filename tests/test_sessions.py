@@ -1064,14 +1064,14 @@ async def test_block_exit_during_run_in_another_task_keeps_live_history_valid(
 async def test_long_run_keeps_lease_past_idle_bound(
     db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _short_lease(monkeypatch, 0.2)
+    _short_lease(monkeypatch, 0.5)
     provider = FakeProvider(
-        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 1.2})), ScriptedTurn.text("done")]
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 2.4})), ScriptedTurn.text("done")]
     )
     agent = Agent(provider, model="m", tools=[nap])
     async with agent.session("s1") as handle:
         task = asyncio.create_task(agent.run("go", session=handle))
-        await asyncio.sleep(1.0)  # past the idle bound, run still active
+        await asyncio.sleep(2.0)  # past the idle bound, run still active
         with pytest.raises(SessionBusyError):
             async with agent.session("s1"):
                 pass
