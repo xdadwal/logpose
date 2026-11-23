@@ -27,7 +27,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from logpose.agent import Conversation, _now_ms
+from logpose.agent import DEFAULT_SESSION_TTL, Conversation, _now_ms
 from logpose.errors import LogposeError, SessionBusyError
 from logpose.messages import Message
 from logpose.store.base import RunRecord, SessionHandle, validate_session_id
@@ -271,7 +271,7 @@ class SQLiteStore:
         self,
         path: str | os.PathLike[str],
         *,
-        idle_ttl: float = 30 * 86400.0,
+        idle_ttl: float = DEFAULT_SESSION_TTL,
         lease_ttl: float = 60.0,
         busy_timeout_ms: int = 5000,
     ) -> None:

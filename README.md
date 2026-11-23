@@ -646,20 +646,22 @@ on load:
   session first (see Session IDs above).
 
 `.env` files read by pydantic-settings (or similar) do not populate `os.environ`,
-so logpose cannot see them. Pass `db_path=`, `session_ttl=`, `api_key=` and
+so logpose cannot see them. Pass `base_url=`, `api_key=`, `db_path=`, `session_ttl=` and
 `tracing=Tracing(...)` explicitly:
 
 ```python
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from logpose import Agent, Tracing
+from logpose import Agent, LogposeError, Tracing
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env")
-    openai_api_key: str
+    base_url: str
+    openai_api_key: SecretStr
     db_path: str = "/var/lib/myapp/logpose.db"
     session_ttl_days: int = 7
 
@@ -670,7 +672,8 @@ async def lifespan(app: FastAPI):
     app.state.agent = Agent(
         "openai-compat",
         model="gpt-5.1",
-        api_key=settings.openai_api_key,
+        base_url=settings.base_url,
+        api_key=settings.openai_api_key.get_secret_value(),
         db_path=settings.db_path,
         session_ttl=timedelta(days=settings.session_ttl_days),
         tracing=Tracing(),
@@ -680,10 +683,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/chat/{sid}/history")
-async def history(sid: str):
-    messages = await app.state.agent.load_session(sid)
-    return [m.model_dump(mode="json") for m in messages]
+@app.get("/chat/history")
+async def history(request: Request):
+    # The session ID comes from the visitor's own cookie, never from the URL, so
+    # a visitor can only read the conversation they own.
+    sid = request.cookies.get("chat_sid")
+    if not sid:
+        return []
+    try:
+        messages = await app.state.agent.load_session(sid)
+    except LogposeError:  # malformed cookie value
+        return []
+    # Send the browser only user and assistant text, not tool calls or results.
+    return [{"role": m.role, "text": m.text} for m in messages if m.text]
 ```
 
 Known limits:

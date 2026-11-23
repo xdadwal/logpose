@@ -1088,7 +1088,9 @@ class Agent:
                 run is recorded at once; messages are saved when the block exits.
                 Messages and the run record go to the database the handle was
                 leased from; with a handle from an agent with a different
-                ``db_path``, this run's traces still go to this agent's database.
+                ``db_path``, this run's traces still go to this agent's database,
+                while the ``run_id`` duplicate check consults the handle's
+                database, not this agent's traces.
             metadata: Labels for this run (``str`` keys; ``str``, ``int``,
                 ``float`` or ``bool`` values). Readable through
                 :func:`~logpose.runtime.current_runtime_context`, stored on the

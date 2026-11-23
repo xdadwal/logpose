@@ -1081,6 +1081,23 @@ async def test_long_run_keeps_lease_past_idle_bound(
     await agent.aclose()
 
 
+async def test_load_session_readable_while_leased_past_expiry(db: Path) -> None:
+    agent = Agent(
+        FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]),
+        model="m",
+        session_ttl=0.2,
+    )
+    await agent.run("hi", session_id="s1")
+    async with agent.session("s1"):
+        await asyncio.sleep(0.4)  # past expires_at, lease still live
+        assert await agent.load_session("s1") != []
+    # the block's save stamped a fresh expires_at
+    assert await agent.load_session("s1") != []
+    await asyncio.sleep(0.4)
+    assert await agent.load_session("s1") == []
+    await agent.aclose()
+
+
 def test_session_exit_timeout_exceeds_busy_timeout() -> None:
     from logpose.agent import SESSION_EXIT_TIMEOUT
     from logpose.store.sqlite import SQLiteStore
