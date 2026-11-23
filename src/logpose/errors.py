@@ -40,7 +40,13 @@ class LogposeError(Exception):
 
 
 class SessionBusyError(LogposeError):
-    """Raised when a session already has a run in flight and cannot take another."""
+    """Raised when a session's lease cannot be taken or was lost.
+
+    On enter, the session is leased elsewhere (a run is in flight). On exit, the
+    lease was lost (it expired and another holder took it) and the messages were
+    not saved. Also raised when a run starts on a handle whose lease lapsed while
+    idle and was taken by another holder.
+    """
 
 
 class ContextOverflowError(LogposeError):

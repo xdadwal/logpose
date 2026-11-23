@@ -170,18 +170,26 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 ### Output limit
 
 Each turn's output ceiling defaults to 16384 tokens: room for reasoning plus a
-long answer. A reply that long can take longer than the 120-second turn
-deadline on slower models; if your replies run that long, raise
-`provider_turn_timeout` and `run_timeout` as well.
+long answer. Small local models often need it lower; set it with
+`Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`. A reply that
+long can take longer than the 120-second turn deadline on slower models; if
+your replies run that long, raise `provider_turn_timeout` and `run_timeout` as
+well.
+
+Some servers hard-reject a large ceiling with a 400. Examples: DeepSeek (limit
+8192 on `max_tokens`), some Groq models (8192 on `max_completion_tokens`), and
+vLLM when the prompt plus the ceiling exceeds `max_model_len` (so a 16k-context
+deployment fails every turn). For these, lower `max_tokens=` (8192 or less).
 
 The ceiling is sent as `max_completion_tokens`, the field OpenAI (and vLLM and
 llama.cpp) now expect; OpenAI's reasoning models reject the older `max_tokens`.
-For a server that only accepts the legacy field, such as some older Ollama or LM
-Studio builds, pass `OpenAICompatProvider(max_tokens_field="max_tokens")`, or
-`Agent("openai-compat", ..., max_tokens_field="max_tokens")`. A server that
-silently ignores the field applies no output cap; the turn and run deadlines
-still bound it. Small local models often need it lower; set it with
-`Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`.
+A server that only understands `max_tokens` may ignore the new field, so the
+output is uncapped (only the turn and run deadlines bound it), or it may reject
+it. For such servers pass `OpenAICompatProvider(max_tokens_field="max_tokens")`,
+or `Agent("openai-compat", ..., max_tokens_field="max_tokens")`.
+
+If you set `max_tokens` or `max_completion_tokens` yourself in `extra_body` or
+`Agent(extra=...)`, your value replaces logpose's, and only your field is sent.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
 so by default reasoning is not sent back on later turns. For servers that accept
@@ -258,8 +266,9 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
 Tool output is budgeted to about 2k tokens per call: shell, `read_file` pages,
-`list_dir`, grep, page fetches, and web search return at most 8,000 characters. `read_file` has no line cap and `list_dir` no entry cap; both page
-by characters with a continuation the model can follow.
+`list_dir`, grep, page fetches, and web search return about 8,000 characters.
+`read_file` has no line cap and `list_dir` no entry cap; both page by characters, each page about 8,000
+characters plus a continuation line the model can follow.
 
 ```python
 import httpx
@@ -534,7 +543,7 @@ response, so a busy session is still a 409 before any headers go out, and leave 
 when the body finishes:
 
 ```python
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -551,9 +560,12 @@ async def chat_stream(sid: str, body: ChatIn):
 
     async def chunks():
         try:
-            async for event in agent.stream(body.text, session=handle):
-                if isinstance(event, TextDelta):
-                    yield event.text
+            # aclosing ends the run (answering any tool call it was waiting on)
+            # before the session is saved, also when the client leaves mid-stream.
+            async with aclosing(agent.stream(body.text, session=handle)) as events:
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        yield event.text
         finally:
             await stack.aclose()  # saves and releases, also when the client leaves
 
@@ -561,6 +573,10 @@ async def chat_stream(sid: str, body: ChatIn):
     # before streaming began); closing the stack a second time does nothing.
     return StreamingResponse(chunks(), background=BackgroundTask(stack.aclose))
 ```
+
+Leaving a session block also closes any stream still open on its handle before
+saving, and answers a trailing unanswered tool call with an error result, so a
+stored session always stays replayable.
 
 For a single call, the convenience form does the same in one step:
 
@@ -573,8 +589,16 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
 
 - **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
   The file is created on first session use; runs without a session never touch disk.
+- **Session IDs:** anyone who knows a session ID can load that conversation, so use
+  unguessable IDs (for example `secrets.token_urlsafe(32)`) and check that the
+  caller owns the session before using it.
 - **Lease:** a lease lasts 60 seconds and is renewed every 20 seconds while its run
-  or block is active, so a crashed process frees its sessions within a minute.
+  or block is active, so a crashed process frees its sessions within a minute. A
+  block that has had no run in progress for 3 minutes stops renewing: its lease
+  expires on its own (so a dropped, never-run streaming response cannot hold a
+  session forever). A block held open across turns (a WebSocket chat) keeps
+  working: the next run on its handle takes the lease back if nobody else took it
+  meanwhile, and raises `SessionBusyError` if someone did.
 - **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
 - **Expiry:** a session expires after 30 days without use; an expired session starts
   empty on its next use. logpose never deletes rows on its own: call

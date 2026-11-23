@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -60,6 +61,12 @@ class SessionHandle:
             index in ``conversation.messages`` are new and are saved on exit.
         next_seq: The stored ``seq`` the first new message will get.
         stored_summary: The latest stored summary as ``(upto_seq, text)``, if any.
+        idle_since: ``time.monotonic()`` when the handle last went idle (opened,
+            or a run on it ended), or ``None`` while a run is in progress. The
+            store stops renewing a lease idle for longer than three lease TTLs.
+        lapsed: True once renewal stopped because the handle sat idle; the
+            lease then expires on its own. A new run on the handle first tries
+            to take the lease back (see ``revive``).
 
     Stored messages are append-only from ``seq`` 0 with no gaps, so a loaded
     message's ``seq`` equals its index in ``conversation.messages``. A summary's
@@ -89,10 +96,22 @@ class SessionHandle:
         self.loaded_count = loaded_count
         self.next_seq = next_seq
         self.stored_summary = stored_summary
-        if stored_summary is not None and next_seq == loaded_count:
+        self.idle_since: float | None = time.monotonic()
+        self.lapsed = False
+        # Set by the store: re-extend a lapsed lease if its stored token is still
+        # this holder's, and resume renewal. Returns False (and marks the handle
+        # lost) if another holder took the lease meanwhile.
+        self.revive: Callable[[], Awaitable[bool]] | None = None
+        self._seed_summary()
+
+    def _seed_summary(self) -> None:
+        """Seed the conversation's compaction state from ``stored_summary`` if it fits."""
+        stored_summary = self.stored_summary
+        conversation = self.conversation
+        if stored_summary is not None and self.next_seq == self.loaded_count:
             upto_seq, text = stored_summary
             cut = upto_seq + 1
-            if 0 < cut <= loaded_count:
+            if 0 < cut <= self.loaded_count:
                 conversation._compaction = _CompactionState(
                     summary=text,
                     cut_index=cut,

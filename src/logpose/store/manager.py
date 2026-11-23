@@ -20,8 +20,9 @@ import os
 import threading
 import warnings
 import weakref
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover
     from logpose.store.base import SessionHandle, SessionStore
@@ -62,6 +63,10 @@ _ACTIVE_HANDLES: weakref.WeakKeyDictionary[SessionHandle, SessionStore] = (
 )
 # Handles with a run in flight; one run at a time per handle.
 _RUNNING: weakref.WeakSet[SessionHandle] = weakref.WeakSet()
+# Streams started on a block's handle; the block closes them before it saves.
+_STREAMS: weakref.WeakKeyDictionary[SessionHandle, weakref.WeakSet[AsyncIterator[Any]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def db_path() -> Path:
@@ -237,5 +242,6 @@ def reset_stores_for_tests() -> None:
         _CREATE_LOCKS.clear()
         _ACTIVE_HANDLES.clear()
         _RUNNING.clear()
+        _STREAMS.clear()
     for store in stores:
         _stop_now(store)

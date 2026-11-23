@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -53,6 +54,7 @@ from logpose.messages import (
 )
 from logpose.providers.base import (
     CompletionDone,
+    CompletionRequest,
     Provider,
     ProviderTextDelta,
 )
@@ -1614,6 +1616,22 @@ def test_named_provider_is_resolved_with_provider_kwargs() -> None:
     assert agent.model == "local-model"
 
 
+def test_agent_forwards_max_tokens_field_to_provider() -> None:
+    agent = Agent(
+        "openai-compat",
+        model="local-model",
+        base_url="http://local.test/v1",
+        max_tokens_field="max_tokens",
+    )
+
+    assert agent.provider.max_tokens_field == "max_tokens"  # type: ignore[attr-defined]
+    body = agent.provider._build_body(  # type: ignore[attr-defined]
+        CompletionRequest(messages=[Message.user("hi")], model="m", max_tokens=64), "m"
+    )
+    assert body["max_tokens"] == 64
+    assert "max_completion_tokens" not in body
+
+
 def test_provider_kwargs_alongside_a_built_provider_raise() -> None:
     with pytest.raises(LogposeError, match="already-built provider"):
         Agent(FakeProvider(), model="test-model", api_key="sk-should-not-be-here")
@@ -2183,3 +2201,38 @@ def test_conversation_from_json_rejects_unknown_version() -> None:
 
     with pytest.raises(LogposeError, match="version"):
         Conversation.from_json('{"version": 99, "messages": []}')
+
+
+def test_conversation_to_json_uses_json_mode() -> None:
+    import datetime
+
+    from logpose.messages import Message, ToolUseBlock
+
+    conv = Conversation(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(id="t1", name="x", input={"when": datetime.date(2026, 1, 2)})
+                ],
+            )
+        ]
+    )
+    data = json.loads(conv.to_json())
+    assert data["messages"][0]["content"][0]["input"] == {"when": "2026-01-02"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        '{"version": 1}',
+        '{"version": 1, "messages": [{"role": "bogus", "content": "x"}]}',
+        '{"version": 1, "messages": 5}',
+    ],
+)
+def test_conversation_from_json_rejects_malformed(text: str) -> None:
+    from logpose.errors import LogposeError
+
+    with pytest.raises(LogposeError):
+        Conversation.from_json(text)

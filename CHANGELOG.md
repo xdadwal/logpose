@@ -10,12 +10,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed (defaults)
 
 - **Breaking:** the output ceiling is now sent as `max_completion_tokens`
-  instead of `max_tokens`, as OpenAI's reasoning models require. Use
-  `OpenAICompatProvider(max_tokens_field="max_tokens")` for servers that only
-  accept the legacy field.
+  instead of `max_tokens`, as OpenAI's reasoning models require. A server that
+  only understands `max_tokens` may ignore the new field (no output cap) or
+  reject it; use `OpenAICompatProvider(max_tokens_field="max_tokens")` (or
+  `Agent(..., max_tokens_field="max_tokens")`) for such servers.
+- `max_tokens` or `max_completion_tokens` in `extra_body` or `Agent(extra=...)`
+  now replaces logpose's ceiling field; only the caller's field is sent.
 - `Agent` `max_tokens` default raised from 8192 to 16384. A full-length reply
   can exceed the 120 s `provider_turn_timeout` on slower models; raise the
   deadlines too if replies run that long.
+- **Breaking:** servers that hard-reject a large output ceiling (for example
+  DeepSeek, some Groq models, vLLM with a small `max_model_len`) now fail with a
+  400 under the 16384 default; lower `max_tokens=` (8192 or less).
 - Tool output caps reduced from 16,000 to 8,000 characters (about 2k tokens):
   shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
   search was already 8,000.
