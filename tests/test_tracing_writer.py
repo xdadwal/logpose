@@ -703,3 +703,32 @@ async def test_slow_open_that_then_fails_still_backs_off(
     await agent.run("c")
     assert len(attempts) == 1
     assert [r.name for r in _warnings(caplog)] == ["logpose.trace", "logpose.trace"]
+
+
+async def test_pending_slow_open_is_waited_on_only_once(
+    db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    original = manager.get_store
+
+    async def slow(*, owner: object | None = None) -> Any:
+        await asyncio.sleep(1.0)
+        return await original(owner=owner)
+
+    monkeypatch.setattr(manager, "get_store", slow)
+    caplog.set_level(logging.WARNING)
+    provider = FakeProvider(ScriptedTurn.text("ok"), repeat_last=True)
+    agent = Agent(provider, model="m", tracing=Tracing(flush_timeout=0.3))
+    other = Agent(provider, model="m", tracing=Tracing(flush_timeout=0.3))
+    times = []
+    for runner in (agent, agent, agent, other):
+        start = time.monotonic()
+        await runner.run("x")
+        times.append(time.monotonic() - start)
+    assert times[0] >= 0.3
+    # Later runs (any agent) do not wait on the same pending open again.
+    assert max(times[1:]) < 0.15, times
+    await _until(lambda: manager._open_count() == 1)
+    await agent.run("x", run_id="after-open")
+    await agent.aclose()
+    await other.aclose()
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_spans WHERE run_id = 'after-open'") == [(2,)]

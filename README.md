@@ -1004,7 +1004,8 @@ If another process holds the database write lock, a traced run without a session
 does not wait for it. Opening the store for the first time (per database path and
 event loop) and checking a caller-supplied `run_id` against stored traces share a
 wait of at most `max(flush_timeout, 0.25)` seconds. When the open takes longer, the
-run is untraced and the open continues in the background for later runs; when the
+run is untraced and the open continues in the background for later runs, which
+do not wait for it again: until it finishes they run untraced at once. When the
 check takes longer, it is skipped. Each logs one `WARNING` per agent on
 `logpose.trace`. Session runs wait for their lease as usual.
 

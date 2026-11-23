@@ -300,6 +300,9 @@ _RUN_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 _TRACE_BACKGROUND: set[asyncio.Future[Any]] = set()
 """Trace-store checks a run stopped waiting for; kept referenced until they finish."""
 
+_SLOW_TRACE_OPENS: weakref.WeakSet[asyncio.Future[Any]] = weakref.WeakSet()
+"""Trace-store opens a run already gave up waiting for; not waited on again."""
+
 _ACTIVE_RUN_IDS: set[str] = set()
 """Caller-supplied run IDs of runs in flight in this process, across all agents
 (stores are shared between agents). Claimed synchronously before any await, so
@@ -1726,7 +1729,8 @@ class Agent:
         loop) on first use, waiting at most :meth:`_trace_wait_budget`: if the
         open takes longer (another process holds the database write lock) this
         run proceeds untraced with one WARNING per agent, and the open carries
-        on in the background for later runs. If it cannot be opened the run
+        on in the background for later runs. Those runs do not wait on it again:
+        they proceed untraced at once until it finishes. If it cannot be opened the run
         proceeds untraced; the first such failure per agent logs one WARNING to
         ``logpose.trace``,
         and runs within :data:`TRACE_STORE_RETRY_SECONDS` of a failure do not
@@ -1749,8 +1753,12 @@ class Agent:
             self._trace_opening = None
             if not opening.done():
                 budget = self._trace_wait_budget()
-                await asyncio.wait({opening}, timeout=budget)
+                # One timed-out wait per pending open: later runs (of any agent)
+                # go untraced at once instead of each waiting the budget again.
+                if opening not in _SLOW_TRACE_OPENS:
+                    await asyncio.wait({opening}, timeout=budget)
                 if not opening.done():
+                    _SLOW_TRACE_OPENS.add(opening)
                     self._trace_opening = opening
                     self._warn_trace_slow(
                         "open",
