@@ -36,7 +36,9 @@ streaming in another tab, without taking the write lease.
 
 ### `db_path`
 - Resolution: `Agent(db_path=)` if given (not blank) → `LOGPOSE_DB_PATH` (not
-  blank) → `./logpose.db`; made absolute (`~` expanded) once, at construction.
+  blank) → `./logpose.db`; made absolute (`~` expanded). An explicit `db_path`
+  is fixed at construction; without it the env/default is resolved at each use,
+  as before.
   Accepts `str | os.PathLike[str] | None`.
 - Used everywhere the agent touches storage: the manager's per-(path, loop)
   store cache, the tracing span writer (per store), `purge_traces`,

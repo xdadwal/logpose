@@ -265,3 +265,52 @@ async def test_defaults_unchanged(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     await agent.run("q", session_id="s")
     await agent.aclose()
     assert _stamp(env, "s") == 30 * DAY_MS
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+
+async def test_db_path_without_argument_is_resolved_at_each_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    early, late = tmp_path / "early.db", tmp_path / "late.db"
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(early))
+    agent = _agent(tracing=Tracing())
+    assert agent.db_path == early
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(late))
+    assert agent.db_path == late
+    await agent.run("q", session_id="s")
+    assert late.exists()
+    assert not early.exists()
+    assert _contents(late, "s") == ["q", "ok"]
+    # The default (no env) follows the working directory at use time too.
+    monkeypatch.delenv("LOGPOSE_DB_PATH")
+    monkeypatch.chdir(tmp_path)
+    assert agent.db_path == tmp_path / "logpose.db"
+    await agent.run("q2", session_id="d")
+    await agent.aclose()
+    assert _contents(tmp_path / "logpose.db", "d") == ["q2", "ok"]
+    # Traces followed the path too.
+    assert _rows(late, "SELECT COUNT(*) FROM logpose_spans")[0][0] > 0
+    assert _rows(tmp_path / "logpose.db", "SELECT COUNT(*) FROM logpose_spans")[0][0] > 0
+
+
+async def test_explicit_db_path_stays_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixed = tmp_path / "fixed.db"
+    monkeypatch.chdir(tmp_path)
+    agent = _agent(db_path="fixed.db")
+    monkeypatch.chdir(tmp_path.parent)
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(tmp_path / "env.db"))
+    assert agent.db_path == fixed
+    with pytest.raises(AttributeError):
+        agent.db_path = tmp_path / "other.db"  # type: ignore[misc]
+
+
+def test_session_ttl_too_large() -> None:
+    with pytest.raises(LogposeError):
+        _agent(session_ttl=1e300)
+    with pytest.raises(LogposeError):
+        _agent(session_ttl=timedelta.max.total_seconds() * 2)
+    assert _agent(session_ttl=timedelta.max).session_ttl == timedelta.max.total_seconds()

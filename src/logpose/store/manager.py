@@ -3,10 +3,12 @@
 One opened :class:`~logpose.store.sqlite.SQLiteStore` exists per (absolute
 database path, running event loop): an aiosqlite connection is bound to the
 loop that awaits it, and the sync facade runs its own private loop. The path is
-each agent's :attr:`~logpose.agent.Agent.db_path`. Stores are created lazily on
-first session use, shared by every :class:`~logpose.agent.Agent` with that path
-on that loop, and closed by :meth:`~logpose.agent.Agent.aclose` of the last
-agent using them, or at interpreter exit (best effort).
+an agent's explicit ``db_path`` when it was given; otherwise it is resolved by
+:func:`db_path` at each use (``LOGPOSE_DB_PATH``, then ``./logpose.db``).
+Stores are created lazily on first session use, shared by every
+:class:`~logpose.agent.Agent` with that path on that loop, and closed by
+:meth:`~logpose.agent.Agent.aclose` of the last agent using them, or at
+interpreter exit (best effort).
 
 Each store owns one :class:`~logpose.tracing.writer.SpanWriter`. Closing a store
 closes its writer first (writing what is queued, bounded); a store whose loop is
