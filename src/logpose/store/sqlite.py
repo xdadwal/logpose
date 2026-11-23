@@ -287,6 +287,13 @@ class SQLiteStore:
         validate_session_id(session_id)
         handle, token = await self._acquire(session_id, wait, metadata)
         renewal = [asyncio.create_task(self._renewal_loop(handle, token))]
+        closing = False
+
+        async def stop_renewal() -> None:
+            nonlocal closing
+            closing = True
+            for task in renewal:
+                await self._stop(task)
 
         async def revive() -> bool:
             counts = await self._write(
@@ -301,6 +308,10 @@ class SQLiteStore:
             if counts[0] == 0:
                 handle.lost = True
                 return False
+            if closing:
+                # The block exited while this revive waited for the store:
+                # its release clears the lease, so start no new renewal.
+                return False
             handle.lapsed = False
             renewal.append(asyncio.create_task(self._renewal_loop(handle, token)))
             return True
@@ -309,10 +320,10 @@ class SQLiteStore:
         try:
             yield handle
         except BaseException as exc:
-            await self._stop(renewal[-1])
+            await stop_renewal()
             await self._release(handle, token, exc)
             raise
-        await self._stop(renewal[-1])
+        await stop_renewal()
         await self._release(handle, token, None)
 
     async def _acquire(
