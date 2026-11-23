@@ -353,13 +353,19 @@ def _session_kwargs(
     return kwargs
 
 
-def _run_kwargs(metadata: RunMetadata | None, run_id: str | None) -> dict[str, Any]:
-    """Collect only the run-labelling keywords the caller actually passed."""
+def _run_kwargs(
+    metadata: RunMetadata | None,
+    run_id: str | None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Collect only the per-run keywords the caller actually passed."""
     kwargs: dict[str, Any] = {}
     if metadata is not None:
         kwargs["metadata"] = metadata
     if run_id is not None:
         kwargs["run_id"] = run_id
+    if extra is not None:
+        kwargs["extra"] = extra
     return kwargs
 
 
@@ -375,6 +381,7 @@ def run_sync(
     session: SessionHandle | None = None,
     metadata: RunMetadata | None = None,
     run_id: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> RunResult[Any]:
     """Run ``agent`` to completion, blocking until it finishes.
 
@@ -396,6 +403,8 @@ def run_sync(
         metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
         run_id: Use this run ID instead of a generated one, as for
             :meth:`~logpose.agent.Agent.run`.
+        extra: Provider request parameters for this run only, merged over the
+            agent's ``extra``, as for :meth:`~logpose.agent.Agent.run`.
 
     Returns:
         The completed :class:`~logpose.events.RunResult`.
@@ -410,7 +419,7 @@ def run_sync(
     runner = _runner_for(agent)
     kwargs = _output_kwargs(output_type, output_retries)
     kwargs.update(_session_kwargs(session_id, session_metadata, session))
-    kwargs.update(_run_kwargs(metadata, run_id))
+    kwargs.update(_run_kwargs(metadata, run_id, extra))
     return runner.run(agent.run(prompt, conversation=conversation, **kwargs))
 
 
@@ -426,6 +435,7 @@ def stream_sync(
     session: SessionHandle | None = None,
     metadata: RunMetadata | None = None,
     run_id: str | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> Iterator[Event]:
     """Run ``agent``, yielding events as they happen.
 
@@ -454,6 +464,8 @@ def stream_sync(
         metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
         run_id: Use this run ID instead of a generated one, as for
             :meth:`~logpose.agent.Agent.run`.
+        extra: Provider request parameters for this run only, merged over the
+            agent's ``extra``, as for :meth:`~logpose.agent.Agent.run`.
 
     Returns:
         An iterator of :data:`~logpose.events.Event` values, ending with
@@ -470,7 +482,7 @@ def stream_sync(
     # should surface here rather than at the first `next()`.
     kwargs = _output_kwargs(output_type, output_retries)
     kwargs.update(_session_kwargs(session_id, session_metadata, session))
-    kwargs.update(_run_kwargs(metadata, run_id))
+    kwargs.update(_run_kwargs(metadata, run_id, extra))
     events = agent.stream(prompt, conversation=conversation, **kwargs)
     return _drive(runner, events)
 
@@ -570,6 +582,7 @@ class SyncAgent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> RunResult[Any]:
         """Run to completion, blocking until it finishes.
 
@@ -586,6 +599,8 @@ class SyncAgent:
             metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
             run_id: Use this run ID instead of a generated one, as for
                 :meth:`~logpose.agent.Agent.run`.
+            extra: Provider request parameters for this run only, merged over
+                the agent's ``extra``, as for :meth:`~logpose.agent.Agent.run`.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -607,6 +622,7 @@ class SyncAgent:
             session=session,
             metadata=metadata,
             run_id=run_id,
+            extra=extra,
         )
 
     def stream(
@@ -621,6 +637,7 @@ class SyncAgent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> Iterator[Event]:
         """Run, yielding events as they happen.
 
@@ -637,6 +654,8 @@ class SyncAgent:
             metadata: Labels for this run, as for :meth:`~logpose.agent.Agent.run`.
             run_id: Use this run ID instead of a generated one, as for
                 :meth:`~logpose.agent.Agent.run`.
+            extra: Provider request parameters for this run only, merged over
+                the agent's ``extra``, as for :meth:`~logpose.agent.Agent.run`.
 
         Returns:
             An iterator of :data:`~logpose.events.Event` values, ending with
@@ -657,6 +676,7 @@ class SyncAgent:
             session=session,
             metadata=metadata,
             run_id=run_id,
+            extra=extra,
         )
 
     def session(
