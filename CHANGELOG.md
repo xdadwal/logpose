@@ -54,6 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Input guardrails: `Agent(input_guardrails=[...], guardrail_mode="blocking" | "parallel")`
+  screen each run's new user message. Adds `GuardrailInput`, `GuardrailVerdict`,
+  `GuardrailResult`, `InputGuardrail`, `pattern_guard`, `openai_decision_guard`
+  (OpenAI Decisions API only) and `GuardrailTripped` (raised for `output_type`
+  runs). A block returns the guard's placeholder with `stop_reason="refusal"` and
+  `RunResult.guardrail`, and leaves the conversation and session history
+  untouched. Emits the content-free `guardrail.decided` event; guard usage on
+  `GuardrailVerdict.usage` counts in run usage.
+  `openai_decision_guard` takes its key from `api_key=` or the dedicated
+  `LOGPOSE_GUARD_API_KEY` variable (never `LOGPOSE_API_KEY` or
+  `OPENAI_API_KEY`; missing raises at construction), takes `name=`, and bounds the whole call by `timeout`. Guards see
+  the prompt text exactly as sent; a guarded prompt with non-text content is
+  blocked as `"error"` ("unsupported content"). A parallel-mode block counts
+  the usage of a first turn that already finished.
+- Session `RunRecord` outcome `"blocked"` for runs stopped by an input guardrail.
 - Context compaction: tool-output pointers with an automatic
   `recall_tool_output` tool, a calibrated model-written summary of older turns
   (first turn pinned, assistant-role summary, persisted with sessions), and a

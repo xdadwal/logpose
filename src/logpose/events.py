@@ -9,9 +9,12 @@ one of :data:`Event`; the terminal :class:`RunEnd` carries the same
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
 
 from logpose.messages import Message, StopReason, Usage
+
+if TYPE_CHECKING:
+    from logpose.guardrails import GuardrailResult
 
 __all__ = [
     "TextDelta",
@@ -106,6 +109,9 @@ class RunResult(Generic[T]):
         iterations: Number of provider turns the loop took.
         output: The validated structured answer when the run had an
             ``output_type``; ``None`` otherwise. ``text`` keeps the raw JSON.
+        guardrail: When an input guardrail blocked the run, the guard name,
+            category, reason and scores; ``text`` is then the placeholder reply
+            and ``stop_reason`` is ``"refusal"``. ``None`` otherwise.
     """
 
     text: str
@@ -114,6 +120,7 @@ class RunResult(Generic[T]):
     stop_reason: StopReason = "end_turn"
     iterations: int = 0
     output: T | None = None
+    guardrail: GuardrailResult | None = None
 
 
 @dataclass(frozen=True)

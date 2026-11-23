@@ -55,6 +55,7 @@ from logpose.context import ContextInput, ContextPolicy, ContextPreparationError
 from logpose.errors import (
     AuthError,
     ContextOverflowError,
+    GuardrailTripped,
     LogposeError,
     MaxIterationsError,
     OutputRefusalError,
@@ -75,6 +76,14 @@ from logpose.events import (
     ToolCall,
     ToolResult,
     TurnEnd,
+)
+from logpose.guardrails import (
+    GuardrailInput,
+    GuardrailResult,
+    GuardrailVerdict,
+    InputGuardrail,
+    openai_decision_guard,
+    pattern_guard,
 )
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
 from logpose.messages import (
@@ -140,6 +149,14 @@ __all__ = [
     "current_runtime_context",
     "current_tool_deadline",
     "ToolDeadlineHandle",
+    # guardrails
+    "GuardrailInput",
+    "GuardrailVerdict",
+    "GuardrailResult",
+    "GuardrailTripped",
+    "InputGuardrail",
+    "pattern_guard",
+    "openai_decision_guard",
     # tools
     "tool",
     "ToolDef",

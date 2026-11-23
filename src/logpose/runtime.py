@@ -43,8 +43,9 @@ class RuntimeContext:
 class RuntimeEvent:
     """An immutable, metadata-only record of an agent lifecycle operation.
 
-    ``name`` is one of the documented ``run.*``, ``provider.*``, ``tool.*``, or
-    ``context.*`` event names. Optional fields are populated only where they apply.
+    ``name`` is one of the documented ``run.*``, ``provider.*``, ``tool.*``,
+    ``context.*``, or ``guardrail.*`` event names. Optional fields are populated
+    only where they apply. ``guard_scores`` is a JSON object of a guard's scores.
     """
 
     name: str
@@ -77,6 +78,10 @@ class RuntimeEvent:
     estimated_tokens_before: int | None = None
     estimated_tokens_after: int | None = None
     input_budget: int | None = None
+    guard_name: str | None = None
+    guard_allowed: bool | None = None
+    guard_category: str | None = None
+    guard_scores: str | None = None
 
     def log_fields(self) -> dict[str, str | int | float | bool | None]:
         """Return primitive, namespaced fields safe to attach to a LogRecord."""

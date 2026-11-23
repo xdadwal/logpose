@@ -37,6 +37,8 @@ your application -> logpose Agent -> model provider
   the backend supports it.
 - Provider discovery, readiness checks, model listing, and a protocol for adding
   custom backends.
+- Input guardrails that screen user messages before the agent acts, blocking or
+  racing the first model turn.
 - Credential redaction in provider errors and tracebacks.
 
 logpose is currently **alpha software**. The public surface is usable, but APIs
@@ -817,6 +819,113 @@ strict `json_schema` support cannot be used with `output_type`.
 | Z.ai GLM API | ❌ documents only `json_object` |
 | DeepSeek API | ❌ documents only `json_object` |
 
+## Input guardrails
+
+Input guardrails check each run's new user message before the agent acts on it.
+They are configured on the agent, so `run`, `stream` and the sync facade need no
+extra arguments:
+
+```python
+import httpx
+
+from logpose import Agent, openai_decision_guard, pattern_guard
+
+# Create once and keep for the app's lifetime; close it at shutdown.
+shared_httpx_client = httpx.AsyncClient()
+
+agent = Agent(
+    "openai-compat",
+    model="gpt-5.1",
+    input_guardrails=[
+        pattern_guard(max_chars=4000, reply="That message is too long."),
+        openai_decision_guard(
+            "billing questions for Acme",
+            replies={
+                "off_topic": "I can only help with Acme billing.",
+                "unsafe": "I can't help with that.",
+            },
+            # key: LOGPOSE_GUARD_API_KEY env var, or pass api_key= explicitly
+            client=shared_httpx_client,  # one httpx.AsyncClient for the app
+        ),
+    ],
+    guardrail_mode="blocking",  # or "parallel"
+)
+```
+
+A guard is any sync or async callable taking a `GuardrailInput` (the new
+`message`, a few `recent` messages, session `metadata`, `run_id`) and returning
+a `GuardrailVerdict`. Guards see the prompt's text exactly as it is sent to
+the provider (text blocks joined with no separator). Guards are text-only: a prompt
+with any non-text content (tool results, raw provider blocks) is blocked with
+category `"error"`, guard `"content_check"` and reason `"unsupported content"`
+before any guard runs,
+rather than sent unscreened. A run with an empty text prompt, or with no new
+prompt, skips the guards. A guard that raises or returns the wrong type
+counts as a block with category `"error"`, as does a verdict with malformed `scores` or `usage`, or whose `allowed` is not a `bool`. A sync callable that returns a coroutine is treated as a sync-tier guard (awaited in sequence, so it does not race the turn); write async guards as `async def`.
+
+**Order.** Sync guards run first, in list order, and the first block ends the run
+before any async guard starts (in parallel mode too: sync guards run before the
+model call begins). Async guards then run concurrently; the first block wins
+(list order among guards that finish together) and the rest are cancelled. A
+slow sync guard runs inline and cannot be interrupted by `run_timeout`; the
+deadline is checked when it returns, so keep sync guards fast.
+
+**Blocking versus parallel.** In `"blocking"` mode (the default) the guards
+finish before the main model is called. In `"parallel"` mode async guards race
+the first model turn, which hides their latency, with these trade-offs:
+
+- Text and thinking output is buffered until the guards allow. Tools never run
+  before then.
+- On a block the turn is cancelled. If the turn had already finished, its
+  reported usage counts in the run's usage and `RunRecord`. A turn cancelled
+  mid-stream reports no usage, so its main-model tokens are not counted, but a
+  blocked request may still cost some main-model tokens.
+- `context.compacted` and `context.summarizing` events from the discarded turn
+  remain emitted, but a summary it made (or a failed summary attempt) is not
+  kept: the conversation's compaction state is left as it was.
+- If the run times out or is cancelled before the verdict, the prompt is dropped
+  and `iterations` is 0.
+
+**What a block returns.** The run ends with the guard's placeholder reply as the
+text, `stop_reason="refusal"`, and `RunResult.guardrail` (a `GuardrailResult`
+with `guard`, `category`, `reason`, `scores`). In blocking mode no model call is
+made. Neither the prompt nor the placeholder is added to the `Conversation` or
+the session, and the session's `RunRecord` has outcome `"blocked"`. With
+`output_type`, a block raises `GuardrailTripped` instead; the result is on
+`.result` (a `GuardrailResult`). Each decided guard emits a `guardrail.decided` runtime event with the
+guard name, verdict, category, and scores, never message text. Usage a guard
+reports on `GuardrailVerdict.usage` counts in the run's usage and session
+records; a custom async guard that calls a model should return its usage there.
+
+**`pattern_guard`** is free and deterministic: a `max_chars` cap (default 4000,
+`None` disables) and case-insensitive regexes in `block_patterns`, compiled at
+construction (an invalid regex raises `LogposeError`). Patterns you supply can
+backtrack catastrophically on adversarial input, so set `max_chars`.
+
+**`openai_decision_guard`** judges "on topic" and "unsafe" in one call to
+OpenAI's Decisions API (`POST /v1/decisions`, model `gpt-6-luna`), billed for
+input tokens only. It is OpenAI-specific: for other providers, write a custom
+guard. It opens a new httpx client per call unless you pass a shared `client=`,
+which is recommended in web apps for connection reuse. The key is
+`api_key=` if non-blank, else the `LOGPOSE_GUARD_API_KEY` environment variable;
+if neither is set, construction raises `LogposeError`. It never falls back to
+`LOGPOSE_API_KEY` (which may be another server's key) or `OPENAI_API_KEY`. `timeout` (default 5 s) bounds the whole call. Pass `name=`
+to tell two decision guards apart in results and events. `on_error` is `"block"` (the default, fail closed)
+or `"allow"`. A fail-open allow is observable: the verdict has
+`category="fail_open"` and the failure `reason` (no body text), and the
+`guardrail.decided` event has `guard_allowed=True` with
+`guard_category="fail_open"`. `history` (default 4) is how many prior messages
+the judge sees; the runner supplies at most 4, so values outside 0 to 4 raise
+`LogposeError`. A malformed or non-finite probability is handled as an
+error under `on_error`.
+
+**Tuning thresholds.** Start with `on_topic_min=0.5` and `unsafe_max=0.5`, then
+review the `scores` in `guardrail.decided` events from real traffic and adjust.
+
+**Limits.** Input guardrails only see the user's message. They do not see
+injection inside tool outputs or fetched documents. Pair them with read-only
+tools, and use `on_tool_call` to gate actions.
+
 ## Synchronous usage
 
 `SyncAgent` exposes the same loop to blocking applications:
@@ -884,6 +993,7 @@ All library-defined errors inherit from `LogposeError`.
 | `OutputRefusalError` | The model refused a structured-output request. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (a `ProviderError`). |
 | `ContextOverflowError` | The request cannot fit the explicitly set `context_window` even after compaction; see [Long conversations](#long-conversations). |
+| `GuardrailTripped` | An input guardrail blocked a run that uses `output_type`; `.result` is the `GuardrailResult`. See [Input guardrails](#input-guardrails). |
 
 Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or

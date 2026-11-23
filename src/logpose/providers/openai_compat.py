@@ -225,7 +225,8 @@ def _messages_to_wire(
 
     for message in messages:
         tool_results = [b for b in message.content if isinstance(b, ToolResultBlock)]
-        text = "".join(b.text for b in message.content if isinstance(b, TextBlock))
+        # Message.text: input guardrails screen this same string (guard_text).
+        text = message.text
         tool_uses = [b for b in message.content if isinstance(b, ToolUseBlock)]
 
         # Tool results are their own role and must precede any further user text.

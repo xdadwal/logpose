@@ -91,7 +91,9 @@ InputGuardrail = Callable[[GuardrailInput], GuardrailVerdict | Awaitable[Guardra
 
 - `Agent(..., input_guardrails: Sequence[InputGuardrail] = (), guardrail_mode:
   Literal["blocking", "parallel"] = "blocking")`.
-- Guards apply only when the run has a new prompt (`prompt is not None`). A guard
+- Guards apply only when the run has a new prompt (`prompt is not None`). A
+  verdict whose `allowed` is not a `bool` is malformed (a block with category
+  `"error"`). A guard
   that raises counts as a block with category `"error"` and the reply
   `"Sorry, something went wrong. Please try again."`. Built-in guards apply
   their own `on_error` policy first.
@@ -106,7 +108,8 @@ InputGuardrail = Callable[[GuardrailInput], GuardrailVerdict | Awaitable[Guardra
 - **Parallel:** guards run alongside the first provider turn. Text and thinking
   deltas are held back until the guards resolve. Tool calls requested before
   resolution wait for the guards: tools never run on unvetted input. On a block,
-  the provider turn is cancelled.
+  the provider turn is cancelled. Usage of a first turn that finished before
+  the block still counts.
 - Guards are bounded by the run deadline, and cancelling the run cancels them.
 
 ### When blocked
@@ -137,7 +140,8 @@ openai_decision_guard(
     domain: str,
     *,
     replies: Mapping[str, str],              # keys "off_topic", "unsafe"; both required
-    api_key: str | None = None,              # else LOGPOSE_API_KEY
+    api_key: str | None = None,              # else LOGPOSE_GUARD_API_KEY; required
+    name: str = "openai_decision_guard",     # guard name in results and events
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-6-luna",
     on_topic_min: float = 0.5,
@@ -164,13 +168,18 @@ openai_decision_guard(
   - else allow.
 
   Scores always carry both probabilities.
-- **Failure:** a refusal answer, a non-2xx response, a timeout, or malformed JSON
-  applies `on_error`. A block uses the `"unsafe"` reply, category `"error"`, and
+- **Failure:** a refusal on `on_topic`, a non-2xx response, a timeout (bounding
+  the whole call, not just each HTTP phase), or malformed JSON applies
+  `on_error`. A refusal on `unsafe` blocks as `"unsafe"` instead (resolution 3). A block uses the `"unsafe"` reply, category `"error"`, and
   a reason naming the failure type. Response bodies are never logged or echoed.
 - **Usage:** see resolution 6.
 - **Validation:**
-  - `api_key` is resolved at the first call: if missing, the call fails, which
-    applies `on_error`;
+  - the key is `api_key` if non-blank, else the dedicated `LOGPOSE_GUARD_API_KEY`
+    environment variable if non-blank (both stripped); neither raises
+    `LogposeError` at construction naming both options. `LOGPOSE_API_KEY` and
+    `OPENAI_API_KEY` are never read (amended 2026-11-23: falling back to
+    `LOGPOSE_API_KEY` sent the main provider's key to OpenAI when the app used
+    another server);
   - thresholds must lie in [0, 1];
   - `replies` must contain both keys (missing ones raise `LogposeError` at
     construction).
@@ -198,8 +207,13 @@ openai_decision_guard(
    block.
 5. **Text only.** logpose messages have no image blocks, and the owner excluded
    multimodal input.
-   - The guard sees the prompt's text blocks, concatenated with newlines.
-   - A prompt with no text (for example tool results only) skips the guards.
+   - The guard sees the prompt's text blocks joined with no separator, exactly
+     as the provider sends them (amended 2026-11-23: joining with newlines let
+     a pattern split across blocks pass).
+   - A prompt with any non-text block (for example tool results, raw provider
+     blocks) is blocked with category `"error"`, reason `"unsupported
+     content"`, before any guard runs (amended 2026-11-23: it used to skip the
+     guards, sending unscreened content). A prompt with empty text skips them.
    - For `recent`, only user and assistant **text** is sent. Messages with only
      tool calls or tool results are skipped, and still count toward `history`
      only if they contain text.

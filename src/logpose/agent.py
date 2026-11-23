@@ -130,6 +130,7 @@ from logpose.compaction import (
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     ContextOverflowError,
+    GuardrailTripped,
     LogposeError,
     MaxIterationsError,
     OutputRefusalError,
@@ -150,8 +151,23 @@ from logpose.events import (
     ToolResult,
     TurnEnd,
 )
+from logpose.guardrails import (
+    GuardrailInput,
+    GuardrailResult,
+    GuardrailVerdict,
+    InputGuardrail,
+    _has_unsupported_content,
+    guard_text,
+)
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
-from logpose.messages import Message, TextBlock, ToolResultBlock, ToolUseBlock, Usage
+from logpose.messages import (
+    ContentBlock,
+    Message,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    Usage,
+)
 from logpose.output import (
     OutputParseFailure,
     format_errors,
@@ -380,6 +396,14 @@ formatted traceback. The latter two modes are opt-in because tool failures can
 contain confidential application data.
 """
 
+GuardrailMode = Literal["blocking", "parallel"]
+"""How input guardrails are scheduled relative to the first provider turn."""
+_GUARDRAIL_MODES: tuple[str, ...] = ("blocking", "parallel")
+GUARDRAIL_ERROR_REPLY = "Sorry, something went wrong. Please try again."
+"""Placeholder reply for a block by a guard that raised."""
+GUARDRAIL_RECENT_MESSAGES = 4
+"""Prior user/assistant text messages handed to a guard as ``GuardrailInput.recent``."""
+
 
 @dataclass(frozen=True)
 class ToolErrorContext:
@@ -571,6 +595,8 @@ class Agent:
         compaction_threshold: float = DEFAULT_COMPACTION_THRESHOLD,
         compaction_target: float = DEFAULT_COMPACTION_TARGET,
         pointer_min_chars: int = DEFAULT_POINTER_MIN_CHARS,
+        input_guardrails: Sequence[InputGuardrail] = (),
+        guardrail_mode: GuardrailMode = "blocking",
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -663,6 +689,25 @@ class Agent:
                 to (default 0.60). Must be below ``compaction_threshold``.
             pointer_min_chars: Earlier-run tool outputs longer than this are sent
                 as pointers (default 1,000).
+            input_guardrails: Checks on each run's new user message, run before
+                the main model is called. Synchronous guards run first, in
+                order, and the first block ends the run; asynchronous guards
+                then run concurrently, the first block winning and the rest
+                cancelled. A block ends the run with the guard's placeholder
+                reply (``stop_reason="refusal"``, ``RunResult.guardrail`` set)
+                and the message never enters history; with ``output_type`` it
+                raises :class:`~logpose.errors.GuardrailTripped` instead. A
+                guard that raises counts as a block with category ``"error"``.
+                Runs without a new prompt (or whose prompt has no text) skip
+                the guards.
+            guardrail_mode: ``"blocking"`` (the default): the guards finish
+                before the main model is called. ``"parallel"`` (opt-in): the
+                guards race the first provider turn, which saves their latency
+                but sends the unvetted prompt to the main model, so a blocked
+                request may still cost main-model tokens. Its text and thinking
+                deltas are held back until the guards allow, and no tool runs
+                before then; on a block the turn is cancelled and the run ends
+                exactly as in blocking mode, leaving the conversation as it was.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -672,7 +717,8 @@ class Agent:
                 are passed alongside an already-built provider, if the provider
                 does not implement the protocol, if two tools share a name, if a
                 tool is not a :class:`~logpose.tools.ToolDef`, if
-                ``on_tool_call`` is not callable, or if ``max_iterations`` /
+                ``on_tool_call`` or an input guardrail is not callable, or if
+                ``guardrail_mode`` is unknown, or if ``max_iterations`` /
             ``max_tokens`` are not positive, or if ``retry_policy`` is not a
             :class:`~logpose.retry.RetryPolicy`, or if
             ``provider_turn_timeout``, ``max_concurrent_tools``, or
@@ -739,6 +785,15 @@ class Agent:
             raise LogposeError(f"on_tool_call must be callable, got {type(on_tool_call).__name__}.")
         if not all(callable(observer) for observer in observers):
             raise LogposeError("observers must contain only callable callbacks.")
+        if isinstance(input_guardrails, (str, bytes)) or not all(
+            callable(guard) for guard in input_guardrails
+        ):
+            raise LogposeError("input_guardrails must contain only callable guards.")
+        if guardrail_mode not in _GUARDRAIL_MODES:
+            raise LogposeError(
+                f"guardrail_mode must be one of {', '.join(map(repr, _GUARDRAIL_MODES))}, "
+                f"got {guardrail_mode!r}."
+            )
         if (
             isinstance(session_wait, bool)
             or not isinstance(session_wait, (int, float))
@@ -814,6 +869,8 @@ class Agent:
         self.output_type = output_type
         self.output_retries = output_retries
         self.session_wait = float(session_wait)
+        self.input_guardrails: tuple[InputGuardrail, ...] = tuple(input_guardrails)
+        self.guardrail_mode: GuardrailMode = guardrail_mode
         self._uses_store = False
 
         by_name: dict[str, ToolDef] = {}
@@ -1195,7 +1252,14 @@ class Agent:
         started_ms = _now_ms()
         run_end: RunEnd | None = None
         try:
-            inner = self._loop(first, handle.conversation, output_type, output_retries, stats)
+            inner = self._loop(
+                first,
+                handle.conversation,
+                output_type,
+                output_retries,
+                stats,
+                guard_metadata=handle.metadata,
+            )
             try:
                 async for event in inner:
                     if isinstance(event, RunEnd):
@@ -1214,8 +1278,10 @@ class Agent:
             raise
         manager._RUNNING.discard(handle)
         handle.idle_since = monotonic()
+        blocked = run_end is not None and run_end.result.guardrail is not None
         await _finish_session(
-            self._end_session_run(store, handle, cm, stats, started_ms, None), None
+            self._end_session_run(store, handle, cm, stats, started_ms, None, blocked=blocked),
+            None,
         )
         if run_end is None:  # pragma: no cover - the loop always ends with RunEnd
             raise LogposeError("The agentic loop finished without producing a result.")
@@ -1229,11 +1295,13 @@ class Agent:
         stats: _RunStats,
         started_ms: int,
         exc: BaseException | None,
+        *,
+        blocked: bool = False,
     ) -> None:
         """Write the run record, then (``session_id`` form) save and release."""
         from logpose.store.base import RunRecord
 
-        outcome, error_type = _outcome(exc)
+        outcome, error_type = ("blocked", None) if blocked else _outcome(exc)
         record = RunRecord(
             run_id=stats.run_id or self._runtime_id("run"),
             session_id=handle.id,
@@ -1384,6 +1452,8 @@ class Agent:
         output_type: type[BaseModel] | None = None,
         output_retries: int = 0,
         stats: _RunStats | None = None,
+        *,
+        guard_metadata: Mapping[str, str] | None = None,
     ) -> AsyncIterator[Event]:
         """Drive provider turns and tool executions until the run ends.
 
@@ -1394,6 +1464,7 @@ class Agent:
             output_retries: Correction turns allowed for an invalid final answer.
             stats: Run-scoped accumulator kept current with the run id, usage and
                 iterations, so a caller can read them whatever the outcome.
+            guard_metadata: Session metadata handed to input guardrails.
 
         Yields:
             :data:`~logpose.events.Event` values, ending with
@@ -1406,6 +1477,7 @@ class Agent:
             ProviderError: If the provider fails or violates its contract.
             OutputValidationError: If the final answer never validates.
             OutputRefusalError: If the model refused the structured answer.
+            GuardrailTripped: If an input guardrail blocked a run with ``output_type``.
         """
         model = self._model()
         response_format = response_format_for(output_type) if output_type is not None else None
@@ -1425,15 +1497,10 @@ class Agent:
         stats.run_id = run_context.run_id
         run_stats = stats
         # Built-in context policy state: the conversation's, or this run's only.
+        # Set up after the guard step, so a blocked run touches nothing on the
+        # Conversation.
         compaction: _CompactionState | None = None
         run_compaction = _RunCompaction()
-        if self._context_policy_is_default:
-            if conversation is None:
-                compaction = _CompactionState()
-            else:
-                if conversation._compaction is None:
-                    conversation._compaction = _CompactionState()
-                compaction = conversation._compaction
         total_usage = Usage()
 
         def add_usage(usage: Usage) -> None:
@@ -1452,9 +1519,148 @@ class Agent:
                 history.append(_error_results(unanswered, text))
                 unanswered.clear()
 
+        # Parallel mode appends the prompt before the guards decide. Until they
+        # allow it, whatever ends the run removes it again: unvetted input never
+        # stays in the conversation.
+        unvetted = False
+
+        def drop_unvetted() -> None:
+            # Iterations count only vetted turns: any exit before the guards
+            # allow reports none, as a blocking-mode block does.
+            nonlocal unvetted, iterations
+            if unvetted:
+                del history[current_start:]
+                unvetted = False
+                iterations = 0
+                run_stats.iterations = 0
+
+        def blocked_end(blocked: GuardrailResult, reply: str) -> Iterator[Event]:
+            if output_type is not None:
+                raise GuardrailTripped(blocked)
+            yield TextDelta(text=reply)
+            blocked_result: RunResult[Any] = RunResult(
+                text=reply,
+                messages=list(history),
+                usage=total_usage,
+                stop_reason="refusal",
+                iterations=0,
+                guardrail=blocked,
+            )
+            self._emit_runtime(
+                "run.completed",
+                context=run_context,
+                duration_seconds=monotonic() - started_at,
+                stop_reason="refusal",
+                iterations=0,
+                input_tokens=total_usage.input_tokens,
+                output_tokens=total_usage.output_tokens,
+                cache_read_input_tokens=total_usage.cache_read_input_tokens,
+                cache_creation_input_tokens=total_usage.cache_creation_input_tokens,
+            )
+            yield RunEnd(result=blocked_result)
+
+        turn_context = run_context
+
+        async def turn_events() -> AsyncIterator[TextDelta | ThinkingDelta | _TurnDone]:
+            """Prepare and stream one provider turn, ending with its ``_TurnDone``.
+
+            A context-length rejection forces a summary and retries the turn
+            once, within the same iteration.
+            """
+            nonlocal turn_context
+            rejection: ProviderError | None = None
+            while True:
+                shape = _summary_shape(compaction)
+                async with _run_budget(run_deadline):
+                    request, estimate = await self._prepare_request(
+                        history,
+                        response_format,
+                        current_start=current_start,
+                        compaction=compaction,
+                        run_compaction=run_compaction,
+                        context=turn_context,
+                        run_deadline=run_deadline,
+                        add_usage=add_usage,
+                        force_summary=rejection is not None,
+                    )
+                if rejection is not None and shape == _summary_shape(compaction):
+                    # Nothing more could be summarized (or the summary call
+                    # failed): the same request would be rejected again.
+                    raise rejection
+                done: CompletionDone | None = None
+                turn_stream = self._provider_turn(request, turn_context, run_deadline)
+                try:
+                    async for event in turn_stream:
+                        if isinstance(event, ProviderTextDelta):
+                            yield TextDelta(text=event.text)
+                        elif isinstance(event, ProviderThinkingDelta):
+                            yield ThinkingDelta(text=event.text)
+                        else:
+                            done = event
+                except ProviderError as exc:
+                    if (
+                        rejection is not None
+                        or compaction is None
+                        or not _is_context_length_error(exc)
+                    ):
+                        raise
+                    rejection = exc
+                    turn_context = replace(turn_context, request_id=self._runtime_id("request"))
+                    continue
+                finally:
+                    await _aclose(turn_stream)
+                yield _TurnDone(done, estimate)
+                return
+
         try:
+            guard_input: GuardrailInput | None = None
+            if (
+                prompt is not None
+                and self.input_guardrails
+                # Non-text content is screened too: the content check blocks it.
+                and (guard_text(prompt) or _has_unsupported_content(prompt))
+            ):
+                guard_input = GuardrailInput(
+                    message=prompt,
+                    recent=_recent_text(history),
+                    metadata=dict(guard_metadata or {}),
+                    run_id=run_context.run_id,
+                )
+            parallel = guard_input is not None and self.guardrail_mode == "parallel"
+            if guard_input is not None:
+                # Before the prompt is appended and before any compaction work,
+                # so a blocked run makes no provider call and leaves the
+                # conversation as it was. Parallel mode runs only the cheap
+                # synchronous tier here: just the asynchronous one races the
+                # first provider turn.
+                async with _run_budget(run_deadline):
+                    blocked, reply = await self._run_guardrails(
+                        guard_input,
+                        context=run_context,
+                        add_usage=add_usage,
+                        tiers="sync" if parallel else "all",
+                    )
+                if blocked is not None:
+                    for item in blocked_end(blocked, reply):
+                        yield item
+                    return
+                if parallel and not any(_is_async_guard(g) for g in self.input_guardrails):
+                    parallel = False  # nothing left to race
+            if self._context_policy_is_default:
+                if conversation is None:
+                    compaction = _CompactionState()
+                elif parallel:
+                    # A working copy until the guards allow: a blocked run must
+                    # leave the conversation's summary and calibration as they were.
+                    existing = conversation._compaction
+                    compaction = copy.copy(existing) if existing is not None else _CompactionState()
+                else:
+                    if conversation._compaction is None:
+                        conversation._compaction = _CompactionState()
+                    compaction = conversation._compaction
             if prompt is not None:
                 history.append(prompt)
+                unvetted = parallel
 
             last: CompletionDone | None = None
             output: BaseModel | None = None
@@ -1481,50 +1687,63 @@ class Agent:
                     request_id=self._runtime_id("request"),
                 )
                 done: CompletionDone | None = None
-                # A context-length rejection forces a summary and retries this
-                # turn once, within the same iteration.
-                rejection: ProviderError | None = None
-                while True:
-                    shape = _summary_shape(compaction)
-                    async with _run_budget(run_deadline):
-                        request, estimate = await self._prepare_request(
-                            history,
-                            response_format,
-                            current_start=current_start,
-                            compaction=compaction,
-                            run_compaction=run_compaction,
-                            context=turn_context,
-                            run_deadline=run_deadline,
-                            add_usage=add_usage,
-                            force_summary=rejection is not None,
+                estimate = 0
+                if unvetted:
+                    # Parallel mode's first turn: the guards race it. Everything
+                    # the turn produces is buffered until they decide, so no
+                    # model output reaches the caller and no tool runs before.
+                    assert guard_input is not None
+                    diagnostics = self.last_context_diagnostics
+                    buffer: asyncio.Queue[object] = asyncio.Queue()
+                    guard_task = asyncio.ensure_future(
+                        self._run_guardrails(
+                            guard_input, context=run_context, add_usage=add_usage, tiers="async"
                         )
-                    if rejection is not None and shape == _summary_shape(compaction):
-                        # Nothing more could be summarized (or the summary call
-                        # failed): the same request would be rejected again.
-                        raise rejection
-                    turn_stream = self._provider_turn(request, turn_context, run_deadline)
+                    )
+                    producer = asyncio.ensure_future(_pump(turn_events(), buffer))
                     try:
-                        async for event in turn_stream:
-                            if isinstance(event, ProviderTextDelta):
-                                yield TextDelta(text=event.text)
-                            elif isinstance(event, ProviderThinkingDelta):
-                                yield ThinkingDelta(text=event.text)
-                            else:
-                                done = event
-                    except ProviderError as exc:
-                        if (
-                            rejection is not None
-                            or compaction is None
-                            or not _is_context_length_error(exc)
-                        ):
-                            raise
-                        rejection = exc
-                        request_id = self._runtime_id("request")
-                        turn_context = replace(turn_context, request_id=request_id)
-                        continue
+                        async with _run_budget(run_deadline):
+                            blocked, reply = await guard_task
+                        if blocked is not None:
+                            producer.cancel()
+                            await asyncio.gather(producer, return_exceptions=True)
+                            # A turn that finished before the verdict spent
+                            # main-model tokens: count them.
+                            while not buffer.empty():
+                                held = buffer.get_nowait()
+                                if isinstance(held, _TurnDone) and held.done is not None:
+                                    add_usage(held.done.usage)
+                            drop_unvetted()
+                            self.last_context_diagnostics = diagnostics
+                            for item in blocked_end(blocked, reply):
+                                yield item
+                            return
+                        unvetted = False
+                        if conversation is not None and self._context_policy_is_default:
+                            conversation._compaction = compaction
+                        while True:
+                            held = await buffer.get()
+                            if isinstance(held, _PumpFailed):
+                                raise held.error
+                            if isinstance(held, _TurnDone):
+                                done, estimate = held.done, held.estimate
+                                break
+                            assert isinstance(held, (TextDelta, ThinkingDelta))
+                            yield held
                     finally:
-                        await _aclose(turn_stream)
-                    break
+                        for task in (guard_task, producer):
+                            task.cancel()
+                        await asyncio.gather(guard_task, producer, return_exceptions=True)
+                else:
+                    turn = turn_events()
+                    try:
+                        async for streamed in turn:
+                            if isinstance(streamed, _TurnDone):
+                                done, estimate = streamed.done, streamed.estimate
+                            else:
+                                yield streamed
+                    finally:
+                        await _aclose(turn)
 
                 if done is None:
                     raise ProviderError(
@@ -1649,6 +1868,7 @@ class Agent:
             )
             yield RunEnd(result=result)
         except _RunExpired:
+            drop_unvetted()
             answer_unanswered("Run deadline exceeded before this tool finished.")
             self._emit_runtime(
                 "run.timed_out",
@@ -1667,7 +1887,156 @@ class Agent:
             )
             raise
         finally:
+            drop_unvetted()
             answer_unanswered("Run ended before this tool finished.")
+
+    async def _run_guardrails(
+        self,
+        inp: GuardrailInput,
+        *,
+        context: RuntimeContext,
+        add_usage: Callable[[Usage], None],
+        tiers: Literal["all", "sync", "async"] = "all",
+    ) -> tuple[GuardrailResult | None, str]:
+        """Run the input guardrails in two tiers.
+
+        Synchronous guards run first, in list order; the first block returns at
+        once, before any asynchronous guard starts. Asynchronous guards then run
+        concurrently: the first block in completion order wins and the rest are
+        cancelled. Guards that finish in the same scheduling round are all
+        decided, and the first block among them in list order wins. A guard
+        that raises (or returns something other than a verdict) is a block with
+        category ``"error"``. Each decided guard publishes a content-free
+        ``guardrail.decided`` event.
+
+        Args:
+            inp: What the guards see.
+            context: Correlation context for the events.
+            add_usage: Receives each decided guard's reported usage as soon as
+                it is decided, so it counts even if the run then times out or
+                is cancelled. Usage of a guard cancelled before deciding is lost.
+            tiers: Which tiers to run: both (``"all"``), or only the
+                synchronous or asynchronous one (parallel mode runs the
+                synchronous tier before the first provider turn starts).
+
+        Returns:
+            ``(result, reply)``: the block's result and placeholder reply, or
+            ``(None, "")`` when every guard allowed.
+        """
+        sync_guards = [
+            g for g in self.input_guardrails if tiers != "async" and not _is_async_guard(g)
+        ]
+        async_guards = [g for g in self.input_guardrails if tiers != "sync" and _is_async_guard(g)]
+
+        def decide(
+            name: str, verdict: object, error: BaseException | None, began: float
+        ) -> tuple[GuardrailResult, str] | None:
+            if error is None and not isinstance(verdict, GuardrailVerdict):
+                error = TypeError(f"guard returned {type(verdict).__name__}")
+            if (
+                error is None
+                and isinstance(verdict, GuardrailVerdict)
+                and not isinstance(verdict.allowed, bool)
+            ):
+                # A truthy non-bool such as "false" must never allow.
+                error = TypeError("guard verdict's allowed is not a bool")
+            if error is not None:
+                verdict = GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(error).__name__}"
+                )
+            assert isinstance(verdict, GuardrailVerdict)
+            scores_json = ""
+            try:
+                scores_json = json.dumps(dict(verdict.scores), sort_keys=True)
+                if verdict.usage is not None:
+                    if not isinstance(verdict.usage, Usage):
+                        raise TypeError("guard usage is not a Usage")
+                    add_usage(verdict.usage)
+            except Exception as exc:  # noqa: BLE001 - a malformed verdict is a guard failure
+                error = exc
+                verdict = GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(exc).__name__}"
+                )
+                scores_json = "{}"
+            category = verdict.category if verdict.allowed else (verdict.category or "blocked")
+            self._emit_runtime(
+                "guardrail.decided",
+                context=context,
+                duration_seconds=monotonic() - began,
+                guard_name=name,
+                guard_allowed=verdict.allowed,
+                guard_category=category,
+                guard_scores=scores_json,
+                exception_type=type(error).__name__ if error is not None else None,
+            )
+            if verdict.allowed:
+                return None
+            assert category is not None
+            result = GuardrailResult(
+                guard=name, category=category, reason=verdict.reason, scores=dict(verdict.scores)
+            )
+            return result, verdict.reply or GUARDRAIL_ERROR_REPLY
+
+        if tiers != "async" and _has_unsupported_content(inp.message):
+            # Guards are text-only: content they cannot see is blocked before
+            # any guard runs, never sent unscreened. Decided (event) only when
+            # it blocks, so allowed runs report just the configured guards.
+            blocked = decide(
+                "content_check",
+                GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason="unsupported content"
+                ),
+                None,
+                monotonic(),
+            )
+            assert blocked is not None
+            return blocked
+
+        for guard in sync_guards:
+            began = monotonic()
+            verdict: object = None
+            error: BaseException | None = None
+            try:
+                verdict = guard(inp)
+                if inspect.isawaitable(verdict):
+                    verdict = await verdict
+            except Exception as exc:  # noqa: BLE001 - a raising guard is a block
+                error = exc
+            blocked = decide(_guard_name(guard), verdict, error, began)
+            if blocked is not None:
+                return blocked
+
+        if not async_guards:
+            return None, ""
+        began = monotonic()
+        tasks: dict[asyncio.Task[Any], InputGuardrail] = {
+            asyncio.ensure_future(_await_guard(guard, inp)): guard for guard in async_guards
+        }
+        pending = set(tasks)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                winner: tuple[GuardrailResult, str] | None = None
+                # Every finished guard is decided (event and usage) before a
+                # block returns; `tasks` keeps list order.
+                for task, guard in tasks.items():
+                    if task not in done:
+                        continue
+                    failure: BaseException | None = (
+                        asyncio.CancelledError() if task.cancelled() else task.exception()
+                    )
+                    value = None if failure is not None else task.result()
+                    outcome = decide(_guard_name(guard), value, failure, began)
+                    if winner is None:
+                        winner = outcome
+                if winner is not None:
+                    return winner
+            return None, ""
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _provider_turn(
         self,
@@ -2737,6 +3106,41 @@ def _is_context_length_error(error: ProviderError) -> bool:
 
 
 @dataclass
+class _TurnDone:
+    """End of one prepared provider turn: its completion (if any) and raw estimate."""
+
+    done: CompletionDone | None
+    estimate: int
+
+
+@dataclass(frozen=True)
+class _PumpFailed:
+    """An exception a buffered provider turn raised, handed to the consumer."""
+
+    error: BaseException
+
+
+async def _pump(events: AsyncIterator[object], buffer: asyncio.Queue[object]) -> None:
+    """Move every item of ``events`` into ``buffer``; a raised exception goes in last.
+
+    Parallel guardrail mode runs the first provider turn this way, in its own
+    task, so the agent can hold its output back until the guards decide.
+    """
+    try:
+        async for item in events:
+            buffer.put_nowait(item)
+    except Exception as exc:  # noqa: BLE001 - surfaced by the consumer once the guards allow
+        buffer.put_nowait(_PumpFailed(exc))
+    except BaseException as exc:
+        # Still terminal for the consumer (it would otherwise wait forever),
+        # and still this task's outcome.
+        buffer.put_nowait(_PumpFailed(exc))
+        raise
+    finally:
+        await _aclose(events)
+
+
+@dataclass
 class _RunCompaction:
     """Built-in context policy state that lasts for one run only."""
 
@@ -2762,6 +3166,8 @@ def _outcome(exc: BaseException | None) -> tuple[Outcome, str | None]:
         return "completed", None
     if isinstance(exc, MaxIterationsError):
         return "max_iterations", None
+    if isinstance(exc, GuardrailTripped):
+        return "blocked", None
     if isinstance(exc, RunTimeoutError):
         return "run_timeout", None
     if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
@@ -2967,6 +3373,43 @@ async def _finish_session(
             _RUNTIME_LOGGER.warning("session exit failed: %s", type(task.exception()).__name__)
         return
     task.result()
+
+
+def _is_async_guard(guard: object) -> bool:
+    """Whether ``guard`` is an ``async def`` function (or object with one as ``__call__``)."""
+    return inspect.iscoroutinefunction(guard) or inspect.iscoroutinefunction(
+        getattr(guard, "__call__", None)  # noqa: B004 - inspecting, not testing callability
+    )
+
+
+def _guard_name(guard: object) -> str:
+    """A guard's reported name: its ``name`` attribute, else ``__name__``, else its type."""
+    name = getattr(guard, "name", None) or getattr(guard, "__name__", None)
+    return name if isinstance(name, str) and name else type(guard).__name__
+
+
+async def _await_guard(guard: InputGuardrail, inp: GuardrailInput) -> object:
+    """Call an asynchronous guard and await its verdict."""
+    verdict = guard(inp)
+    if inspect.isawaitable(verdict):
+        return await verdict
+    return verdict  # pragma: no cover - only async guards are run as tasks
+
+
+def _recent_text(history: Sequence[Message]) -> tuple[Message, ...]:
+    """The last few user/assistant messages that carry text, reduced to their text."""
+    recent: list[Message] = []
+    for message in reversed(history):
+        if len(recent) == GUARDRAIL_RECENT_MESSAGES:
+            break
+        if message.role not in ("user", "assistant"):
+            continue
+        texts: list[ContentBlock] = [
+            block for block in message.content if isinstance(block, TextBlock)
+        ]
+        if texts:
+            recent.append(Message(role=message.role, content=texts))
+    return tuple(reversed(recent))
 
 
 def _error_results(calls: list[ToolUseBlock], text: str) -> Message:
