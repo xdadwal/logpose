@@ -266,8 +266,8 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
 Tool output is budgeted to about 2k tokens per call: shell, `read_file` pages,
-`list_dir`, grep, page fetches, and web search return about 8,000 characters. `read_file` has no line cap and
-`list_dir` no entry cap; both page by characters, each page about 8,000
+`list_dir`, grep, page fetches, and web search return about 8,000 characters.
+`read_file` has no line cap and `list_dir` no entry cap; both page by characters, each page about 8,000
 characters plus a continuation line the model can follow.
 
 ```python
