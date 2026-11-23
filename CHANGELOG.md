@@ -32,11 +32,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget (default 32,000 tokens) are summarized, and long earlier tool outputs
   are sent as pointers. Stored history is unchanged. What this changes for
   existing apps:
-  - logpose assumes a 128,000-token `context_window` unless you set it. Requests
-    estimated above `context_window - max_tokens` are refused before sending with
-    `ContextOverflowError`. Apps on larger-window models (for example OpenAI
-    `gpt-6-luna`, about 1.05M tokens) must set `context_window`, or large prompts
-    are refused; small local models should set it lower.
+  - logpose budgets for a 128,000-token window unless you set `context_window`,
+    but refuses nothing before sending unless you set it: with an explicit
+    `context_window`, requests estimated above `context_window - max_tokens`
+    raise `ContextOverflowError`. Small local models should set it, so logpose
+    compacts before the server rejects. On large-window models raise
+    `context_budget` too (the default 32,000 summarizes at about 27,000 tokens)
+    if you want long verbatim context.
+  - The system prompt is never compacted, but it counts toward the budget.
   - A `recall_tool_output` tool now appears in every request that has tools.
     Allow-list gates in `on_tool_call` must allow it, and tests asserting the
     exact tool specs sent will change.
@@ -57,11 +60,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reactive summary-and-retry on context-length rejections. New `Agent` options
   `context_window`, `context_budget`, `compaction_threshold`,
   `compaction_target` and `pointer_min_chars`; `ContextOverflowError`; the
-  `context.compacted` runtime event. Reactive retry recognizes OpenAI-style,
+  `context.compacted` and `context.summarizing` runtime events. Reactive retry recognizes OpenAI-style,
   vLLM, llama.cpp ("context size", `exceed_context_size_error`) and LM Studio
   ("context length") rejections. Token estimates count non-ASCII text by
-  character, and the summary call's output ceiling is at least the agent's
-  `max_tokens` so reasoning models are not starved.
+  character and leave out reasoning the provider does not re-send. The summary
+  call's output ceiling is the agent's `max_tokens` capped at 15% of the input
+  budget (never below 2,048); no summary is made when it cannot get the request
+  under the target (large pinned first turn, system prompt or tool schemas), and
+  the summarizer treats the transcript as data, not instructions. Optional
+  `SummaryStore` protocol for direct summary access (`SessionStore` does not
+  require it).
 - Sessions: `agent.run/stream(..., session_id=...)` and
   `async with agent.session(sid)` persist history and run records in SQLite
   (`LOGPOSE_DB_PATH`, default `logpose.db`) with a per-session lease. Adds

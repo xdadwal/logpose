@@ -626,12 +626,15 @@ Only the request that is sent is changed. The `Conversation`, the session store 
 **What the default changes for existing apps.** This is on unless you pass
 `context_policy=None`:
 
-- **logpose assumes a 128,000-token `context_window` unless you set it.** A request
+- **Set `context_window` to the model's window.** Unset, logpose budgets for
+  128,000 tokens but refuses nothing before sending; the provider decides, and a
+  context-length rejection triggers one summary and retry. Once set, a request
   estimated above `context_window - max_tokens` is refused before it is sent, with
-  `ContextOverflowError`. On a larger-window model (for example OpenAI's
-  `gpt-6-luna`, about 1.05M tokens) set `context_window`, or large prompts that the
-  model would accept are refused. On a small local model set it lower, so logpose
-  compacts before the server rejects the request.
+  `ContextOverflowError`. On a small local model set it, so logpose compacts before
+  the server rejects the request.
+- **`context_budget` (default 32,000) caps input per request**, whatever the
+  window: summaries start at about 27,000 estimated tokens even on a 1M-token
+  model. Raise it (or pass `None`) if you want long conversations sent verbatim.
 - **A `recall_tool_output` tool appears in every request that has tools.** Allow-list
   gates in `on_tool_call` must allow it, and tests that assert the exact tool specs
   sent to the provider will see it. `context_policy=None` removes it.
@@ -641,7 +644,8 @@ Only the request that is sent is changed. The `Conversation`, the session store 
 ```python
 agent = Agent(
     "openai-compat", model="gpt-6-luna", tools=[get_weather],
-    context_window=1_050_000,  # the model's window; the 128k default would refuse big prompts
+    context_window=1_050_000,  # the model's window
+    context_budget=200_000,  # keep more verbatim history than the 32k default
 )
 ```
 
@@ -668,11 +672,22 @@ characters / 4, multiplied by a calibration ratio learned from the usage the
 provider reports (smoothed, clamped to [0.5, 2.0]). When the estimate reaches 85%
 of the budget (`compaction_threshold`), older turns are summarized down to about
 60% (`compaction_target`): one extra model call (no tools, output ceiling the
-larger of 2,048 and the agent's `max_tokens` so reasoning models have room to think,
-counted in the run's usage) whose result is inserted as an assistant message after
-the first user turn, which stays pinned. Recent turns, and everything from the
-current run, are sent verbatim. The summary is cached and reused until the
-threshold is reached again.
+agent's `max_tokens` so reasoning models have room to think, capped at 15% of the
+input budget and never below 2,048, counted in the run's usage) whose result is
+inserted as an assistant message after the first user turn, which stays pinned.
+Recent turns, and everything from the current run, are sent verbatim. The summary
+is cached and reused until the threshold is reached again. Estimates leave out
+reasoning (thinking) blocks unless the provider re-sends them
+(`OpenAICompatProvider(preserve_reasoning=True)`).
+
+**The system prompt is never compacted.** It is sent unchanged on every request,
+but it and the tool schemas count toward the budget. When they, or a large first
+user turn (a pasted document), already fill the target on their own, no summary
+is made, since one could not help: the request is sent as is. The summary call does
+not use your system prompt: it sends its own instruction, which treats the
+transcript as data, does not carry forward instructions found in it (for example in
+fetched web pages), and reports such content as attributed facts. The summary is
+inserted after the `[Summary of earlier conversation]` prefix.
 
 The summary cache lives on the `Conversation` (and, with sessions, is persisted in
 the session store: schema v2, migrated automatically, reused across requests). An
@@ -683,11 +698,13 @@ between requests.
 Prompt-cache stability is per run. Pointers are decided at run boundaries: the
 previous run's long tool outputs are sent in full during that run and become
 pointers at the next run, so the provider's prompt cache misses from that point
-once per run (and again whenever a summary is made or extended).
+once per run (and again whenever a summary is made or extended). The system prompt
+and tool schemas never change, so the cached prefix up to the first changed message
+still hits.
 
 If the summary call fails or returns no text, the request is sent uncompacted when
-it fits the window (`context_window - max_tokens`); otherwise the run raises
-`ContextOverflowError`. A failed summary is not retried again within the same run.
+it fits the window (`context_window - max_tokens`) or when `context_window` is not
+set; otherwise the run raises `ContextOverflowError`. A failed summary is not retried again within the same run.
 If the provider rejects a request with an HTTP 400 that mentions the context length
 (`context_length`, `maximum context length`, `context window`, `context size`,
 `context length` or `exceed_context`, covering OpenAI-style servers, vLLM,
@@ -695,7 +712,7 @@ llama.cpp and LM Studio), logpose forces one summary and retries once.
 
 | Error | Raised when |
 | --- | --- |
-| `ContextOverflowError` | The request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). Raised before the request is sent; carries `estimated_tokens` and `input_budget`. |
+| `ContextOverflowError` | `context_window` was set and the request cannot fit `context_window - max_tokens` even after compaction (or after a failed summary call). Raised before the request is sent; carries `estimated_tokens` and `input_budget`. |
 
 ```python
 agent = Agent(
@@ -707,7 +724,9 @@ agent = Agent(
 
 **Observing it.** Each prepared request that applied pointers or attempted a
 summary publishes a metadata-only `context.compacted` runtime event (pointer count,
-whether a summary is in use, estimated tokens before and after, input budget).
+whether a summary is in use, estimated tokens before and after, input budget). A
+`context.summarizing` event (estimated tokens, input budget) fires just before a
+summary call, so a streaming UI can show why the reply is paused.
 `agent.last_context_diagnostics` holds the same numbers for the latest request.
 
 **Opting out.** `context_policy=None` disables all of this and sends full history.
@@ -847,7 +866,7 @@ All library-defined errors inherit from `LogposeError`.
 | `OutputValidationError` | Structured output did not validate after the retry budget (or was cut off by `max_tokens`). |
 | `OutputRefusalError` | The model refused a structured-output request. |
 | `StructuredOutputUnsupportedError` | The server rejected the strict `json_schema` request (a `ProviderError`). |
-| `ContextOverflowError` | The request cannot fit the context window even after compaction; see [Long conversations](#long-conversations). |
+| `ContextOverflowError` | The request cannot fit the explicitly set `context_window` even after compaction; see [Long conversations](#long-conversations). |
 
 Ordinary exceptions raised inside a tool are returned to the model as safe error
 results rather than raised from the run. Configure `tool_error_mode` or

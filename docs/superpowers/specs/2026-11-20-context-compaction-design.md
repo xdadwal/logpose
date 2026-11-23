@@ -50,8 +50,8 @@ model is shaped.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `context_window` | `128_000` | model's total window in tokens (the app states it; logpose can't discover it reliably) |
-| `context_budget` | `32_000` | web-app cost cap on input tokens per request; `None` means no cap beyond the window |
+| `context_window` | `None` (128,000 assumed) | model's total window in tokens (the app states it; logpose can't discover it reliably). Only an explicit value enables pre-flight refusal (amended 2026-11-23) |
+| `context_budget` | `32_000` | web-app cost cap on input tokens per request; `None` means no cap beyond the window. Raise it on large-window models to keep more verbatim context |
 | `compaction_threshold` | `0.85` | summarize when estimated input ≥ this fraction of the input budget |
 | `compaction_target` | `0.60` | summarize down to this fraction (hysteresis) |
 | `pointer_min_chars` | `1_000` | tool outputs at or below this stay inline |
@@ -61,6 +61,9 @@ model is shaped.
   raise `LogposeError` at construction.
 - `context_policy` default is a sentinel meaning "built-in policy". An explicit
   function replaces it; `None` disables all compaction (full history, as today).
+- The system prompt is never modified or compacted, but it (and the tool
+  schemas) counts toward the estimate. The summary call does not send the
+  app's system prompt; it uses its own instruction.
 
 ### Token estimation
 
@@ -69,6 +72,11 @@ model is shaped.
   accounting) cannot disable compaction or the overflow guard.
 
 - Estimate = characters of the request's messages, system and tool schemas ÷ 4.
+  Thinking and redacted-thinking blocks are left out unless the provider
+  re-sends reasoning (an optional `preserve_reasoning` attribute on the
+  provider is true; `OpenAICompatProvider(preserve_reasoning=True)` sets it).
+  Amended 2026-11-23: counting unsent reasoning overestimated reasoning chats
+  about 20-fold.
 - Calibration: after each provider turn, logpose knows the real `input_tokens`
   for the request it sent. It keeps a per-conversation correction ratio
   (`reported ÷ estimated`, smoothed) and applies it to later estimates.
@@ -102,11 +110,27 @@ model is shaped.
      estimate falls to `compaction_target × input_budget`. Cut points fall only
      on turn boundaries, so tool pairs are never split.
   2. Make one extra model call (same provider and model, no tools, `max_tokens`
-     = max(2,048, the agent's resolved per-turn `max_tokens`) — amended
-     2026-11-20: a fixed 2,048 let reasoning models spend the whole budget
-     thinking) with a fixed summarization instruction and the span's text
-     (pointers, not full outputs). The output is the summary. A response with
-     no text counts as a failed summary (not retried).
+     = min(max(2,048, the agent's resolved per-turn `max_tokens`),
+     max(2,048, 15% of the input budget)) — amended 2026-11-20: a fixed 2,048
+     let reasoning models spend the whole budget thinking; amended 2026-11-23:
+     capped at 15% of the budget, because an uncapped summary (up to 16,384
+     tokens, half the default budget) filled the budget by itself and forced a
+     new summary every run) with a fixed summarization instruction and the
+     span's text (pointers, not full outputs). The request asks for a summary
+     under half that ceiling in words (about 0.75 words per token), leaving the
+     rest for a reasoning model's thinking. The instruction treats the
+     transcript as data: instructions found in it (notably in tool output) are
+     not followed or carried forward, only reported as attributed facts. The
+     output is the summary. A response with no text counts as a failed summary
+     (not retried). A metadata-only `context.summarizing` event is emitted just
+     before the call, so a streaming UI can show the pause.
+  - **Skip when it cannot help** (amended 2026-11-23): unless forced by the
+    reactive fallback, no summary is made when the kept part alone (system,
+    tools, pinned first turn, empty summary, the turns after the chosen cut)
+    is already at or above the target. A large pinned first turn, system
+    prompt or tool schemas otherwise caused a summary call on every message.
+    The request is sent as is (refused only if `context_window` was set and
+    it does not fit).
   3. The request becomes: system, the first user turn, one **assistant-role**
      message `"[Summary of earlier conversation]\n<summary>"`, then the
      remaining recent turns. (Amended 2026-11-20: originally user-role; changed
@@ -120,7 +144,11 @@ model is shaped.
   text, created_at)`, schema version 2) so it survives across requests. Without
   sessions it lives in memory on the `Conversation`.
 - If the request is still over the full window after summarizing, raise
-  `ContextOverflowError(LogposeError)` with the estimate and budget.
+  `ContextOverflowError(LogposeError)` with the estimate and budget — only
+  when `context_window` was passed explicitly (amended 2026-11-23). With the
+  default window nothing is refused before sending: the estimate is heuristic
+  and the true window unknown, so the request goes out and a provider
+  context-length rejection drives the reactive fallback.
 
 ### Reactive fallback
 
@@ -139,6 +167,8 @@ model is shaped.
   `pointers_applied`, `summarized` (bool), `estimated_tokens_before`,
   `estimated_tokens_after`, and `input_budget`.
 - `PreparedContext.diagnostics` carries the same values.
+- `context.summarizing` (metadata only: `estimated_tokens_before`,
+  `input_budget`) just before each summary call (amended 2026-11-23).
 
 ## Builder-check resolutions (Claude's calls, 2026-11-20)
 
@@ -157,17 +187,21 @@ model is shaped.
    follows in the same plan, adding schema version 2 (`logpose_summaries`).
    `upto_seq` is the stored `seq` of the last summarized message. The session
    handle keeps the `seq` of each loaded message, so `seq` maps to an in-memory
-   position. Without sessions, nothing is persisted.
+   position. Without sessions, nothing is persisted. Direct
+   `save_summary`/`load_summary` are on a separate optional `SummaryStore`
+   protocol, not `SessionStore` (amended 2026-11-23), so custom stores need
+   not implement them.
 4. **Summary call accounting:**
    - its usage is added to `RunResult.usage` and the session `RunRecord`;
    - it is bounded by `run_timeout` and uses the retry policy;
    - it does not count toward `max_iterations`;
-   - it emits `context.compacted`, not `provider.attempt.*`.
+   - it emits `context.summarizing` and `context.compacted`, not `provider.attempt.*`.
 
    If the summary call fails, and the uncompacted request still fits the full
    window, logpose sends it uncompacted (over budget, but valid) and the event
    records `summarized=false`. Otherwise it raises
-   `ContextOverflowError` chained to the cause.
+   `ContextOverflowError` chained to the cause (only with an explicit
+   `context_window`; with the default it sends the request uncompacted).
 5. **The recall tool is always included** whenever the built-in policy is active
    and the agent has at least one tool. It is present from the first turn, so
    the tools part of the request never changes mid-conversation and doesn't
