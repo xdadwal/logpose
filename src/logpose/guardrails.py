@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -233,9 +234,11 @@ def openai_decision_guard(
     blocks as unsafe; any other failure applies ``on_error``. The guard's
     Verdicts carry the call's usage in ``usage``.
 
-    ``api_key`` is required and is never read from the environment: the
-    ``LOGPOSE_API_KEY`` setting may belong to another server, and sending it to
-    ``base_url`` would leak it. ``name`` is the guard's name in results, events
+    The key is ``api_key`` if non-blank, else the ``LOGPOSE_GUARD_API_KEY``
+    environment variable if non-blank (both stripped), resolved at construction.
+    ``LOGPOSE_API_KEY`` and ``OPENAI_API_KEY`` are never read: the former may
+    belong to another server, and sending it to ``base_url`` would leak it.
+    ``name`` is the guard's name in results, events
     and spans (set it to tell two decision guards apart). ``timeout`` bounds the
     whole call, not just each HTTP phase.
 
@@ -245,15 +248,16 @@ def openai_decision_guard(
     ``reason``, and the ``guardrail.decided`` event reports that category.
 
     Raises:
-        LogposeError: At construction, if ``api_key`` is missing or blank,
-            ``replies`` lacks a key, a threshold is outside [0, 1], or
-            ``history`` is outside [0, 4].
+        LogposeError: At construction, if neither ``api_key`` nor
+            ``LOGPOSE_GUARD_API_KEY`` is set (non-blank), ``replies`` lacks a
+            key, a threshold is outside [0, 1], or ``history`` is outside
+            [0, 4].
     """
-    key = (api_key or "").strip()
+    key = (api_key or "").strip() or os.environ.get("LOGPOSE_GUARD_API_KEY", "").strip()
     if not key:
         raise LogposeError(
-            "openai_decision_guard needs api_key= (an OpenAI key); it does not read "
-            "LOGPOSE_API_KEY or any other environment variable"
+            "openai_decision_guard needs an OpenAI key: pass api_key= or set "
+            "LOGPOSE_GUARD_API_KEY (LOGPOSE_API_KEY and OPENAI_API_KEY are not read)"
         )
     missing = {"off_topic", "unsafe"} - set(replies)
     if missing:

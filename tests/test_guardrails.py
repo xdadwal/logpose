@@ -237,19 +237,38 @@ def test_threshold_range_validated(kw: dict[str, float]) -> None:
         openai_decision_guard("d", replies=REPLIES, api_key="k", **kw)
 
 
+_GUARD_ENV = "LOGPOSE_GUARD_API_KEY"
+
+
 @pytest.mark.parametrize("key", [None, "", "   "])
-def test_api_key_is_required(monkeypatch: pytest.MonkeyPatch, key: str | None) -> None:
-    # No environment fallback: LOGPOSE_API_KEY may belong to another server,
-    # and OPENAI_API_KEY is never read either.
-    monkeypatch.setenv("LOGPOSE_API_KEY", "main-provider-key")
-    monkeypatch.setenv("OPENAI_API_KEY", "openai-env-key")
-    with pytest.raises(LogposeError, match="api_key"):
+@pytest.mark.parametrize("env", [None, "", "  \t "])
+def test_missing_or_blank_key_raises(
+    monkeypatch: pytest.MonkeyPatch, key: str | None, env: str | None
+) -> None:
+    monkeypatch.delenv(_GUARD_ENV, raising=False)
+    if env is not None:
+        monkeypatch.setenv(_GUARD_ENV, env)
+    with pytest.raises(LogposeError, match=r"api_key.*LOGPOSE_GUARD_API_KEY"):
         openai_decision_guard("d", replies=REPLIES, api_key=key)
 
 
-async def test_explicit_api_key_is_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_other_provider_keys_are_never_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_GUARD_ENV, raising=False)
     monkeypatch.setenv("LOGPOSE_API_KEY", "main-provider-key")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-env-key")
+    calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json=_answers(0.9, 0.1))
+
+    with pytest.raises(LogposeError):
+        _guard(handler, api_key=None)
+    assert calls == []
+
+
+async def test_arg_wins_over_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_GUARD_ENV, "sk-env")
     seen: dict[str, str] = {}
 
     def handler(req: httpx.Request) -> httpx.Response:
@@ -258,6 +277,21 @@ async def test_explicit_api_key_is_sent(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert (await _guard(handler, api_key=" sk-explicit ")(_inp())).allowed
     assert seen["auth"] == "Bearer sk-explicit"
+
+
+@pytest.mark.parametrize("key", [None, "", "  "])
+async def test_env_used_when_arg_unset_or_blank(
+    monkeypatch: pytest.MonkeyPatch, key: str | None
+) -> None:
+    monkeypatch.setenv(_GUARD_ENV, " sk-env ")
+    seen: dict[str, str] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["auth"] = req.headers["authorization"]
+        return httpx.Response(200, json=_answers(0.9, 0.1))
+
+    assert (await _guard(handler, api_key=key)(_inp())).allowed
+    assert seen["auth"] == "Bearer sk-env"
 
 
 async def test_concurrent_calls_keep_their_own_usage() -> None:
