@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-run `extra=` on `run`, `stream`, `run_sync`, `stream_sync` and
+  `SyncAgent.run`/`stream`, merged over `Agent(extra=...)` for every model call
+  of that run (for example a per-visitor `safety_identifier` on a shared agent).
+  Reserved request fields raise `LogposeError`. The `invoke_agent` span records
+  the key names (never values) as `logpose.request.extra_keys`.
+
 ### Changed (defaults)
 
 - **Breaking:** the output ceiling is now sent as `max_completion_tokens`
