@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import enum
 import inspect
@@ -85,6 +86,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Coroutine,
     Iterable,
     Iterator,
@@ -224,6 +226,16 @@ _STREAM_CLOSE_MARGIN = 2.0
 """Seconds past :data:`SESSION_EXIT_TIMEOUT` that closing a block's open streams
 may take before it is abandoned (a stream's run record already has its own
 bound; this backstops closing the loop itself)."""
+
+_LEFTOVER_WAIT = 6.0
+"""Seconds (the store's 5-second ``busy_timeout`` plus a margin) a block waits,
+before its save's budget starts, for exit work it abandoned while closing
+streams, so a run record still holding the store does not eat into the save."""
+
+_EXIT_LEFTOVERS: contextvars.ContextVar[list[asyncio.Future[Any]] | None] = contextvars.ContextVar(
+    "_EXIT_LEFTOVERS", default=None
+)
+"""Where exit work abandoned while a block closes a stream is collected."""
 
 _ABANDONED: set[asyncio.Future[Any]] = set()
 """Exit tasks given up on, kept referenced until they finish so none is
@@ -2209,38 +2221,80 @@ async def _exit_session(
         await cm.__aexit__(type(exc), exc, exc.__traceback__)
 
 
-async def _close_streams(handle: SessionHandle) -> None:
-    """Close the streams still open on a session block's handle.
+async def _close_stream(stream: AsyncIterator[Any], leftovers: list[asyncio.Future[Any]]) -> None:
+    """Close one stream left open on a session block's handle.
 
     A run suspended after a ``ToolCall`` answers its calls and writes its run
     record (inside its own bounded exit) before the block saves. A stream
-    running in another task cannot be closed and is skipped.
+    running in another task cannot be closed and is skipped. Exit work the
+    stream abandons is collected in ``leftovers``.
+    """
+    _EXIT_LEFTOVERS.set(leftovers)
+    try:
+        await _aclose(stream)
+    except Exception as error:  # noqa: BLE001 - the save must still happen
+        _RUNTIME_LOGGER.warning("closing a session stream failed: %s", type(error).__name__)
+
+
+async def _close_streams(handle: SessionHandle) -> bool:
+    """Close every stream still open on ``handle``; return whether the caller was cancelled.
+
+    Each stream closes in its own task, concurrently, so a stuck one cannot
+    keep the others open; a close still running after :data:`SESSION_EXIT_TIMEOUT`
+    plus a margin is abandoned. Before returning, waits up to
+    :data:`_LEFTOVER_WAIT` for abandoned work (a run record still holding the
+    store) to end, so the save's budget starts with the store free.
     """
     from logpose.store import manager
 
     # No new run may start on the handle once its streams are being closed.
     manager._ACTIVE_HANDLES.pop(handle, None)
-    for stream in list(manager._STREAMS.pop(handle, ())):
-        try:
-            await _aclose(stream)
-        except Exception as error:  # noqa: BLE001 - the save must still happen
-            _RUNTIME_LOGGER.warning("closing a session stream failed: %s", type(error).__name__)
+    streams = list(manager._STREAMS.pop(handle, ()))
+    if not streams:
+        return False
+    leftovers: list[asyncio.Future[Any]] = []
+    tasks = [asyncio.ensure_future(_close_stream(stream, leftovers)) for stream in streams]
+    bound = SESSION_EXIT_TIMEOUT + _STREAM_CLOSE_MARGIN
+    cancelled = await _wait_shielded(tasks, bound)
+    for task in tasks:
+        if not task.done():
+            _abandon(task)
+            leftovers.append(task)
+            _RUNTIME_LOGGER.warning(
+                "closing a session stream did not finish within %ss; saving without its run record",
+                bound,
+            )
+        elif task.cancelled():
+            _RUNTIME_LOGGER.warning("closing a session stream was cancelled")
+        elif task.exception() is not None:
+            _RUNTIME_LOGGER.warning(
+                "closing a session stream failed: %s", type(task.exception()).__name__
+            )
+    pending = [task for task in leftovers if not task.done()]
+    if pending:
+        cancelled = await _wait_shielded(pending, _LEFTOVER_WAIT) or cancelled
+        if not all(task.done() for task in pending):
+            _RUNTIME_LOGGER.warning(
+                "abandoned session stream work still running after %ss; saving anyway",
+                _LEFTOVER_WAIT,
+            )
+    return cancelled
 
 
-async def _wait_shielded(task: asyncio.Future[Any], timeout: float) -> bool:
-    """Wait up to ``timeout`` seconds for ``task``; return whether the caller was cancelled.
+async def _wait_shielded(tasks: Collection[asyncio.Future[Any]], timeout: float) -> bool:
+    """Wait up to ``timeout`` seconds for all ``tasks``; return whether the caller was cancelled.
 
     A cancellation of the caller does not stop the wait; it is reported instead.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     cancelled = False
-    while not task.done():
+    while not all(task.done() for task in tasks):
         remaining = deadline - loop.time()
         if remaining <= 0:
             break
         try:
-            await asyncio.wait({task}, timeout=remaining)
+            await asyncio.wait(tasks, timeout=remaining)
         except asyncio.CancelledError:
             cancelled = True
     return cancelled
@@ -2250,6 +2304,9 @@ def _abandon(task: asyncio.Future[Any]) -> None:
     """Cancel an exit task that overran, keeping it referenced until it ends."""
     task.cancel()
     _ABANDONED.add(task)
+    leftovers = _EXIT_LEFTOVERS.get()
+    if leftovers is not None:
+        leftovers.append(task)
 
     def done(t: asyncio.Future[Any]) -> None:
         _ABANDONED.discard(t)
@@ -2279,27 +2336,12 @@ async def _finish_session(
     a lost lease).
 
     With ``close``, the streams still open on that handle are closed first, in
-    a shielded phase of their own (each stream's exit is already bounded; the
-    phase is abandoned after :data:`SESSION_EXIT_TIMEOUT` plus a margin), so
-    the save's budget starts only once closing is over.
+    a shielded phase of their own (:func:`_close_streams`), so the save's
+    budget starts only once closing is over.
     """
-    cancelled = False
-    if close is not None:
-        closing = asyncio.ensure_future(_close_streams(close))
-        cancelled = await _wait_shielded(closing, SESSION_EXIT_TIMEOUT + _STREAM_CLOSE_MARGIN)
-        if not closing.done():
-            _abandon(closing)
-            _RUNTIME_LOGGER.warning(
-                "closing session streams did not finish within %ss; saving without "
-                "their run records",
-                SESSION_EXIT_TIMEOUT + _STREAM_CLOSE_MARGIN,
-            )
-        elif not closing.cancelled() and closing.exception() is not None:
-            _RUNTIME_LOGGER.warning(
-                "closing session streams failed: %s", type(closing.exception()).__name__
-            )
+    cancelled = await _close_streams(close) if close is not None else False
     task = asyncio.ensure_future(work)
-    cancelled = await _wait_shielded(task, SESSION_EXIT_TIMEOUT) or cancelled
+    cancelled = await _wait_shielded({task}, SESSION_EXIT_TIMEOUT) or cancelled
     quiet = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
     if not task.done():
         _abandon(task)

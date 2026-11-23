@@ -235,11 +235,13 @@ cycle, frees its lease when it expires.
   held until it expires.
 - **Exit budgets (Claude's call).** Each exit runs within
   `SESSION_EXIT_TIMEOUT` (8 s, above the 5 s `busy_timeout`). A session block
-  first closes the streams still open on its handle; each stream's exit (its run
-  record) is bounded on its own, and the phase is abandoned after the timeout
-  plus a 2 s margin. The block's save and release then get a fresh 8 s, so two
-  busy waits in a row cannot cancel the save. Under extreme contention the
-  stream's run record may be lost (logged); the messages are not.
+  first closes the streams still open on its handle, concurrently; each stream's
+  exit (its run record) is bounded on its own, and a close is abandoned after
+  the timeout plus a 2 s margin. The block then waits up to 6 s (`busy_timeout`
+  plus a margin) for abandoned exit work, which may still hold the store lock,
+  to finish. The save and release then get a fresh 8 s, so busy waits in a row
+  cannot cancel the save. Under extreme contention the stream's run record may
+  be lost (logged); the messages are not.
 - **Usage on every outcome (Claude's call).** The loop keeps a run-scoped
   accumulator of usage and iterations that the session wrapper reads, so
   `RunRecord` carries real token counts for `completed`, `error`,
