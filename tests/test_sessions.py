@@ -1086,3 +1086,241 @@ def test_session_exit_timeout_exceeds_busy_timeout() -> None:
     from logpose.store.sqlite import SQLiteStore
 
     assert SESSION_EXIT_TIMEOUT > SQLiteStore(":memory:")._busy_timeout_ms / 1000
+
+
+async def _suspended_stream_block(agent: Agent) -> None:
+    """Open a block, leave a stream suspended after its first event, exit the block."""
+    async with agent.session("s1") as handle:
+        events = agent.stream("go", session=handle)
+        await events.__anext__()
+        # No aclose: the block's exit must close it before saving.
+
+
+async def test_block_exit_save_gets_its_own_budget_after_closing_streams(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing the open stream (its run record waits on a busy database) and
+    the save (release waits too) together exceed one exit budget: the save
+    must still get the whole budget for itself."""
+    import logpose.agent as agent_mod
+    from logpose.store.sqlite import SQLiteStore
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.3)
+    real_record, real_release = SQLiteStore.record_run, SQLiteStore._release
+
+    async def busy_record(self: SQLiteStore, record: Any) -> None:
+        await asyncio.sleep(0.2)
+        await real_record(self, record)
+
+    async def busy_release(self: SQLiteStore, *args: Any) -> None:
+        await asyncio.sleep(0.2)
+        await real_release(self, *args)
+
+    monkeypatch.setattr(SQLiteStore, "record_run", busy_record)
+    monkeypatch.setattr(SQLiteStore, "_release", busy_release)
+    agent = Agent(FakeProvider(ScriptedTurn.text("hello")), model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await agent.aclose()
+
+
+async def test_block_exit_abandons_a_stuck_stream_close_and_still_saves(
+    db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stream whose close outlasts its bound is left to finish in the
+    background; the block saves and releases on time, and no task leaks."""
+    import gc
+
+    import logpose.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.3)
+    monkeypatch.setattr(agent_mod, "_STREAM_CLOSE_MARGIN", 0.05)
+    monkeypatch.setattr(agent_mod, "_LEFTOVER_WAIT", 0.05)
+
+    class StuckClose(FakeProvider):
+        async def stream(self, req: Any) -> Any:  # type: ignore[override]
+            try:
+                async for event in super().stream(req):
+                    yield event
+            finally:
+                loop = asyncio.get_running_loop()
+                end = loop.time() + 0.8
+                while (left := end - loop.time()) > 0:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.sleep(left)
+
+    agent = Agent(StuckClose(ScriptedTurn.text("hello")), model="m")
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        await _suspended_stream_block(agent)
+    assert time.monotonic() - started < 0.75
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert "closing a session stream did not finish" in caplog.text
+    assert agent_mod._ABANDONED
+    await asyncio.wait(set(agent_mod._ABANDONED), timeout=2)
+    assert not agent_mod._ABANDONED
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="asyncio"):
+        gc.collect()
+        await asyncio.sleep(0)
+    assert "pending" not in caplog.text
+    assert "never retrieved" not in caplog.text
+    await agent.aclose()
+
+
+async def test_block_exit_with_suspended_stream_normal_path(db: Path) -> None:
+    provider = FakeProvider([ScriptedTurn.text("hello"), ScriptedTurn.text("again")])
+    agent = Agent(provider, model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    result = await agent.run("again", session_id="s1")
+    assert result.text == "again"
+    await agent.aclose()
+
+
+class _StuckFirstClose(FakeProvider):
+    """The first stream closed hangs in cleanup (ignoring cancellation) for ``hang`` s."""
+
+    def __init__(self, *args: Any, hang: float, **kw: Any) -> None:
+        super().__init__(*args, **kw)
+        self.hang = hang
+        self.closes = 0
+
+    async def stream(self, req: Any) -> Any:  # type: ignore[override]
+        try:
+            async for event in super().stream(req):
+                yield event
+        finally:
+            self.closes += 1
+            if self.closes == 1:
+                loop = asyncio.get_running_loop()
+                end = loop.time() + self.hang
+                while (left := end - loop.time()) > 0:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.sleep(left)
+
+
+async def test_block_save_waits_for_abandoned_close_to_free_the_store(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An abandoned close later writes its run record holding the store lock for
+    a busy wait; the save's budget must start only once the store is free."""
+    import logpose.agent as agent_mod
+    from logpose.store.sqlite import SQLiteStore
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.4)
+    monkeypatch.setattr(agent_mod, "_STREAM_CLOSE_MARGIN", 0.05)
+    monkeypatch.setattr(agent_mod, "_LEFTOVER_WAIT", 2.0)
+    real_record, real_release = SQLiteStore.record_run, SQLiteStore._release
+
+    async def locked_record(self: SQLiteStore, record: Any) -> None:
+        async with self._lock:
+            await asyncio.sleep(0.3)  # a busy wait holding the store lock
+        await real_record(self, record)
+
+    async def busy_release(self: SQLiteStore, *args: Any) -> None:
+        await asyncio.sleep(0.3)
+        await real_release(self, *args)
+
+    monkeypatch.setattr(SQLiteStore, "record_run", locked_record)
+    monkeypatch.setattr(SQLiteStore, "_release", busy_release)
+    agent = Agent(_StuckFirstClose(ScriptedTurn.text("hello"), hang=0.7), model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    # The block waited for the abandoned close to finish writing its run record.
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert not agent_mod._ABANDONED
+    await agent.aclose()
+
+
+async def test_one_stuck_stream_does_not_keep_the_block_from_closing_others(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logpose.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.3)
+    monkeypatch.setattr(agent_mod, "_STREAM_CLOSE_MARGIN", 0.05)
+    monkeypatch.setattr(agent_mod, "_LEFTOVER_WAIT", 0.05)
+    agent = Agent(_StuckFirstClose(ScriptedTurn.text("a"), hang=0.8), model="m")
+    async with agent.session("s1") as handle:
+        # Only one run may be active on a handle, so the other stream open at
+        # block exit is one created but never started. Close the stuck one first.
+        stuck = agent.stream("one", session=handle)
+        unstarted = agent.stream("two", session=handle)
+        await stuck.__anext__()
+        manager._STREAMS[handle] = [stuck, unstarted]  # type: ignore[assignment]
+    # The unstarted stream was closed by the block although the first is stuck:
+    # it now ends at once instead of starting a run on a finished block.
+    with pytest.raises(StopAsyncIteration):
+        await unstarted.__anext__()
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await asyncio.wait(set(agent_mod._ABANDONED), timeout=2)
+    assert not agent_mod._ABANDONED
+    await agent.aclose()
+
+
+def _lock_holding_record(monkeypatch: pytest.MonkeyPatch, hold: float, release_wait: float) -> None:
+    """record_run holds the store lock ``hold`` s, ignoring cancellation (as a
+    rollback queued behind a busy BEGIN does); the save's release busy-waits."""
+    from logpose.store.sqlite import SQLiteStore
+
+    real_record, real_release = SQLiteStore.record_run, SQLiteStore._release
+
+    async def locked_record(self: SQLiteStore, record: Any) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            end = loop.time() + hold
+            while (left := end - loop.time()) > 0:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(left)
+        await real_record(self, record)
+
+    async def busy_release(self: SQLiteStore, *args: Any) -> None:
+        await asyncio.sleep(release_wait)
+        await real_release(self, *args)
+
+    monkeypatch.setattr(SQLiteStore, "record_run", locked_record)
+    monkeypatch.setattr(SQLiteStore, "_release", busy_release)
+
+
+async def test_block_save_waits_for_run_record_abandoned_by_the_stream_exit(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close itself finishes in time, but the stream's own exit abandons a
+    run record that keeps holding the store lock: the block waits for it."""
+    import logpose.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.4)
+    monkeypatch.setattr(agent_mod, "_LEFTOVER_WAIT", 2.0)
+    _lock_holding_record(monkeypatch, hold=1.0, release_wait=0.3)
+    agent = Agent(FakeProvider(ScriptedTurn.text("hello")), model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert not agent_mod._ABANDONED
+    await agent.aclose()
+
+
+async def test_block_save_waits_for_run_record_abandoned_after_its_close_was(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close is abandoned first; later the stream's exit abandons its run
+    record, which still holds the store lock: the block waits for that too."""
+    import logpose.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.4)
+    monkeypatch.setattr(agent_mod, "_STREAM_CLOSE_MARGIN", 0.05)
+    monkeypatch.setattr(agent_mod, "_LEFTOVER_WAIT", 2.0)
+    _lock_holding_record(monkeypatch, hold=1.5, release_wait=0.3)
+    agent = Agent(_StuckFirstClose(ScriptedTurn.text("hello"), hang=0.6), model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert not agent_mod._ABANDONED
+    await agent.aclose()
