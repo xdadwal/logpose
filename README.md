@@ -1197,7 +1197,9 @@ async def answer(visitor_id: str, question: str):
   field, as it does in `Agent(extra=...)`. Compaction budgets and the chat span's
   `gen_ai.request.max_tokens` still use the agent's `max_tokens`.
 - The compaction summary call gets the merged `extra` without `response_format`,
-  `tool_choice` and `parallel_tool_calls`.
+  `tool_choice` and `parallel_tool_calls`. A ceiling field in `extra` therefore
+  also caps the summary; set a small ceiling with `Agent(max_tokens=...)` instead
+  if long chats are compacted.
 - Input guardrails never receive it. It is not saved in sessions: pass it on each
   run.
 
