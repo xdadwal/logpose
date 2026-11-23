@@ -676,22 +676,6 @@ async def test_summary_failure_sends_uncompacted_when_it_fits() -> None:
 
 
 @pytest.mark.parametrize(
-    ("max_tokens", "expected"), [(None, 16_384), (20_000, 20_000), (1_000, 2_048)]
-)
-async def test_summary_call_gets_at_least_the_turn_output_ceiling(
-    max_tokens: int | None, expected: int
-) -> None:
-    # Reasoning models spend output tokens thinking; a fixed small ceiling can
-    # leave no room for the summary text itself.
-    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
-    agent = Agent(provider, model="test-model", context_budget=2_000, max_tokens=max_tokens)
-    await agent.run("latest", conversation=Conversation(chat_history(10)))
-    assert is_summary_call(provider.requests[0])
-    assert provider.requests[0].max_tokens == expected
-    assert provider.requests[0].max_tokens >= agent._max_tokens()
-
-
-@pytest.mark.parametrize(
     "turn",
     [
         ScriptedTurn.text("", thinking="thinking " * 500, stop_reason="max_tokens"),
@@ -1339,3 +1323,233 @@ async def test_reactive_retry_once_per_turn_not_per_run() -> None:
     assert "S1" in all_text(provider.requests[4].messages)
     assert [m.text for m in summary_messages(provider.requests[5])] == [SUMMARY_PREFIX + "S2"]
     assert_request_valid(provider.requests[5])
+
+
+# -- Review fixes: repeated summaries, reasoning estimates, default window ------
+
+
+def answers(count: int) -> list[ScriptedTurn]:
+    return [ScriptedTurn.text(f"answer {i}") for i in range(count)]
+
+
+async def test_large_pinned_first_turn_does_not_summarize_every_run() -> None:
+    # The pinned first turn alone is over the threshold: no summary can get the
+    # request under it, so summarizing on every later run only burns calls.
+    provider = FakeProvider(answers(12))
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    conv = Conversation()
+    await agent.run("DOC " + "d" * 7_200, conversation=conv)
+    for i in range(5):
+        await agent.run(f"follow up {i}", conversation=conv)
+    assert sum(is_summary_call(r) for r in provider.requests) <= 1
+    assert provider.call_count <= 7
+
+
+async def test_large_system_prompt_does_not_summarize_every_run() -> None:
+    # Compaction never changes the system prompt, but it counts toward the
+    # budget: a fixed part near the threshold must not cause a summary per run.
+    system = "RULES " + "r" * 6_000
+    provider = FakeProvider(answers(14))
+    agent = Agent(provider, model="test-model", system=system, context_budget=2_000)
+    conv = Conversation()
+    await agent.run("hello " + "h" * 200, conversation=conv)
+    for i in range(6):
+        await agent.run(f"follow up {i} " + "f" * 200, conversation=conv)
+    assert sum(is_summary_call(r) for r in provider.requests) <= 1
+    for request in provider.requests:
+        if not is_summary_call(request):
+            assert request.system == system
+
+
+async def test_large_tool_schemas_do_not_summarize_every_run() -> None:
+    @tool(description="Look things up. " + "z" * 6_000)
+    def lookup(q: str) -> str:
+        """Look things up."""
+        return q
+
+    provider = FakeProvider(answers(14))
+    agent = Agent(provider, model="test-model", tools=[lookup], context_budget=2_000)
+    conv = Conversation()
+    await agent.run("hello " + "h" * 200, conversation=conv)
+    for i in range(6):
+        await agent.run(f"follow up {i} " + "f" * 200, conversation=conv)
+    assert sum(is_summary_call(r) for r in provider.requests) <= 1
+
+
+async def test_summaries_still_made_when_they_can_help() -> None:
+    # A modest system prompt leaves room: older turns are still summarized.
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model", system="s" * 1_000, context_budget=2_000)
+    await agent.run("latest", conversation=Conversation(chat_history(10)))
+    assert is_summary_call(provider.requests[0])
+    assert summary_messages(provider.requests[1])
+
+
+@pytest.mark.parametrize(
+    ("budget", "max_tokens", "expected"),
+    [
+        (32_000, None, 4_800),  # 15% of the default budget, below max_tokens
+        (200_000, None, 16_384),  # never above the agent's max_tokens
+        (200_000, 20_000, 20_000),
+        (2_000, None, 2_048),  # never below SUMMARY_MAX_TOKENS
+        (2_000, 1_000, 2_048),
+    ],
+)
+async def test_summary_output_ceiling_scales_with_budget(
+    budget: int, max_tokens: int | None, expected: int
+) -> None:
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(
+        provider,
+        model="test-model",
+        context_window=400_000,
+        context_budget=budget,
+        max_tokens=max_tokens,
+    )
+    history = chat_history(10, chars=budget * 4 // 20)
+    await agent.run("latest", conversation=Conversation(history))
+    assert is_summary_call(provider.requests[0])
+    # Reasoning models spend output tokens thinking: with room in the budget
+    # the ceiling is the agent's own max_tokens, never a small fixed number.
+    assert provider.requests[0].max_tokens == expected
+
+
+async def test_summary_request_states_a_length_limit() -> None:
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    await agent.run("latest", conversation=Conversation(chat_history(10)))
+    call = provider.requests[0]
+    assert is_summary_call(call)
+    assert "words" in call.messages[0].text.split("Transcript to summarize:")[0]
+
+
+def test_summary_instruction_treats_transcript_as_data() -> None:
+    from logpose.compaction import SUMMARY_INSTRUCTION
+
+    text = SUMMARY_INSTRUCTION.lower()
+    assert "data" in text
+    assert "instruction" in text and "tool output" in text
+
+
+def reasoning_history(turns: int, thinking_chars: int = 2_000) -> list[Message]:
+    from logpose.messages import ThinkingBlock
+
+    history: list[Message] = []
+    for i in range(turns):
+        history.append(Message(role="user", content=[TextBlock(text=f"<q{i}> question")]))
+        history.append(
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(thinking="t" * thinking_chars, signature="sig"),
+                    TextBlock(text=f"<a{i}> answer"),
+                ],
+            )
+        )
+    return history
+
+
+def test_estimate_excludes_reasoning_unless_resent() -> None:
+    from logpose.compaction import message_chars
+    from logpose.messages import RedactedThinkingBlock, ThinkingBlock
+
+    plain = Message(role="assistant", content=[TextBlock(text="answer")])
+    thoughtful = Message(
+        role="assistant",
+        content=[
+            ThinkingBlock(thinking="t" * 4_000, signature="sig"),
+            RedactedThinkingBlock(data="r" * 4_000),
+            TextBlock(text="answer"),
+        ],
+    )
+    assert estimate_tokens([thoughtful], None, []) < estimate_tokens([plain], None, []) + 20
+    assert estimate_tokens([thoughtful], None, [], reasoning=True) > 2_000
+    assert message_chars(thoughtful) < message_chars(plain) + 80
+    assert message_chars(thoughtful, reasoning=True) > 8_000
+
+
+async def test_reasoning_text_does_not_trigger_summaries() -> None:
+    # 10 turns with 2,000 chars of reasoning each: ~5,000 estimated tokens if
+    # counted, but the provider does not re-send it, so nothing is summarized.
+    provider = FakeProvider([ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    await agent.run("latest", conversation=Conversation(reasoning_history(10)))
+    assert provider.call_count == 1
+    assert not summary_messages(provider.requests[0])
+
+
+async def test_resent_reasoning_counts_toward_the_estimate() -> None:
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    provider.preserve_reasoning = True  # type: ignore[attr-defined]
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    await agent.run("latest", conversation=Conversation(reasoning_history(10)))
+    assert is_summary_call(provider.requests[0])
+
+
+async def test_default_window_does_not_refuse_preflight() -> None:
+    # ~150k estimated tokens: over the default 128k window, but the window was
+    # not set, so the request goes out and the provider decides.
+    provider = FakeProvider([ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model")
+    result = await agent.run("x" * 600_000)
+    assert result.text == "ok"
+    assert provider.call_count == 1
+
+
+async def test_default_window_sends_after_failed_summary() -> None:
+    provider = FakeProvider(
+        [ScriptedTurn.failure(ProviderError("down", status_code=400)), ScriptedTurn.text("ok")]
+    )
+    agent = Agent(provider, model="test-model", context_budget=None)
+    history = chat_history(10, chars=60_000)
+    result = await agent.run("latest", conversation=Conversation(history))
+    assert result.text == "ok"
+    assert provider.call_count == 2
+
+
+async def test_explicit_window_still_refuses_preflight() -> None:
+    provider = FakeProvider([ScriptedTurn.text("ok")])
+    agent = Agent(provider, model="test-model", context_window=128_000)
+    with pytest.raises(ContextOverflowError):
+        await agent.run("x" * 600_000)
+    assert provider.call_count == 0
+
+
+async def test_summarizing_event_precedes_the_summary_call() -> None:
+    seen: list[tuple[str, int]] = []
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(
+        provider,
+        model="test-model",
+        context_budget=2_000,
+        observers=[lambda e: seen.append((e.name, provider.call_count))],
+    )
+    await agent.run("latest", conversation=Conversation(chat_history(10)))
+    summarizing = [(name, calls) for name, calls in seen if name == "context.summarizing"]
+    assert summarizing == [("context.summarizing", 0)]
+    event_names = [name for name, _ in seen]
+    assert event_names.index("context.summarizing") < event_names.index("context.compacted")
+
+
+async def test_summarizing_event_during_stream() -> None:
+    seen: list[str] = []
+    provider = FakeProvider([ScriptedTurn.text("S"), ScriptedTurn.text("ok")])
+    agent = Agent(
+        provider,
+        model="test-model",
+        context_budget=2_000,
+        observers=[lambda e: seen.append(e.name)],
+    )
+    async for _ in agent.stream("latest", conversation=Conversation(chat_history(10))):
+        pass
+    assert "context.summarizing" in seen
+
+
+def test_summary_store_is_optional_for_custom_stores() -> None:
+    from logpose.store.base import SessionStore, SummaryStore
+    from logpose.store.sqlite import SQLiteStore
+
+    assert not hasattr(SessionStore, "save_summary")
+    assert not hasattr(SessionStore, "load_summary")
+    assert hasattr(SummaryStore, "save_summary") and hasattr(SummaryStore, "load_summary")
+    assert issubclass(SQLiteStore, SummaryStore)

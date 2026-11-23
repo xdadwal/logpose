@@ -109,7 +109,6 @@ from logpose.cancellation import (
 from logpose.compaction import (
     RECALL_TOOL_NAME,
     SUMMARY_INSTRUCTION,
-    SUMMARY_MAX_TOKENS,
     _CompactionState,
     apply_pointers,
     choose_cut,
@@ -120,6 +119,8 @@ from logpose.compaction import (
     overhead_chars,
     render_transcript,
     summary_message,
+    summary_output_tokens,
+    summary_word_limit,
     turn_starts,
 )
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
@@ -540,7 +541,7 @@ class Agent:
         output_type: type[BaseModel] | None = None,
         output_retries: int = 1,
         session_wait: float = 0.0,
-        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        context_window: int | None = None,
         context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
         compaction_threshold: float = DEFAULT_COMPACTION_THRESHOLD,
         compaction_target: float = DEFAULT_COMPACTION_TARGET,
@@ -622,10 +623,15 @@ class Agent:
                 final answer fails validation (default 1). ``0`` fails at once.
             session_wait: Seconds to keep retrying a busy session's lease before
                 raising :class:`~logpose.errors.SessionBusyError` (default 0).
-            context_window: The model's total context window in tokens
-                (default 128,000).
+            context_window: The model's total context window in tokens. When
+                set, a request estimated above ``context_window - max_tokens``
+                is refused before it is sent. When omitted, 128,000 is assumed
+                for the budget, nothing is refused before sending, and the
+                provider's own context-length error triggers the reactive retry.
             context_budget: Cap on input tokens per request (default 32,000), or
-                ``None`` for no cap beyond the window.
+                ``None`` for no cap beyond the window. On a large-window model
+                raise it to keep more conversation verbatim: the default still
+                summarizes at about 27,000 estimated tokens.
             compaction_threshold: Fraction of the input budget at which the
                 built-in policy summarizes older turns (default 0.85).
             compaction_target: Fraction of the input budget it summarizes down
@@ -714,6 +720,9 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        self._window_explicit = context_window is not None
+        if context_window is None:
+            context_window = DEFAULT_CONTEXT_WINDOW
         _check_positive_int("context_window", context_window)
         if context_budget is not None:
             _check_positive_int("context_budget", context_budget)
@@ -1957,12 +1966,20 @@ class Agent:
         current estimate (the provider just rejected that request, so the
         estimate itself is too high a target).
 
+        Without ``force``, no summary is made when the kept part alone (system
+        prompt, tool schemas, pinned first turn and the turns after the best
+        cut) already reaches the target: no summary can get the request under
+        it, and one would be made again on every later run.
+
+        Estimates leave out reasoning blocks unless the provider re-sends them
+        (its ``preserve_reasoning`` attribute is true).
+
         Returns:
             The request to send and its raw token estimate.
 
         Raises:
-            ContextOverflowError: If the request cannot be made to fit the
-                window (``context_window − max_tokens``).
+            ContextOverflowError: If ``context_window`` was set and the request
+                cannot be made to fit ``context_window − max_tokens``.
         """
         messages = request.messages
         applied = 0
@@ -1972,6 +1989,8 @@ class Agent:
                 messages, current_start=current_start, min_chars=self.pointer_min_chars
             )
         system, tools = request.system, request.tools
+        # Reasoning text counts only if the provider actually re-sends it.
+        reasoning = bool(getattr(self.provider, "preserve_reasoning", False))
 
         def calibrated(raw: int) -> int:
             return math.ceil(raw * state.ratio)
@@ -1979,9 +1998,15 @@ class Agent:
         def compose(summary: str, cut: int) -> list[Message]:
             return [*messages[: first + 1], summary_message(summary), *messages[cut:]]
 
-        raw = estimate_tokens(messages, system, tools)
+        def estimate(sent: Sequence[Message]) -> int:
+            return estimate_tokens(sent, system, tools, reasoning=reasoning)
+
+        raw = estimate(messages)
         before = calibrated(raw)
         window = self.context_window - self._max_tokens()
+        # The default window is a guess: with it, nothing is refused before
+        # sending; the provider's own context-length error drives the retry.
+        refuse = self._window_explicit
         starts = turn_starts(messages)
         first = starts[0] if starts else -1
 
@@ -1997,7 +2022,7 @@ class Agent:
         sent = messages
         if state.summary is not None:
             sent = compose(state.summary, state.cut_index)
-            raw = estimate_tokens(sent, system, tools)
+            raw = estimate(sent)
         attempted = False
 
         if (
@@ -2010,19 +2035,25 @@ class Agent:
             lower = state.cut_index if state.summary is not None else first + 1
             upper = len(messages) if current_start is None else current_start
             candidates = [index for index in starts if lower < index <= upper]
+            summarize = False
             if candidates:
-                prefix_chars = sum(message_chars(m) + 2 for m in messages[: first + 1])
+                prefix_chars = sum(
+                    message_chars(m, reasoning=reasoning) + 2 for m in messages[: first + 1]
+                )
                 placeholder = message_chars(summary_message(state.summary or "")) + 2
+                target = self.compaction_target * min(
+                    self.input_budget, calibrated(raw) if force else self.input_budget
+                )
                 cut = choose_cut(
                     messages,
                     candidates,
                     fixed_chars=prefix_chars + placeholder + overhead_chars(system, tools),
                     ratio=state.ratio,
-                    target_tokens=self.compaction_target
-                    * min(self.input_budget, calibrated(raw) if force else self.input_budget),
+                    target_tokens=target,
+                    reasoning=reasoning,
                 )
-                floor = calibrated(estimate_tokens(compose("", cut), system, tools))
-                if floor > window:
+                floor = calibrated(estimate(compose("", cut)))
+                if floor > window and refuse:
                     # Even an empty summary cannot make this fit: don't pay for one.
                     raise ContextOverflowError(
                         f"The request needs about {floor} input tokens even after "
@@ -2035,7 +2066,17 @@ class Agent:
                     span, previous = messages[state.cut_index : cut], state.summary
                 else:
                     span, previous = messages[first + 1 : cut], None
+                # Unless forced, skip when the kept part alone is at the target:
+                # a summary cannot get under it and would be remade every run.
+                summarize = force or floor < target
+            if summarize:
                 attempted = True
+                self._emit_runtime(
+                    "context.summarizing",
+                    context=context,
+                    estimated_tokens_before=before,
+                    input_budget=self.input_budget,
+                )
                 failure: ProviderError | None = None
                 try:
                     summary = await self._summarize(
@@ -2050,13 +2091,13 @@ class Agent:
                     # fits the window. Not retried again this run: every later
                     # turn would pay for the same failing call.
                     run_state.summary_failed = True
-                    estimate = calibrated(raw)
-                    if estimate > window:
+                    needed = calibrated(raw)
+                    if needed > window and refuse:
                         raise ContextOverflowError(
-                            f"The summary call failed and the request (about {estimate} "
+                            f"The summary call failed and the request (about {needed} "
                             f"input tokens) does not fit the {window} the context window "
                             f"leaves (input budget {self.input_budget}).",
-                            estimated_tokens=estimate,
+                            estimated_tokens=needed,
                             input_budget=self.input_budget,
                         ) from failure
                 else:
@@ -2064,10 +2105,10 @@ class Agent:
                     state.cut_index = cut
                     state.fingerprint = fingerprint(history[:cut])
                     sent = compose(summary, cut)
-                    raw = estimate_tokens(sent, system, tools)
+                    raw = estimate(sent)
 
         after = calibrated(raw)
-        if after > window:
+        if after > window and refuse:
             raise ContextOverflowError(
                 f"The request needs about {after} input tokens, more than the {window} "
                 f"the context window leaves (input budget {self.input_budget}).",
@@ -2112,10 +2153,12 @@ class Agent:
         caller bounds it by the run deadline; each attempt is also bounded by
         the provider turn timeout.
 
-        Its output ceiling is the larger of :data:`SUMMARY_MAX_TOKENS` and the
-        agent's per-turn ``max_tokens``: a reasoning model spends output tokens
-        thinking before it writes, and the per-turn ceiling is already sized
-        for that and already fits the window.
+        Its output ceiling is the agent's per-turn ``max_tokens`` (a reasoning
+        model spends output tokens thinking before it writes), capped at
+        :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION` of the input budget
+        and never below :data:`~logpose.compaction.SUMMARY_MAX_TOKENS` (see
+        :func:`~logpose.compaction.summary_output_tokens`). The request asks
+        for a summary under half that ceiling, leaving the rest for thinking.
 
         Returns:
             The summary text, or ``None`` if the model answered with no text
@@ -2124,12 +2167,12 @@ class Agent:
         Raises:
             ProviderError: If every allowed attempt failed.
         """
+        ceiling = summary_output_tokens(self._max_tokens(), self.input_budget)
+        transcript = render_transcript(span, previous, max_words=summary_word_limit(ceiling))
         request = CompletionRequest(
-            messages=[
-                Message(role="user", content=[TextBlock(text=render_transcript(span, previous))])
-            ],
+            messages=[Message(role="user", content=[TextBlock(text=transcript)])],
             model=self._model(),
-            max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
+            max_tokens=ceiling,
             system=SUMMARY_INSTRUCTION,
             tools=[],
             extra={k: v for k, v in self.extra.items() if k not in _TURN_ONLY_EXTRA},

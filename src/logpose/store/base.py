@@ -7,14 +7,14 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from logpose.agent import Conversation
 from logpose.compaction import _CompactionState, fingerprint
 from logpose.errors import LogposeError
 from logpose.messages import Message
 
-__all__ = ["RunRecord", "SessionHandle", "SessionStore", "validate_session_id"]
+__all__ = ["RunRecord", "SessionHandle", "SessionStore", "SummaryStore", "validate_session_id"]
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
@@ -159,10 +159,20 @@ class SessionStore(Protocol):
 
     async def record_run(self, record: RunRecord) -> None: ...
 
-    async def save_summary(self, session_id: str, upto_seq: int, text: str) -> None: ...
-
-    async def load_summary(self, session_id: str) -> tuple[int, str] | None: ...
-
     async def delete_session(self, session_id: str) -> None: ...
 
     async def purge_expired(self, now_ms: int | None = None) -> int: ...
+
+
+@runtime_checkable
+class SummaryStore(Protocol):
+    """Optional extra a :class:`SessionStore` may implement: direct summary access.
+
+    The session path persists summaries through :class:`SessionHandle`
+    (``stored_summary`` and :meth:`SessionHandle.summary_to_save`), so a custom
+    store need not implement these. The SQLite store does.
+    """
+
+    async def save_summary(self, session_id: str, upto_seq: int, text: str) -> None: ...
+
+    async def load_summary(self, session_id: str) -> tuple[int, str] | None: ...
