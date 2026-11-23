@@ -52,6 +52,7 @@ from logpose.messages import (
 )
 from logpose.providers.base import (
     CompletionDone,
+    CompletionRequest,
     Provider,
     ProviderTextDelta,
 )
@@ -270,7 +271,7 @@ async def test_max_tokens_falls_back_to_the_providers_own_ceiling() -> None:
     # A provider with no opinion gets the loop's documented default.
     bare = FakeProvider([ScriptedTurn.text("hi")])
     await Agent(bare, model="test-model").run("hello")
-    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 8192
+    assert bare.last_request.max_tokens == DEFAULT_MAX_TOKENS == 16384
 
 
 async def test_deltas_are_re_emitted_as_public_events() -> None:
@@ -1605,6 +1606,22 @@ def test_named_provider_is_resolved_with_provider_kwargs() -> None:
     assert agent.model == "local-model"
 
 
+def test_agent_forwards_max_tokens_field_to_provider() -> None:
+    agent = Agent(
+        "openai-compat",
+        model="local-model",
+        base_url="http://local.test/v1",
+        max_tokens_field="max_tokens",
+    )
+
+    assert agent.provider.max_tokens_field == "max_tokens"  # type: ignore[attr-defined]
+    body = agent.provider._build_body(  # type: ignore[attr-defined]
+        CompletionRequest(messages=[Message.user("hi")], model="m", max_tokens=64), "m"
+    )
+    assert body["max_tokens"] == 64
+    assert "max_completion_tokens" not in body
+
+
 def test_provider_kwargs_alongside_a_built_provider_raise() -> None:
     with pytest.raises(LogposeError, match="already-built provider"):
         Agent(FakeProvider(), model="test-model", api_key="sk-should-not-be-here")
@@ -1894,7 +1911,7 @@ async def test_web_app_defaults() -> None:
     assert agent.provider_turn_timeout == 120
     assert agent.run_timeout == 320
     await agent.run("hello")
-    assert provider.last_request.max_tokens == 8192
+    assert provider.last_request.max_tokens == 16384
 
 
 async def test_run_timeout_raises_with_partial_history() -> None:
