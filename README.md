@@ -605,7 +605,17 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   `await agent.purge_expired_sessions()` to delete expired sessions, or
   `await agent.delete_session(sid)` to remove one.
 - **Run records:** each run writes a row to `logpose_runs`. Token counts cover
-  completed turns only.
+  completed turns only. A stream still open when its `agent.session(...)` block
+  exits is closed first and writes its record within its own time limit (about
+  10 s); the block then waits up to 6 s for any record still writing, and its
+  save gets a full 8 s of its own. So a busy database can lose that stream's run
+  record (logged) but not the block's messages; such an exit can take up to about
+  24 s. Wrapping the stream in `contextlib.aclosing(...)` closes it before the
+  block exits and avoids this.
+- **Exit and cancellation:** the exit's save runs past a cancellation, so a server
+  cancelling the handler on client disconnect does not shorten it. If streams may
+  be left open on a handle, set the ASGI server's graceful-shutdown timeout to at
+  least 25 s, or use `aclosing`.
 
 Known limits:
 
