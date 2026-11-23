@@ -79,6 +79,7 @@ import enum
 import inspect
 import json
 import logging
+import math
 import time
 import traceback
 import weakref
@@ -94,6 +95,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import AbstractAsyncContextManager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -106,8 +108,28 @@ from logpose.cancellation import (
     _clear_deadline_handle,
     _install_deadline_handle,
 )
+from logpose.compaction import (
+    RECALL_TOOL_NAME,
+    SUMMARY_INSTRUCTION,
+    SUMMARY_MAX_TOKENS,
+    _CompactionState,
+    apply_pointers,
+    choose_cut,
+    estimate_tokens,
+    fingerprint,
+    make_recall_tool,
+    message_chars,
+    overhead_chars,
+    render_transcript,
+    summary_char_limit,
+    summary_message,
+    summary_word_limit,
+    truncate_summary,
+    turn_starts,
+)
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
+    ContextOverflowError,
     LogposeError,
     MaxIterationsError,
     OutputRefusalError,
@@ -115,6 +137,7 @@ from logpose.errors import (
     ProviderError,
     RunTimeoutError,
     SessionBusyError,
+    StructuredOutputUnsupportedError,
     ToolExecutionError,
 )
 from logpose.events import (
@@ -200,6 +223,21 @@ DEFAULT_PROVIDER_TURN_TIMEOUT = 120.0
 DEFAULT_RUN_TIMEOUT = 320.0
 """Wall-clock deadline, in seconds, for a whole run. ``None`` disables it."""
 
+DEFAULT_CONTEXT_WINDOW = 128_000
+"""Model context window, in tokens, assumed when the app does not state one."""
+
+DEFAULT_CONTEXT_BUDGET = 32_000
+"""Cap on estimated input tokens per request for the built-in context policy."""
+
+DEFAULT_COMPACTION_THRESHOLD = 0.85
+"""Fraction of the input budget at which the built-in policy summarizes."""
+
+DEFAULT_COMPACTION_TARGET = 0.60
+"""Fraction of the input budget the built-in policy summarizes down to."""
+
+DEFAULT_POINTER_MIN_CHARS = 1_000
+"""Earlier-run tool outputs longer than this are sent as pointers."""
+
 DEFAULT_MAX_CONCURRENT_TOOLS = 8
 """Maximum tool handlers one agent executes at once across concurrent runs."""
 
@@ -257,6 +295,25 @@ class _Unset(enum.Enum):
 
 _UNSET = _Unset.UNSET
 """Means "use the agent default" for ``output_type`` / ``output_retries``."""
+
+
+class _BuiltinContext(enum.Enum):
+    """Sentinel type: ``context_policy`` left at its default (the built-in path)."""
+
+    BUILTIN = enum.auto()
+
+    def __repr__(self) -> str:
+        return "<built-in>"
+
+
+_BUILTIN_CONTEXT = _BuiltinContext.BUILTIN
+"""Default ``context_policy``: logpose's own compaction path."""
+
+_TURN_ONLY_EXTRA = frozenset({"response_format", "tool_choice", "parallel_tool_calls"})
+"""``extra`` keys that describe the agent's own turn and are not sent with the summary call."""
+
+_RUN_HISTORY: ContextVar[Sequence[Message]] = ContextVar("logpose_run_history", default=())
+"""The executing run's full history, read by the ``recall_tool_output`` tool."""
 
 _CORRECTION_PREFIX = "Your previous answer did not match the required JSON schema:\n"
 _CORRECTION_SUFFIX = "\nReply again with only the corrected JSON."
@@ -370,7 +427,7 @@ class Conversation:
             supported; the loop only ever appends to it.
     """
 
-    __slots__ = ("messages",)
+    __slots__ = ("messages", "_compaction")
 
     def __init__(self, messages: Iterable[Message] | None = None) -> None:
         """Initialize the history.
@@ -380,6 +437,9 @@ class Conversation:
                 keeps ownership of whatever they passed.
         """
         self.messages: list[Message] = list(messages) if messages is not None else []
+        # Built-in context policy state: calibration ratio and cached summary.
+        # Never serialized; a fingerprint guards it against edited history.
+        self._compaction: _CompactionState | None = None
 
     def append(self, message: Message) -> None:
         """Add one turn to the end of the history.
@@ -502,10 +562,15 @@ class Agent:
         on_tool_call: ToolGate | None = None,
         observers: Sequence[RuntimeObserver] = (),
         tool_observer: ToolObserver | None = None,
-        context_policy: ContextPolicy | None = None,
+        context_policy: ContextPolicy | None | _BuiltinContext = _BUILTIN_CONTEXT,
         output_type: type[BaseModel] | None = None,
         output_retries: int = 1,
         session_wait: float = 0.0,
+        context_window: int | None = None,
+        context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
+        compaction_threshold: float = DEFAULT_COMPACTION_THRESHOLD,
+        compaction_target: float = DEFAULT_COMPACTION_TARGET,
+        pointer_min_chars: int = DEFAULT_POINTER_MIN_CHARS,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -567,9 +632,14 @@ class Agent:
                 detached approved tool intent and normalized outcome. Failures stop
                 the run with ToolObservationError rather than becoming tool results.
                 Contains application content; never attach it to telemetry logging.
-            context_policy: Optional sync/async request preparation policy. Runs before
-                every provider iteration on detached data; never rewrites history.
-                Applications own selection and summaries. Failure stops the run.
+            context_policy: Request preparation. Left at its default, logpose's
+                built-in path runs: tool outputs from earlier runs longer than
+                ``pointer_min_chars`` are sent as short pointers, and agents with
+                tools get a ``recall_tool_output`` tool to read them back. A
+                sync/async function replaces the built-in path entirely; it runs
+                before every provider iteration on detached data, never rewrites
+                history, and its failure stops the run. ``None`` sends the full
+                history unchanged.
             output_type: Default pydantic model the final answer must satisfy.
                 When set, every turn requests strict ``json_schema`` output and
                 the run returns the validated object as ``RunResult.output``.
@@ -578,6 +648,21 @@ class Agent:
                 final answer fails validation (default 1). ``0`` fails at once.
             session_wait: Seconds to keep retrying a busy session's lease before
                 raising :class:`~logpose.errors.SessionBusyError` (default 0).
+            context_window: The model's total context window in tokens. When
+                set, a request estimated above ``context_window - max_tokens``
+                is refused before it is sent. When omitted, 128,000 is assumed
+                for the budget, nothing is refused before sending, and the
+                provider's own context-length error triggers the reactive retry.
+            context_budget: Cap on input tokens per request (default 32,000), or
+                ``None`` for no cap beyond the window. On a large-window model
+                raise it to keep more conversation verbatim: the default still
+                summarizes at about 27,000 estimated tokens.
+            compaction_threshold: Fraction of the input budget at which the
+                built-in policy summarizes older turns (default 0.85).
+            compaction_target: Fraction of the input budget it summarizes down
+                to (default 0.60). Must be below ``compaction_threshold``.
+            pointer_min_chars: Earlier-run tool outputs longer than this are sent
+                as pointers (default 1,000).
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -593,7 +678,10 @@ class Agent:
             ``provider_turn_timeout``, ``max_concurrent_tools``, or
             ``tool_timeout`` is invalid, or if a tool-error option is invalid,
             or if ``output_type`` is not a ``BaseModel`` subclass or
-            ``output_retries`` is not an int >= 0.
+            ``output_retries`` is not an int >= 0, or if a context setting is
+            invalid, or if, with the built-in context path, the input budget
+            (``min(context_window - max_tokens, context_budget)``) is not
+            positive or an app tool is named ``recall_tool_output``.
         """
         _check_output_type(output_type)
         _check_output_retries(output_retries)
@@ -657,6 +745,24 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        self._window_explicit = context_window is not None
+        if context_window is None:
+            context_window = DEFAULT_CONTEXT_WINDOW
+        _check_positive_int("context_window", context_window)
+        if context_budget is not None:
+            _check_positive_int("context_budget", context_budget)
+        _check_positive_int("pointer_min_chars", pointer_min_chars)
+        for label, fraction in (
+            ("compaction_threshold", compaction_threshold),
+            ("compaction_target", compaction_target),
+        ):
+            if isinstance(fraction, bool) or not isinstance(fraction, (int, float)):
+                raise LogposeError(f"{label} must be a number, got {fraction!r}.")
+        if not 0 < compaction_target < compaction_threshold <= 1:
+            raise LogposeError(
+                "context settings must satisfy 0 < compaction_target < compaction_threshold "
+                f"<= 1; got target={compaction_target!r}, threshold={compaction_threshold!r}."
+            )
 
         if isinstance(provider, str):
             self.provider: Provider = resolve(provider, **provider_kwargs)
@@ -695,7 +801,15 @@ class Agent:
         self.on_tool_call = on_tool_call
         self.observers: tuple[RuntimeObserver, ...] = tuple(observers)
         self.tool_observer = tool_observer
-        self.context_policy = context_policy
+        self._context_policy_is_default = context_policy is _BUILTIN_CONTEXT
+        self.context_policy: ContextPolicy | None = (
+            None if isinstance(context_policy, _BuiltinContext) else context_policy
+        )
+        self.context_window = context_window
+        self.context_budget = context_budget
+        self.compaction_threshold = float(compaction_threshold)
+        self.compaction_target = float(compaction_target)
+        self.pointer_min_chars = pointer_min_chars
         self.last_context_diagnostics: dict[str, int | str | bool] = {}
         self.output_type = output_type
         self.output_retries = output_retries
@@ -714,8 +828,29 @@ class Agent:
                     f"Duplicate tool name {tool_def.name!r}; every tool must be uniquely named."
                 )
             by_name[tool_def.name] = tool_def
+        # The built-in path's own tool: present from the first turn whenever the
+        # agent has tools, so the advertised tool list never changes mid-chat.
+        # Not added to ``self.tools``, which stays the app's own list.
+        self._recall_active = self._context_policy_is_default and bool(self.tools)
+        if self._recall_active:
+            if RECALL_TOOL_NAME in by_name:
+                raise LogposeError(
+                    f"Tool name {RECALL_TOOL_NAME!r} is reserved by the built-in context "
+                    "policy; rename the tool or pass context_policy=None."
+                )
+            by_name[RECALL_TOOL_NAME] = make_recall_tool(_RUN_HISTORY.get)
         self._tools_by_name = by_name
-        self._specs: tuple[ToolSpec, ...] = tuple(tool_def.spec() for tool_def in self.tools)
+        self._specs: tuple[ToolSpec, ...] = tuple(tool_def.spec() for tool_def in by_name.values())
+        resolved_window = context_window - self._max_tokens()
+        self.input_budget = (
+            resolved_window if context_budget is None else min(resolved_window, context_budget)
+        )
+        if self._context_policy_is_default and self.input_budget <= 0:
+            raise LogposeError(
+                f"The input budget is {self.input_budget} tokens: context_window="
+                f"{context_window} minus max_tokens={self._max_tokens()} leaves no room "
+                "for input. Raise context_window or lower max_tokens."
+            )
 
     # -- public API ---------------------------------------------------------
 
@@ -1281,10 +1416,31 @@ class Agent:
         run_deadline = started_at + self.run_timeout if self.run_timeout is not None else None
         self._emit_runtime("run.started", context=run_context)
         history: list[Message] = conversation.messages if conversation is not None else []
+        # Messages from here on belong to this run; the built-in context path
+        # sends their tool outputs in full and points at earlier runs' ones.
+        current_start = len(history)
         iterations = 0
         if stats is None:
             stats = _RunStats()
         stats.run_id = run_context.run_id
+        run_stats = stats
+        # Built-in context policy state: the conversation's, or this run's only.
+        compaction: _CompactionState | None = None
+        run_compaction = _RunCompaction()
+        if self._context_policy_is_default:
+            if conversation is None:
+                compaction = _CompactionState()
+            else:
+                if conversation._compaction is None:
+                    conversation._compaction = _CompactionState()
+                compaction = conversation._compaction
+        total_usage = Usage()
+
+        def add_usage(usage: Usage) -> None:
+            nonlocal total_usage
+            total_usage = total_usage + usage
+            run_stats.usage = total_usage
+
         # Tool calls appended to history whose results are not yet appended.
         # Whatever ends the run meanwhile (timeout, cancellation, an abandoned
         # stream, a raising gate), each one gets an error result, or every later
@@ -1300,7 +1456,6 @@ class Agent:
             if prompt is not None:
                 history.append(prompt)
 
-            total_usage = Usage()
             last: CompletionDone | None = None
             output: BaseModel | None = None
             corrections = 0
@@ -1326,19 +1481,50 @@ class Agent:
                     request_id=self._runtime_id("request"),
                 )
                 done: CompletionDone | None = None
-                async with _run_budget(run_deadline):
-                    request = await self._prepare_request(history, response_format)
-                turn_stream = self._provider_turn(request, turn_context, run_deadline)
-                try:
-                    async for event in turn_stream:
-                        if isinstance(event, ProviderTextDelta):
-                            yield TextDelta(text=event.text)
-                        elif isinstance(event, ProviderThinkingDelta):
-                            yield ThinkingDelta(text=event.text)
-                        else:
-                            done = event
-                finally:
-                    await _aclose(turn_stream)
+                # A context-length rejection forces a summary and retries this
+                # turn once, within the same iteration.
+                rejection: ProviderError | None = None
+                while True:
+                    shape = _summary_shape(compaction)
+                    async with _run_budget(run_deadline):
+                        request, estimate = await self._prepare_request(
+                            history,
+                            response_format,
+                            current_start=current_start,
+                            compaction=compaction,
+                            run_compaction=run_compaction,
+                            context=turn_context,
+                            run_deadline=run_deadline,
+                            add_usage=add_usage,
+                            force_summary=rejection is not None,
+                        )
+                    if rejection is not None and shape == _summary_shape(compaction):
+                        # Nothing more could be summarized (or the summary call
+                        # failed): the same request would be rejected again.
+                        raise rejection
+                    turn_stream = self._provider_turn(request, turn_context, run_deadline)
+                    try:
+                        async for event in turn_stream:
+                            if isinstance(event, ProviderTextDelta):
+                                yield TextDelta(text=event.text)
+                            elif isinstance(event, ProviderThinkingDelta):
+                                yield ThinkingDelta(text=event.text)
+                            else:
+                                done = event
+                    except ProviderError as exc:
+                        if (
+                            rejection is not None
+                            or compaction is None
+                            or not _is_context_length_error(exc)
+                        ):
+                            raise
+                        rejection = exc
+                        request_id = self._runtime_id("request")
+                        turn_context = replace(turn_context, request_id=request_id)
+                        continue
+                    finally:
+                        await _aclose(turn_stream)
+                    break
 
                 if done is None:
                     raise ProviderError(
@@ -1366,8 +1552,14 @@ class Agent:
                     answer_index = len(history)
                     history.append(done.message)
                     unanswered[:] = calls
-                total_usage = total_usage + done.usage
-                stats.usage = total_usage
+                add_usage(done.usage)
+                if compaction is not None:
+                    compaction.calibrate(
+                        done.usage.input_tokens
+                        + done.usage.cache_read_input_tokens
+                        + done.usage.cache_creation_input_tokens,
+                        estimate,
+                    )
                 last = done
                 yield TurnEnd(stop_reason=done.stop_reason, usage=done.usage)
 
@@ -1382,7 +1574,7 @@ class Agent:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
                     async with _run_budget(run_deadline):
-                        results = await self._execute(calls, turn_context)
+                        results = await self._execute(calls, turn_context, history)
                     # ONE user message holding every result, in request order —
                     # appended before the results are yielded, so a consumer that
                     # walks away mid-results still leaves a replayable history.
@@ -1685,14 +1877,56 @@ class Agent:
         self,
         history: Sequence[Message],
         response_format: dict[str, Any] | None = None,
-    ) -> CompletionRequest:
-        """Await selection before inference; isolate policy mutation from canonical data."""
+        *,
+        current_start: int | None = None,
+        compaction: _CompactionState | None = None,
+        run_compaction: _RunCompaction | None = None,
+        context: RuntimeContext | None = None,
+        run_deadline: float | None = None,
+        add_usage: Callable[[Usage], None] | None = None,
+        force_summary: bool = False,
+    ) -> tuple[CompletionRequest, int]:
+        """Await selection before inference; isolate policy mutation from canonical data.
+
+        Args:
+            history: The run's full history. Never modified.
+            response_format: Structured-output format to attach, if any.
+            current_start: Index of the first message this run appended. The
+                built-in path sends tool outputs before it as pointers; ``None``
+                treats the whole history as the current run.
+            compaction: The built-in path's per-conversation state; a fresh
+                one is used when omitted.
+            run_compaction: The built-in path's state for this run only.
+            context: Correlation context for the summary call and the
+                ``context.compacted`` event.
+            run_deadline: Bounds the summary call's retries.
+            add_usage: Receives the summary call's token usage.
+            force_summary: Summarize (or extend the summary) even below the
+                threshold; set after the provider rejected the request for
+                exceeding its context length.
+
+        Returns:
+            The request to send, and its raw (uncalibrated) token estimate on
+            the built-in path (``0`` otherwise).
+        """
         request = self._request(history)
         if response_format is not None:
             request.extra["response_format"] = copy.deepcopy(response_format)
         self.last_context_diagnostics = {}
+        if self._context_policy_is_default:
+            return await self._builtin_context(
+                request,
+                history,
+                current_start=current_start,
+                state=compaction if compaction is not None else _CompactionState(),
+                run_state=run_compaction if run_compaction is not None else _RunCompaction(),
+                context=context,
+                run_deadline=run_deadline,
+                add_usage=add_usage,
+                force=force_summary,
+            )
         if self.context_policy is None:
-            return request
+            return request, 0
         try:
             selected = self.context_policy(
                 ContextInput(
@@ -1718,10 +1952,13 @@ class Agent:
             ):
                 raise TypeError("Diagnostics must contain metadata scalars")
             self.last_context_diagnostics = dict(prepared.diagnostics)
-            return replace(
-                request,
-                messages=[m.model_copy(deep=True) for m in prepared.messages],
-                system=prepared.system,
+            return (
+                replace(
+                    request,
+                    messages=[m.model_copy(deep=True) for m in prepared.messages],
+                    system=prepared.system,
+                ),
+                0,
             )
         except asyncio.CancelledError:
             raise
@@ -1729,6 +1966,298 @@ class Agent:
             raise ContextPreparationError(
                 "Context preparation failed before provider inference"
             ) from exc
+
+    async def _builtin_context(
+        self,
+        request: CompletionRequest,
+        history: Sequence[Message],
+        *,
+        current_start: int | None,
+        state: _CompactionState,
+        run_state: _RunCompaction,
+        context: RuntimeContext | None,
+        run_deadline: float | None,
+        add_usage: Callable[[Usage], None] | None,
+        force: bool = False,
+    ) -> tuple[CompletionRequest, int]:
+        """Shape a request with the built-in policy: pointers, then the summary.
+
+        Step 1 sends long tool outputs from earlier runs as pointers. Step 2,
+        when the calibrated estimate is still at or over ``compaction_threshold``
+        of the input budget, replaces older turns with one model-written summary
+        (cached on ``state`` and reused while it still fits). Cuts fall only on
+        caller turn starts, never inside the current run, and never touch the
+        first user turn. ``force`` runs step 2 whatever the estimate, aiming at
+        ``compaction_target`` of the smaller of the input budget and the
+        current estimate (the provider just rejected that request, so the
+        estimate itself is too high a target).
+
+        Without ``force``, no summary is made when the kept part alone (system
+        prompt, tool schemas, pinned first turn and the turns after the best
+        cut) already reaches the target: no summary can get the request under
+        it, and one would be made again on every later run.
+
+        Estimates leave out reasoning blocks unless the provider re-sends them
+        (its ``preserve_reasoning`` attribute is true).
+
+        Returns:
+            The request to send and its raw token estimate.
+
+        Raises:
+            ContextOverflowError: If ``context_window`` was set and the request
+                cannot be made to fit ``context_window − max_tokens``.
+        """
+        messages = request.messages
+        applied = 0
+        if self._recall_active and current_start:
+            # Pointers only when the model can recall what they point at.
+            messages, applied = apply_pointers(
+                messages, current_start=current_start, min_chars=self.pointer_min_chars
+            )
+        system, tools = request.system, request.tools
+        # Reasoning text counts only if the provider actually re-sends it.
+        reasoning = bool(getattr(self.provider, "preserve_reasoning", False))
+
+        def calibrated(raw: int) -> int:
+            return math.ceil(raw * state.ratio)
+
+        def compose(summary: str, cut: int) -> list[Message]:
+            return [*messages[: first + 1], summary_message(summary), *messages[cut:]]
+
+        def estimate(sent: Sequence[Message]) -> int:
+            return estimate_tokens(sent, system, tools, reasoning=reasoning)
+
+        raw = estimate(messages)
+        before = calibrated(raw)
+        window = self.context_window - self._max_tokens()
+        # The default window is a guess: with it, nothing is refused before
+        # sending; the provider's own context-length error drives the retry.
+        refuse = self._window_explicit
+        starts = turn_starts(messages)
+        first = starts[0] if starts else -1
+
+        # A cached summary applies only to the exact history it was made from,
+        # and its cut must still start a caller turn (edits after it can move
+        # that): the summary is an assistant message, so a user turn must follow.
+        if state.summary is not None and not (
+            0 <= first < state.cut_index
+            and state.cut_index in starts
+            and fingerprint(history[: state.cut_index]) == state.fingerprint
+        ):
+            state.clear_summary()
+        sent = messages
+        if state.summary is not None:
+            sent = compose(state.summary, state.cut_index)
+            raw = estimate(sent)
+        attempted = False
+
+        if (
+            (force or calibrated(raw) >= self.compaction_threshold * self.input_budget)
+            and first >= 0
+            and not run_state.summary_failed
+            # After failed summaries, back off by caller turns (unless forced).
+            and (force or state.may_summarize(len(starts)))
+        ):
+            # The span must be non-empty and must end at or before the current
+            # run's own first message, which is always sent verbatim.
+            lower = state.cut_index if state.summary is not None else first + 1
+            upper = len(messages) if current_start is None else current_start
+            candidates = [index for index in starts if lower < index <= upper]
+            summarize = False
+            if candidates:
+                prefix_chars = sum(
+                    message_chars(m, reasoning=reasoning) + 2 for m in messages[: first + 1]
+                )
+                placeholder = message_chars(summary_message(state.summary or "")) + 2
+                target = self.compaction_target * min(
+                    self.input_budget, calibrated(raw) if force else self.input_budget
+                )
+                cut = choose_cut(
+                    messages,
+                    candidates,
+                    fixed_chars=prefix_chars + placeholder + overhead_chars(system, tools),
+                    ratio=state.ratio,
+                    target_tokens=target,
+                    reasoning=reasoning,
+                )
+                floor = calibrated(estimate(compose("", cut)))
+                if floor > window and refuse:
+                    # Even an empty summary cannot make this fit: don't pay for one.
+                    raise ContextOverflowError(
+                        f"The request needs about {floor} input tokens even after "
+                        f"summarizing earlier turns, more than the {window} the context "
+                        f"window leaves (input budget {self.input_budget}).",
+                        estimated_tokens=floor,
+                        input_budget=self.input_budget,
+                    )
+                if state.summary is not None:
+                    span, previous = messages[state.cut_index : cut], state.summary
+                else:
+                    span, previous = messages[first + 1 : cut], None
+                # Unless forced, skip when the kept part alone is at the target:
+                # a summary cannot get under it and would be remade every run.
+                summarize = force or floor < target
+            if summarize:
+                attempted = True
+                self._emit_runtime(
+                    "context.summarizing",
+                    context=context,
+                    estimated_tokens_before=before,
+                    input_budget=self.input_budget,
+                )
+                failure: ProviderError | None = None
+                try:
+                    summary = await self._summarize(
+                        span, previous, context, run_deadline, add_usage
+                    )
+                except ProviderError as exc:
+                    summary, failure = None, exc
+                if summary is None:
+                    # Failed, or answered with no text (e.g. a reasoning model
+                    # that spent its output budget thinking). Keep whatever
+                    # valid shape we had (no summary, or the older one) if it
+                    # fits the window. Not retried again this run: every later
+                    # turn would pay for the same failing call.
+                    run_state.summary_failed = True
+                    state.summary_failed(len(starts))
+                    needed = calibrated(raw)
+                    if needed > window and refuse:
+                        raise ContextOverflowError(
+                            f"The summary call failed and the request (about {needed} "
+                            f"input tokens) does not fit the {window} the context window "
+                            f"leaves (input budget {self.input_budget}).",
+                            estimated_tokens=needed,
+                            input_budget=self.input_budget,
+                        ) from failure
+                else:
+                    state.summary = truncate_summary(summary, summary_char_limit(self.input_budget))
+                    state.summary_succeeded()
+                    state.cut_index = cut
+                    state.fingerprint = fingerprint(history[:cut])
+                    sent = compose(state.summary, cut)
+                    raw = estimate(sent)
+
+        after = calibrated(raw)
+        if after > window and refuse:
+            raise ContextOverflowError(
+                f"The request needs about {after} input tokens, more than the {window} "
+                f"the context window leaves (input budget {self.input_budget}).",
+                estimated_tokens=after,
+                input_budget=self.input_budget,
+            )
+        summarized = state.summary is not None
+        diagnostics: dict[str, int | str | bool] = {
+            "pointers_applied": applied,
+            "summarized": summarized,
+            "estimated_tokens_before": before,
+            "estimated_tokens_after": after,
+            "input_budget": self.input_budget,
+        }
+        self.last_context_diagnostics = diagnostics
+        if applied or summarized or attempted:
+            self._emit_runtime(
+                "context.compacted",
+                context=context,
+                pointers_applied=applied,
+                summarized=summarized,
+                estimated_tokens_before=before,
+                estimated_tokens_after=after,
+                input_budget=self.input_budget,
+            )
+        if sent is request.messages:
+            return request, raw
+        return replace(request, messages=list(sent)), raw
+
+    async def _summarize(
+        self,
+        span: Sequence[Message],
+        previous: str | None,
+        context: RuntimeContext | None,
+        run_deadline: float | None,
+        add_usage: Callable[[Usage], None] | None,
+    ) -> str | None:
+        """Make the summary call: same provider and model, no tools, retried.
+
+        Not a loop turn: it does not count toward ``max_iterations`` and emits
+        no ``provider.attempt.*`` events. Its usage goes to ``add_usage``. The
+        caller bounds it by the run deadline; each attempt is also bounded by
+        the provider turn timeout.
+
+        Its output ceiling is the larger of
+        :data:`~logpose.compaction.SUMMARY_MAX_TOKENS` and the agent's per-turn
+        ``max_tokens``: a reasoning model spends output tokens thinking before
+        it writes. The summary's length is bounded instead by the request
+        (a word limit from :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION`
+        of the input budget) and by truncation in the caller. Text from a
+        response cut off at ``max_tokens`` is still used (truncated likewise).
+
+        Returns:
+            The summary text, or ``None`` if the model answered with no text
+            (not retried: the same request would spend its budget the same way).
+
+        Raises:
+            ProviderError: If every allowed attempt failed.
+        """
+        transcript = render_transcript(
+            span, previous, max_words=summary_word_limit(self.input_budget)
+        )
+        request = CompletionRequest(
+            messages=[Message(role="user", content=[TextBlock(text=transcript)])],
+            model=self._model(),
+            max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
+            system=SUMMARY_INSTRUCTION,
+            tools=[],
+            extra={k: v for k, v in self.extra.items() if k not in _TURN_ONLY_EXTRA},
+        )
+        attempt_context = context or RuntimeContext(
+            run_id=self._runtime_id("run"), provider=self.provider_name, model=self._model()
+        )
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
+            turn_timeout = self._turn_timeout()
+            turn_deadline = monotonic() + turn_timeout if turn_timeout is not None else None
+            token = _set_runtime_context(attempt_context)
+            try:
+                stream = self.provider.stream(request)
+            finally:
+                _reset_runtime_context(token)
+            done: CompletionDone | None = None
+            failure: ProviderError | None = None
+            try:
+                while True:
+                    try:
+                        event = await _next_within(
+                            stream, attempt_context, turn_deadline, run_deadline
+                        )
+                    except StopAsyncIteration:
+                        break
+                    if isinstance(event, CompletionDone):
+                        done = event
+            except TimeoutError:
+                failure = ProviderError(
+                    f"Provider {self.provider_name!r} exceeded its complete-turn deadline "
+                    "during the summary call.",
+                    retryable=True,
+                    error_code="turn_timeout",
+                )
+            except ProviderError as error:
+                failure = error
+            finally:
+                await _aclose_with_runtime_context(stream, attempt_context)
+            if failure is None:
+                if done is not None and add_usage is not None:
+                    add_usage(done.usage)
+                text = done.message.text.strip() if done is not None else ""
+                return text or None
+            failure.attempts = attempt
+            if not failure.retryable or attempt >= self.retry_policy.max_attempts:
+                raise failure
+            delay = self.retry_policy.delay(attempt, retry_after=failure.retry_after)
+            if _outlasts_run(delay, run_deadline):
+                raise failure
+            await asyncio.sleep(delay)
+        raise AssertionError(  # pragma: no cover
+            "Retry loop exhausted without returning or raising."
+        )
 
     @staticmethod
     def _final_output(
@@ -1811,7 +2340,10 @@ class Agent:
     # -- tools --------------------------------------------------------------
 
     async def _execute(
-        self, calls: Sequence[ToolUseBlock], turn_context: RuntimeContext
+        self,
+        calls: Sequence[ToolUseBlock],
+        turn_context: RuntimeContext,
+        history: Sequence[Message] = (),
     ) -> list[ToolResultBlock]:
         """Gate every requested call, then run the survivors concurrently.
 
@@ -1821,6 +2353,8 @@ class Agent:
 
         Args:
             calls: The tool-use blocks from the assistant turn, in wire order.
+            turn_context: Correlation context of the turn that requested them.
+            history: The run's full history, readable by ``recall_tool_output``.
 
         Returns:
             One :class:`~logpose.messages.ToolResultBlock` per call, in the same
@@ -1834,10 +2368,16 @@ class Agent:
             context = replace(turn_context, tool_call_id=call.id, tool_name=call.name)
             self._emit_runtime("tool.queued", context=context)
             queued.append((index, call, queued_at))
-        tasks = [
-            asyncio.create_task(self._invoke(call, queued_at, turn_context))
-            for _, call, queued_at in queued
-        ]
+        # Each task copies the current context at creation, so the recall tool
+        # sees this run's history even while other runs share the agent.
+        history_token = _RUN_HISTORY.set(history)
+        try:
+            tasks = [
+                asyncio.create_task(self._invoke(call, queued_at, turn_context))
+                for _, call, queued_at in queued
+            ]
+        finally:
+            _RUN_HISTORY.reset(history_token)
         try:
             ran: list[ToolResultBlock] = list(await asyncio.gather(*tasks))
         except ToolObservationError:
@@ -2145,6 +2685,12 @@ def _check_output_type(output_type: object) -> None:
     strict_json_schema(output_type)
 
 
+def _check_positive_int(label: str, value: object) -> None:
+    """Raise unless ``value`` is an ``int`` (not a ``bool``) of at least 1."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise LogposeError(f"{label} must be a positive int, got {value!r}.")
+
+
 def _check_output_retries(output_retries: object) -> None:
     """Reject an ``output_retries`` that is not an int >= 0."""
     if (
@@ -2153,6 +2699,48 @@ def _check_output_retries(output_retries: object) -> None:
         or output_retries < 0
     ):
         raise LogposeError(f"output_retries must be an int >= 0, got {output_retries!r}.")
+
+
+def _summary_shape(state: _CompactionState | None) -> tuple[str | None, int] | None:
+    """The cached summary and its cut, to tell whether a forced summary changed them."""
+    return (state.summary, state.cut_index) if state is not None else None
+
+
+_CONTEXT_LENGTH_MARKERS = (
+    "context_length",
+    "maximum context length",
+    "context window",
+    # llama.cpp: "the request exceeds the available context size", type
+    # "exceed_context_size_error"; LM Studio: "... Context Length ...".
+    "context size",
+    "context length",
+    "exceed_context",
+)
+
+
+def _is_context_length_error(error: ProviderError) -> bool:
+    """Whether ``error`` is a provider rejecting a request as too long for its context.
+
+    An HTTP 400 whose message (or error code) mentions ``context_length``,
+    ``maximum context length``, ``context window``, ``context size``,
+    ``context length`` or ``exceed_context``, case-insensitively. A
+    structured-output rejection or a failure after output was delivered never is.
+    """
+    if (
+        isinstance(error, StructuredOutputUnsupportedError)
+        or error.status_code != 400
+        or error.partial
+    ):
+        return False
+    text = f"{error.message} {error.error_code or ''}".lower()
+    return any(marker in text for marker in _CONTEXT_LENGTH_MARKERS)
+
+
+@dataclass
+class _RunCompaction:
+    """Built-in context policy state that lasts for one run only."""
+
+    summary_failed: bool = False
 
 
 @dataclass
@@ -2214,7 +2802,10 @@ async def _exit_session(
             # A copy: a run still going in another task keeps appending to the old
             # list (and answers these calls itself); only the saved history changes.
             repair = _error_results(calls, "Run ended before this tool finished.")
-            handle.conversation = Conversation([*messages, repair])
+            repaired = Conversation([*messages, repair])
+            # Keep the compaction state so its summary is still saved on exit.
+            repaired._compaction = handle.conversation._compaction
+            handle.conversation = repaired
     if exc is None:
         await cm.__aexit__(None, None, None)
     else:

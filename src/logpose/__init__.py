@@ -54,6 +54,7 @@ from logpose.cancellation import ToolDeadlineHandle, current_tool_deadline
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     AuthError,
+    ContextOverflowError,
     LogposeError,
     MaxIterationsError,
     OutputRefusalError,
@@ -171,6 +172,7 @@ __all__ = [
     # errors
     "LogposeError",
     "AuthError",
+    "ContextOverflowError",
     "ProviderError",
     "SessionBusyError",
     "SessionHandle",

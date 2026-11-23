@@ -182,8 +182,14 @@ def test_fake_provider_satisfies_the_provider_protocol() -> None:
 
 async def test_request_carries_history_system_and_tool_specs() -> None:
     provider = FakeProvider([ScriptedTurn.text("hi")])
+    # context_policy=None: the exact app tool list, without the built-in recall tool.
     agent = Agent(
-        provider, model="test-model", system="Be terse.", tools=[add, shout], max_tokens=512
+        provider,
+        model="test-model",
+        system="Be terse.",
+        tools=[add, shout],
+        max_tokens=512,
+        context_policy=None,
     )
 
     await agent.run("hello")
@@ -755,7 +761,9 @@ async def test_unknown_tool_name_reports_the_available_tools() -> None:
             ScriptedTurn.text("ok, no teleporting"),
         ]
     )
-    events = await collect(Agent(provider, model="test-model", tools=[add, shout]), "teleport me")
+    # context_policy=None so the listed tools are exactly the app's own.
+    agent = Agent(provider, model="test-model", tools=[add, shout], context_policy=None)
+    events = await collect(agent, "teleport me")
     result = events[-1].result
 
     block = result.messages[2].content[0]

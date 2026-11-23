@@ -43,8 +43,8 @@ class RuntimeContext:
 class RuntimeEvent:
     """An immutable, metadata-only record of an agent lifecycle operation.
 
-    ``name`` is one of the documented ``run.*``, ``provider.*``, or ``tool.*``
-    event names. Optional fields are populated only where they apply.
+    ``name`` is one of the documented ``run.*``, ``provider.*``, ``tool.*``, or
+    ``context.*`` event names. Optional fields are populated only where they apply.
     """
 
     name: str
@@ -72,6 +72,11 @@ class RuntimeEvent:
     exception_type: str | None = None
     stop_reason: str | None = None
     iterations: int | None = None
+    pointers_applied: int | None = None
+    summarized: bool | None = None
+    estimated_tokens_before: int | None = None
+    estimated_tokens_after: int | None = None
+    input_budget: int | None = None
 
     def log_fields(self) -> dict[str, str | int | float | bool | None]:
         """Return primitive, namespaced fields safe to attach to a LogRecord."""

@@ -923,6 +923,29 @@ async def test_block_exit_repairs_trailing_unanswered_tool_use(db: Path) -> None
     await agent.aclose()
 
 
+async def test_block_exit_repair_keeps_summary_to_save(db: Path) -> None:
+    from logpose.compaction import _CompactionState, fingerprint
+    from logpose.messages import Message, TextBlock, ToolUseBlock
+    from logpose.store.sqlite import SQLiteStore
+
+    agent = Agent(FakeProvider(ScriptedTurn.text("ok")), model="m")
+    async with agent.session("s1") as handle:
+        for text in ("q0", "a0"):
+            role = "user" if text.startswith("q") else "assistant"
+            handle.conversation.append(Message(role=role, content=[TextBlock(text=text)]))
+        handle.conversation._compaction = _CompactionState(
+            summary="S", cut_index=2, fingerprint=fingerprint(handle.conversation.messages[:2])
+        )
+        handle.conversation.append(Message(role="user", content=[TextBlock(text="go")]))
+        handle.conversation.append(
+            Message(role="assistant", content=[ToolUseBlock(id="t9", name="nap", input={})])
+        )
+    _assert_replayable(_stored(db), ["t9"], _ENDED)
+    await agent.aclose()
+    async with SQLiteStore(db) as s:
+        assert await s.load_summary("s1") == (1, "S")
+
+
 def _short_lease(monkeypatch: pytest.MonkeyPatch, ttl: float) -> None:
     import logpose.store.sqlite as sqlite_mod
 

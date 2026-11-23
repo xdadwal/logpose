@@ -31,6 +31,7 @@ __all__ = [
     "OutputValidationError",
     "OutputRefusalError",
     "SessionBusyError",
+    "ContextOverflowError",
 ]
 
 
@@ -46,6 +47,36 @@ class SessionBusyError(LogposeError):
     not saved. Also raised when a run starts on a handle whose lease lapsed while
     idle and was taken by another holder.
     """
+
+
+class ContextOverflowError(LogposeError):
+    """Raised when a request cannot be made to fit the model's context window.
+
+    The built-in context policy raises it before sending, and only when
+    ``context_window`` was passed to the agent explicitly: when, after
+    compaction (or when the summary call failed), the estimated request is
+    still larger than ``context_window − max_tokens``. With the default window
+    nothing is refused before sending. A failed summary call is chained as
+    ``__cause__``.
+
+    Attributes:
+        message: Human-readable description of the failure.
+        estimated_tokens: Calibrated estimate of the request's input tokens.
+        input_budget: The agent's input budget, in tokens.
+    """
+
+    def __init__(self, message: str, *, estimated_tokens: int, input_budget: int) -> None:
+        """Initialize the error.
+
+        Args:
+            message: Human-readable description of the failure.
+            estimated_tokens: Calibrated estimate of the request's input tokens.
+            input_budget: The agent's input budget, in tokens.
+        """
+        super().__init__(message)
+        self.message = message
+        self.estimated_tokens = estimated_tokens
+        self.input_budget = input_budget
 
 
 class AuthError(LogposeError):
