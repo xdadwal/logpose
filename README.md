@@ -985,7 +985,7 @@ What capture stores and scrubs:
   `openai_decision_guard` is not known to the scrubber, although the guard never
   puts it in content. Values shorter than 12 characters (placeholders such as
   `EMPTY` or `ollama` that local servers accept) are not scrubbed, so ordinary
-  words are not mangled.
+  words are not mangled; a real credential that short would be stored as is.
 - `logpose.config.system_prompt_sha256` (a SHA-256 of the system prompt) is
   stored even with capture off. It does not reveal the prompt, but a short or
   guessable system prompt can be confirmed by hashing candidates.
