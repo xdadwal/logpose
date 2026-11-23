@@ -1892,11 +1892,12 @@ class Agent:
         metadata: Mapping[str, str | int | float | bool] | None,
         model: str,
         sink: _SpanSink | None,
-        extra_keys: Sequence[str] = (),
+        extra: Mapping[Any, Any] | None = None,
     ) -> _SpanBuilder:
         """A span builder for one run, or the do-nothing one when tracing is off.
 
-        ``extra_keys`` are the run's merged ``extra`` key names; values are never traced.
+        Only the key names of ``extra`` (the run's merged ``extra``) are traced,
+        never its values.
         """
         if self.tracing is None or sink is None:
             return _NO_TRACE
@@ -1913,7 +1914,7 @@ class Agent:
                 system=self.system,
                 tool_specs=self._specs,
                 secrets=self._trace_secrets(),
-                extra_keys=extra_keys,
+                extra_keys=sorted(str(key) for key in extra or ()),
             )
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
             _TRACE_LOGGER.warning("tracing disabled for run %s: %s", run_id, type(exc).__name__)
@@ -2007,8 +2008,14 @@ class Agent:
         run_stats = stats
         # Resolved first: a model error is the run's own error, not a tracing one.
         model = self._model()
-        extra_keys = sorted(self.extra if run_extra is None else run_extra)
-        trace = self._new_trace(resolved_id, session_id, run_metadata, model, sink, extra_keys)
+        trace = self._new_trace(
+            resolved_id,
+            session_id,
+            run_metadata,
+            model,
+            sink,
+            self.extra if run_extra is None else run_extra,
+        )
         if sink is not None:
             self._track_trace_run(sink, resolved_id)
         trace.start_run()

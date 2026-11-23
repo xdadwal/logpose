@@ -410,6 +410,68 @@ async def test_session_runs_carry_extra_and_do_not_persist_it(
         manager.reset_stores_for_tests()
 
 
+@pytest.mark.usefixtures("memory_spans")
+@pytest.mark.parametrize("traced", [False, True])
+async def test_mixed_key_agent_extra_still_runs(traced: bool) -> None:
+    # Agent(extra=) is not validated; a non-str key must not break a run (traced or not).
+    provider = FakeProvider([ScriptedTurn.text("hi")], repeat_last=True)
+    tracing = Tracing() if traced else None
+    agent = Agent(provider, model="m", extra={1: "x", "a": 2}, tracing=tracing)  # type: ignore[dict-item]
+    result = await agent.run("hi")
+    assert result.text == "hi"
+    assert provider.last_request.extra == {1: "x", "a": 2}
+    await agent.run("hi", extra={"b": 3})
+    assert provider.last_request.extra == {1: "x", "a": 2, "b": 3}
+    if traced:
+        roots = [
+            s
+            for s in _spans(agent)
+            if s.attributes.get(sc.GEN_AI_OPERATION_NAME) == sc.OPERATION_INVOKE_AGENT
+        ]
+        assert roots[-1].attributes[sc.LOGPOSE_REQUEST_EXTRA_KEYS] == ["1", "a", "b"]
+
+
+async def test_context_length_retry_carries_merged_extra() -> None:
+    from logpose.errors import ProviderError
+    from tests.test_compaction import CONTEXT_ERROR, chat_history, is_summary_call
+
+    rejection = ProviderError(CONTEXT_ERROR, status_code=400)
+    provider = FakeProvider(
+        [ScriptedTurn.failure(rejection), ScriptedTurn.text("S"), ScriptedTurn.text("ok")]
+    )
+    agent = Agent(provider, model="m", extra={"temperature": 0.1})
+    conv = Conversation(chat_history(4))
+    result = await agent.run(
+        "latest", conversation=conv, extra={"safety_identifier": "h", "tool_choice": "auto"}
+    )
+    assert result.text == "ok"
+    first, summary, retried = provider.requests
+    merged = {"temperature": 0.1, "safety_identifier": "h", "tool_choice": "auto"}
+    assert first.extra == merged
+    assert retried.extra == merged
+    assert is_summary_call(summary)
+    assert summary.extra == {"temperature": 0.1, "safety_identifier": "h"}
+
+
+async def test_parallel_guardrail_first_turn_carries_merged_extra() -> None:
+    async def slow_allow(inp: GuardrailInput) -> GuardrailVerdict:
+        await asyncio.sleep(0.05)
+        return GuardrailVerdict.allow()
+
+    provider = FakeProvider([ScriptedTurn.text("hi")])
+    agent = Agent(
+        provider,
+        model="m",
+        extra={"a": 1},
+        input_guardrails=[slow_allow],
+        guardrail_mode="parallel",
+    )
+    result = await agent.run("hello", extra={"c": 4})
+    assert result.guardrail is None
+    assert provider.call_count == 1
+    assert provider.requests[0].extra == {"a": 1, "c": 4}
+
+
 # ---------------------------------------------------------------------------
 # sync facade
 # ---------------------------------------------------------------------------
