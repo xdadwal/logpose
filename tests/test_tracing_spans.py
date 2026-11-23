@@ -946,3 +946,87 @@ async def test_system_prompt_hash_only_with_a_system_prompt() -> None:
     )
     await prompted.run("hi")
     assert len(root(spans_of(prompted)).attributes[cfg]) == 64
+
+
+async def test_block_exit_closing_a_suspended_stream_ends_its_trace_cancelled(db: Path) -> None:
+    from logpose.agent import _ACTIVE_RUN_IDS
+    from logpose.events import ToolCall
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("add", {"a": 1, "b": 2}, id="c1")), ScriptedTurn.text("3")]
+    )
+    agent = Agent(provider, model="m", tools=[add], tracing=Tracing())
+    async with agent.session("s1") as handle:
+        events = agent.stream("go", session=handle, run_id="held-1")
+        async for event in events:
+            if isinstance(event, ToolCall):
+                break
+        assert "held-1" in _ACTIVE_RUN_IDS
+        # Left suspended after the ToolCall: the block exit closes it before saving.
+    assert "held-1" not in _ACTIVE_RUN_IDS
+    assert _rows(db, "SELECT run_id, outcome FROM logpose_runs") == [("held-1", "cancelled")]
+    spans = spans_of(agent)
+    top = root(spans)
+    assert top.attributes[sc.LOGPOSE_RUN_OUTCOME] == "cancelled"
+    assert top.session_id == "s1"
+    assert all(s.run_id == "held-1" for s in spans)
+    with pytest.raises(LogposeError, match="run_id"):
+        await agent.run("again", session_id="s1", run_id="held-1")
+    await agent.aclose()
+
+
+async def test_unsupported_content_block_has_a_guardrail_span() -> None:
+    from logpose.messages import RawBlock
+
+    def guard(inp: GuardrailInput) -> GuardrailVerdict:
+        return GuardrailVerdict.allow()
+
+    provider = FakeProvider(ScriptedTurn.text("never"))
+    agent = Agent(provider, model="m", input_guardrails=[guard], tracing=Tracing())
+    prompt = Message(
+        role="user",
+        content=[TextBlock(text="look"), RawBlock(data={"type": "image"})],
+    )
+    result = await agent.run(prompt)
+    assert result.guardrail is not None and result.guardrail.guard == "content_check"
+    spans = spans_of(agent)
+    (guard_span,) = named(spans, sc.SPAN_GUARDRAIL)
+    assert guard_span.attributes[sc.LOGPOSE_GUARDRAIL_NAME] == "content_check"
+    assert guard_span.attributes[sc.LOGPOSE_GUARDRAIL_ALLOWED] is False
+    assert guard_span.attributes[sc.LOGPOSE_GUARDRAIL_CATEGORY] == "error"
+    assert guard_span.parent_span_id == root(spans).span_id
+    assert root(spans).attributes[sc.LOGPOSE_RUN_OUTCOME] == "blocked"
+
+
+async def test_summarizing_is_an_event_on_the_compaction_span() -> None:
+    from tests.test_compaction import chat_history
+
+    provider = FakeProvider([ScriptedTurn.text("SUMMARY-ONE"), ScriptedTurn.text("answer")])
+    agent = Agent(provider, model="m", context_budget=2_000, tracing=Tracing())
+    await agent.run("latest question", conversation=Conversation(chat_history(10)))
+    spans = spans_of(agent)
+    (compaction,) = named(spans, sc.SPAN_COMPACTION)
+    (event,) = [e for e in compaction.events if e["name"] == sc.EVENT_SUMMARIZING]
+    assert event["attributes"][sc.LOGPOSE_COMPACTION_ESTIMATE_BEFORE] > 0
+    assert event["attributes"][sc.LOGPOSE_COMPACTION_BUDGET] == agent.input_budget
+    summary_chat = next(
+        s for s in by_op(spans, "chat") if s.attributes.get(sc.LOGPOSE_CHAT_PURPOSE) == "summary"
+    )
+    assert compaction.start_ns <= event["time_unix_nano"] <= summary_chat.start_ns
+
+
+def test_store_without_span_methods_disables_tracing_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from logpose.store import manager
+
+    class Bare:
+        pass
+
+    manager._NO_SPAN_STORE_WARNED = False
+    with caplog.at_level(logging.WARNING, logger="logpose.store"):
+        assert manager.span_writer(Bare()) is None  # type: ignore[arg-type]
+        assert manager.span_writer(Bare()) is None  # type: ignore[arg-type]
+    assert [r.getMessage() for r in caplog.records].count(
+        "session store Bare does not implement SpanStore; tracing is disabled"
+    ) == 1

@@ -690,8 +690,21 @@ class _SpanBuilder:
         after: int,
         budget: int,
         summary: str | None,
+        summarizing_ns: int | None = None,
     ) -> None:
         span = self._open_span(sc.SPAN_COMPACTION, KIND_INTERNAL, start_ns=start_ns)
+        if summarizing_ns is not None:
+            # The ``context.summarizing`` runtime event: when the summary call began.
+            span.events.append(
+                {
+                    "name": sc.EVENT_SUMMARIZING,
+                    "time_unix_nano": summarizing_ns,
+                    "attributes": {
+                        sc.LOGPOSE_COMPACTION_ESTIMATE_BEFORE: before,
+                        sc.LOGPOSE_COMPACTION_BUDGET: budget,
+                    },
+                }
+            )
         span.attributes.update(
             {
                 sc.LOGPOSE_COMPACTION_POINTERS: pointers,

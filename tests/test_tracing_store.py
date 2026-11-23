@@ -262,3 +262,15 @@ async def test_json_round_trip_fidelity(tmp_path: Path) -> None:
     async with SQLiteStore(tmp_path / "t.db") as s:
         await s.write_spans([sp])
         assert (await _read(s))[0].attributes == attrs
+
+
+async def test_purge_expired_spares_a_leased_sessions_spans(tmp_path: Path) -> None:
+    async with SQLiteStore(tmp_path / "t.db") as s:
+        async with s.session("x"):
+            pass
+        await s.write_spans([_span(session="x")])
+        async with s.session("x"):
+            # Past expires_at but leased: its spans stay with it.
+            await s._write([("UPDATE logpose_sessions SET expires_at = 1 WHERE id = 'x'", ())])
+            assert await s.purge_expired() == 0
+            assert [x.span_id for x in await _read(s)] == ["s1"]

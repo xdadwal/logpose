@@ -178,7 +178,11 @@ async def export_traces(
     version = logpose.__version__
     target = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
     target.parent.mkdir(parents=True, exist_ok=True)
+    from logpose.store.base import SpanStore
+
     store = await manager.get_store()
+    if not isinstance(store, SpanStore):
+        raise LogposeError(f"session store {type(store).__name__} does not store spans")
     count = 0
     last_start: int | None = None
     cursor = after

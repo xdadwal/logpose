@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 from logpose.agent import Conversation
 from logpose.compaction import _CompactionState, fingerprint
@@ -16,7 +17,14 @@ from logpose.messages import Message
 if TYPE_CHECKING:  # pragma: no cover
     from logpose.tracing.spans import SpanRecord
 
-__all__ = ["RunRecord", "SessionHandle", "SessionStore", "validate_session_id"]
+__all__ = [
+    "RunRecord",
+    "SessionHandle",
+    "SessionStore",
+    "SpanStore",
+    "SummaryStore",
+    "validate_session_id",
+]
 
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
 
@@ -64,6 +72,12 @@ class SessionHandle:
             index in ``conversation.messages`` are new and are saved on exit.
         next_seq: The stored ``seq`` the first new message will get.
         stored_summary: The latest stored summary as ``(upto_seq, text)``, if any.
+        idle_since: ``time.monotonic()`` when the handle last went idle (opened,
+            or a run on it ended), or ``None`` while a run is in progress. The
+            store stops renewing a lease idle for longer than three lease TTLs.
+        lapsed: True once renewal stopped because the handle sat idle; the
+            lease then expires on its own. A new run on the handle first tries
+            to take the lease back (see ``revive``).
 
     Stored messages are append-only from ``seq`` 0 with no gaps, so a loaded
     message's ``seq`` equals its index in ``conversation.messages``. A summary's
@@ -93,10 +107,22 @@ class SessionHandle:
         self.loaded_count = loaded_count
         self.next_seq = next_seq
         self.stored_summary = stored_summary
-        if stored_summary is not None and next_seq == loaded_count:
+        self.idle_since: float | None = time.monotonic()
+        self.lapsed = False
+        # Set by the store: re-extend a lapsed lease if its stored token is still
+        # this holder's, and resume renewal. Returns False (and marks the handle
+        # lost) if another holder took the lease meanwhile.
+        self.revive: Callable[[], Awaitable[bool]] | None = None
+        self._seed_summary()
+
+    def _seed_summary(self) -> None:
+        """Seed the conversation's compaction state from ``stored_summary`` if it fits."""
+        stored_summary = self.stored_summary
+        conversation = self.conversation
+        if stored_summary is not None and self.next_seq == self.loaded_count:
             upto_seq, text = stored_summary
             cut = upto_seq + 1
-            if 0 < cut <= loaded_count:
+            if 0 < cut <= self.loaded_count:
                 conversation._compaction = _CompactionState(
                     summary=text,
                     cut_index=cut,
@@ -144,13 +170,34 @@ class SessionStore(Protocol):
 
     async def record_run(self, record: RunRecord) -> None: ...
 
+    async def delete_session(self, session_id: str) -> None: ...
+
+    async def purge_expired(self, now_ms: int | None = None) -> int: ...
+
+    async def run_id_exists(self, run_id: str) -> bool: ...
+
+
+@runtime_checkable
+class SummaryStore(Protocol):
+    """Optional extra a :class:`SessionStore` may implement: direct summary access.
+
+    The session path persists summaries through :class:`SessionHandle`
+    (``stored_summary`` and :meth:`SessionHandle.summary_to_save`), so a custom
+    store need not implement these. The SQLite store does.
+    """
+
     async def save_summary(self, session_id: str, upto_seq: int, text: str) -> None: ...
 
     async def load_summary(self, session_id: str) -> tuple[int, str] | None: ...
 
-    async def delete_session(self, session_id: str) -> None: ...
 
-    async def purge_expired(self, now_ms: int | None = None) -> int: ...
+@runtime_checkable
+class SpanStore(Protocol):
+    """Optional extra a :class:`SessionStore` may implement: stored trace spans.
+
+    A store without these methods runs sessions normally with tracing disabled
+    (logged once at WARNING). The SQLite store implements them.
+    """
 
     async def write_spans(self, spans: Sequence[SpanRecord]) -> None: ...
 
@@ -173,5 +220,3 @@ class SessionStore(Protocol):
     ) -> AsyncIterator[tuple[int, SpanRecord]]: ...
 
     async def purge_spans(self, older_than_ms: int) -> int: ...
-
-    async def run_id_exists(self, run_id: str) -> bool: ...

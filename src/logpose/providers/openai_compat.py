@@ -225,7 +225,8 @@ def _messages_to_wire(
 
     for message in messages:
         tool_results = [b for b in message.content if isinstance(b, ToolResultBlock)]
-        text = "".join(b.text for b in message.content if isinstance(b, TextBlock))
+        # Message.text: input guardrails screen this same string (guard_text).
+        text = message.text
         tool_uses = [b for b in message.content if isinstance(b, ToolUseBlock)]
 
         # Tool results are their own role and must precede any further user text.
@@ -327,6 +328,9 @@ def _env(name: str) -> str | None:
     """Read an environment variable, treating blank values as unset."""
     value = os.environ.get(name, "").strip()
     return value or None
+
+
+_CEILING_FIELDS = frozenset({"max_tokens", "max_completion_tokens"})
 
 
 class OpenAICompatProvider:
@@ -591,7 +595,6 @@ class OpenAICompatProvider:
             "messages": _messages_to_wire(
                 req.messages, req.system, preserve_reasoning=self.preserve_reasoning
             ),
-            self.max_tokens_field: req.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -602,8 +605,13 @@ class OpenAICompatProvider:
                 "response_format is set both in the provider's extra_body and on the request. "
                 "Remove one; structured output owns response_format."
             )
-        body.update(self._extra_body)
-        body.update(req.extra)
+        # The caller's ceiling field, if any, replaces ours entirely: sending both
+        # lets servers pick one (vLLM prefers max_completion_tokens) and OpenAI
+        # reasoning models reject max_tokens outright.
+        overrides = {**self._extra_body, **req.extra}
+        if not _CEILING_FIELDS.intersection(overrides):
+            body[self.max_tokens_field] = req.max_tokens
+        body.update(overrides)
         return body
 
     # -- streaming ----------------------------------------------------------

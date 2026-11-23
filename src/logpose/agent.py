@@ -83,6 +83,7 @@ import os
 import re
 import time
 import traceback
+import weakref
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -102,7 +103,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from logpose.cancellation import (
     ToolDeadlineHandle,
@@ -122,7 +123,10 @@ from logpose.compaction import (
     message_chars,
     overhead_chars,
     render_transcript,
+    summary_char_limit,
     summary_message,
+    summary_word_limit,
+    truncate_summary,
     turn_starts,
 )
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
@@ -135,6 +139,7 @@ from logpose.errors import (
     OutputValidationError,
     ProviderError,
     RunTimeoutError,
+    SessionBusyError,
     StructuredOutputUnsupportedError,
     ToolExecutionError,
 )
@@ -153,6 +158,7 @@ from logpose.guardrails import (
     GuardrailResult,
     GuardrailVerdict,
     InputGuardrail,
+    _has_unsupported_content,
     guard_text,
 )
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
@@ -279,8 +285,12 @@ TRACE_MIN_WAIT = 0.25
 and the ``run_id`` check together (its budget is ``max(flush_timeout, this)``), so
 ``flush_timeout=0`` does not leave every first run untraced."""
 
-SESSION_EXIT_TIMEOUT = 5.0
-"""Seconds a session run's exit (record the run, save, release) may take once shielded."""
+SESSION_EXIT_TIMEOUT = 8.0
+"""Seconds a session run's exit (record the run, save, release) may take once shielded.
+
+Longer than the store's 5-second SQLite ``busy_timeout``, so one wait on a busy
+database cannot use up the whole exit.
+"""
 
 _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
 _TRACE_LOGGER = logging.getLogger("logpose.trace")
@@ -497,7 +507,7 @@ class Conversation:
             ``{"version": 1, "messages": [...]}`` as a JSON string; lossless for
             every content block type.
         """
-        messages = [m.model_dump() for m in self.messages]
+        messages = [m.model_dump(mode="json") for m in self.messages]
         return json.dumps({"version": _CONVERSATION_JSON_VERSION, "messages": messages})
 
     @classmethod
@@ -511,13 +521,23 @@ class Conversation:
             A new :class:`Conversation`.
 
         Raises:
-            LogposeError: If the document's ``version`` is not supported.
+            LogposeError: If the document is not valid JSON, its ``version`` is
+                not supported, or its messages are malformed.
         """
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise LogposeError(f"conversation JSON is not valid JSON: {exc}") from None
         version = data.get("version") if isinstance(data, dict) else None
         if version != _CONVERSATION_JSON_VERSION:
             raise LogposeError(f"unsupported conversation JSON version: {version!r}")
-        return cls(Message.model_validate(m) for m in data["messages"])
+        raw = data.get("messages")
+        if not isinstance(raw, list):
+            raise LogposeError("conversation JSON must have a 'messages' list")
+        try:
+            return cls(Message.model_validate(m) for m in raw)
+        except ValidationError as exc:
+            raise LogposeError(f"conversation JSON has a malformed message: {exc}") from None
 
     @property
     def text(self) -> str:
@@ -585,7 +605,7 @@ class Agent:
         output_type: type[BaseModel] | None = None,
         output_retries: int = 1,
         session_wait: float = 0.0,
-        context_window: int = DEFAULT_CONTEXT_WINDOW,
+        context_window: int | None = None,
         context_budget: int | None = DEFAULT_CONTEXT_BUDGET,
         compaction_threshold: float = DEFAULT_COMPACTION_THRESHOLD,
         compaction_target: float = DEFAULT_COMPACTION_TARGET,
@@ -670,10 +690,15 @@ class Agent:
                 final answer fails validation (default 1). ``0`` fails at once.
             session_wait: Seconds to keep retrying a busy session's lease before
                 raising :class:`~logpose.errors.SessionBusyError` (default 0).
-            context_window: The model's total context window in tokens
-                (default 128,000).
+            context_window: The model's total context window in tokens. When
+                set, a request estimated above ``context_window - max_tokens``
+                is refused before it is sent. When omitted, 128,000 is assumed
+                for the budget, nothing is refused before sending, and the
+                provider's own context-length error triggers the reactive retry.
             context_budget: Cap on input tokens per request (default 32,000), or
-                ``None`` for no cap beyond the window.
+                ``None`` for no cap beyond the window. On a large-window model
+                raise it to keep more conversation verbatim: the default still
+                summarizes at about 27,000 estimated tokens.
             compaction_threshold: Fraction of the input budget at which the
                 built-in policy summarizes older turns (default 0.85).
             compaction_target: Fraction of the input budget it summarizes down
@@ -801,6 +826,9 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        self._window_explicit = context_window is not None
+        if context_window is None:
+            context_window = DEFAULT_CONTEXT_WINDOW
         _check_positive_int("context_window", context_window)
         if context_budget is not None:
             _check_positive_int("context_budget", context_budget)
@@ -1126,7 +1154,9 @@ class Agent:
             self._active_store(session)
             if first is None and not session.conversation.messages:
                 raise LogposeError("Nothing to send: pass a prompt, or a session with history.")
-            return self._session_loop(
+            from logpose.store import manager
+
+            stream = self._session_loop(
                 first,
                 resolved_type,
                 resolved_retries,
@@ -1134,6 +1164,10 @@ class Agent:
                 run_id=run_id,
                 run_metadata=run_metadata,
             )
+            # Registered so the block can close it before saving: a stream left
+            # suspended mid-run must answer its tool calls before the history is stored.
+            manager._STREAMS.setdefault(session, weakref.WeakSet()).add(stream)
+            return stream
         if first is None and not (conversation is not None and conversation.messages):
             raise LogposeError(
                 "Nothing to send: pass a prompt, or a conversation that already has messages."
@@ -1218,7 +1252,11 @@ class Agent:
         if not isinstance(older_than, timedelta) or older_than < timedelta(0):
             raise LogposeError(f"older_than must be a non-negative timedelta, got {older_than!r}.")
         cutoff_ms = int(time.time() * 1000) - older_than // timedelta(milliseconds=1)
+        from logpose.store.base import SpanStore
+
         store = await self._store()
+        if not isinstance(store, SpanStore):
+            return 0  # tracing is disabled for a store without spans
         return await store.purge_spans(cutoff_ms)
 
     async def delete_session(self, session_id: str) -> None:
@@ -1334,6 +1372,22 @@ class Agent:
             # Checked again: another run may have started on it meanwhile.
             self._active_store(handle)
         manager._RUNNING.add(handle)
+        handle.idle_since = None
+        if handle.lapsed:
+            # The block sat idle and stopped renewing: take the lease back if it is
+            # still ours, else the session moved on and this run must not start.
+            revived = False
+            try:
+                revived = handle.revive is not None and await handle.revive()
+            finally:
+                if not revived:
+                    manager._RUNNING.discard(handle)
+                    handle.idle_since = monotonic()
+            if not revived:
+                raise SessionBusyError(
+                    f"lease on session {handle.id!r} lapsed while its block sat idle "
+                    "and was taken elsewhere; open a new session block"
+                )
         stats = _RunStats(metadata=run_metadata)
         started_ms = _now_ms()
         run_end: RunEnd | None = None
@@ -1362,10 +1416,12 @@ class Agent:
                 await _aclose(inner)
         except BaseException as exc:
             manager._RUNNING.discard(handle)
+            handle.idle_since = monotonic()
             work = self._end_session_run(store, handle, cm, stats, started_ms, exc)
             await _finish_session(work, exc, claim)
             raise
         manager._RUNNING.discard(handle)
+        handle.idle_since = monotonic()
         blocked = run_end is not None and run_end.result.guardrail is not None
         await _finish_session(
             self._end_session_run(store, handle, cm, stats, started_ms, None, blocked=blocked),
@@ -2072,7 +2128,12 @@ class Agent:
 
         try:
             guard_input: GuardrailInput | None = None
-            if prompt is not None and self.input_guardrails and guard_text(prompt):
+            if (
+                prompt is not None
+                and self.input_guardrails
+                # Non-text content is screened too: the content check blocks it.
+                and (guard_text(prompt) or _has_unsupported_content(prompt))
+            ):
                 guard_input = GuardrailInput(
                     message=prompt,
                     recent=_recent_text(history),
@@ -2168,6 +2229,12 @@ class Agent:
                         if blocked is not None:
                             producer.cancel()
                             await asyncio.gather(producer, return_exceptions=True)
+                            # A turn that finished before the verdict spent
+                            # main-model tokens: count them.
+                            while not buffer.empty():
+                                held = buffer.get_nowait()
+                                if isinstance(held, _TurnDone) and held.done is not None:
+                                    add_usage(held.done.usage)
                             drop_unvetted()
                             self.last_context_diagnostics = diagnostics
                             for item in blocked_end(blocked, reply):
@@ -2386,11 +2453,17 @@ class Agent:
         async_guards = [g for g in self.input_guardrails if tiers != "sync" and _is_async_guard(g)]
 
         def decide(
-            guard: InputGuardrail, verdict: object, error: BaseException | None, began: float
+            name: str, verdict: object, error: BaseException | None, began: float
         ) -> tuple[GuardrailResult, str] | None:
-            name = _guard_name(guard)
             if error is None and not isinstance(verdict, GuardrailVerdict):
                 error = TypeError(f"guard returned {type(verdict).__name__}")
+            if (
+                error is None
+                and isinstance(verdict, GuardrailVerdict)
+                and not isinstance(verdict.allowed, bool)
+            ):
+                # A truthy non-bool such as "false" must never allow.
+                error = TypeError("guard verdict's allowed is not a bool")
             if error is not None:
                 verdict = GuardrailVerdict.block(
                     "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(error).__name__}"
@@ -2439,6 +2512,21 @@ class Agent:
             )
             return result, verdict.reply or GUARDRAIL_ERROR_REPLY
 
+        if tiers != "async" and _has_unsupported_content(inp.message):
+            # Guards are text-only: content they cannot see is blocked before
+            # any guard runs, never sent unscreened. Decided (event) only when
+            # it blocks, so allowed runs report just the configured guards.
+            blocked = decide(
+                "content_check",
+                GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason="unsupported content"
+                ),
+                None,
+                monotonic(),
+            )
+            assert blocked is not None
+            return blocked
+
         for guard in sync_guards:
             began = monotonic()
             verdict: object = None
@@ -2449,7 +2537,7 @@ class Agent:
                     verdict = await verdict
             except Exception as exc:  # noqa: BLE001 - a raising guard is a block
                 error = exc
-            blocked = decide(guard, verdict, error, began)
+            blocked = decide(_guard_name(guard), verdict, error, began)
             if blocked is not None:
                 return blocked
 
@@ -2473,7 +2561,7 @@ class Agent:
                         asyncio.CancelledError() if task.cancelled() else task.exception()
                     )
                     value = None if failure is not None else task.result()
-                    outcome = decide(guard, value, failure, began)
+                    outcome = decide(_guard_name(guard), value, failure, began)
                     if winner is None:
                         winner = outcome
                 if winner is not None:
@@ -2839,12 +2927,20 @@ class Agent:
         current estimate (the provider just rejected that request, so the
         estimate itself is too high a target).
 
+        Without ``force``, no summary is made when the kept part alone (system
+        prompt, tool schemas, pinned first turn and the turns after the best
+        cut) already reaches the target: no summary can get the request under
+        it, and one would be made again on every later run.
+
+        Estimates leave out reasoning blocks unless the provider re-sends them
+        (its ``preserve_reasoning`` attribute is true).
+
         Returns:
             The request to send and its raw token estimate.
 
         Raises:
-            ContextOverflowError: If the request cannot be made to fit the
-                window (``context_window − max_tokens``).
+            ContextOverflowError: If ``context_window`` was set and the request
+                cannot be made to fit ``context_window − max_tokens``.
         """
         started_ns = time.time_ns()
         messages = request.messages
@@ -2855,6 +2951,8 @@ class Agent:
                 messages, current_start=current_start, min_chars=self.pointer_min_chars
             )
         system, tools = request.system, request.tools
+        # Reasoning text counts only if the provider actually re-sends it.
+        reasoning = bool(getattr(self.provider, "preserve_reasoning", False))
 
         def calibrated(raw: int) -> int:
             return math.ceil(raw * state.ratio)
@@ -2862,9 +2960,15 @@ class Agent:
         def compose(summary: str, cut: int) -> list[Message]:
             return [*messages[: first + 1], summary_message(summary), *messages[cut:]]
 
-        raw = estimate_tokens(messages, system, tools)
+        def estimate(sent: Sequence[Message]) -> int:
+            return estimate_tokens(sent, system, tools, reasoning=reasoning)
+
+        raw = estimate(messages)
         before = calibrated(raw)
         window = self.context_window - self._max_tokens()
+        # The default window is a guess: with it, nothing is refused before
+        # sending; the provider's own context-length error drives the retry.
+        refuse = self._window_explicit
         starts = turn_starts(messages)
         first = starts[0] if starts else -1
 
@@ -2880,32 +2984,41 @@ class Agent:
         sent = messages
         if state.summary is not None:
             sent = compose(state.summary, state.cut_index)
-            raw = estimate_tokens(sent, system, tools)
+            raw = estimate(sent)
         attempted = False
+        summarizing_ns: int | None = None
 
         if (
             (force or calibrated(raw) >= self.compaction_threshold * self.input_budget)
             and first >= 0
             and not run_state.summary_failed
+            # After failed summaries, back off by caller turns (unless forced).
+            and (force or state.may_summarize(len(starts)))
         ):
             # The span must be non-empty and must end at or before the current
             # run's own first message, which is always sent verbatim.
             lower = state.cut_index if state.summary is not None else first + 1
             upper = len(messages) if current_start is None else current_start
             candidates = [index for index in starts if lower < index <= upper]
+            summarize = False
             if candidates:
-                prefix_chars = sum(message_chars(m) + 2 for m in messages[: first + 1])
+                prefix_chars = sum(
+                    message_chars(m, reasoning=reasoning) + 2 for m in messages[: first + 1]
+                )
                 placeholder = message_chars(summary_message(state.summary or "")) + 2
+                target = self.compaction_target * min(
+                    self.input_budget, calibrated(raw) if force else self.input_budget
+                )
                 cut = choose_cut(
                     messages,
                     candidates,
                     fixed_chars=prefix_chars + placeholder + overhead_chars(system, tools),
                     ratio=state.ratio,
-                    target_tokens=self.compaction_target
-                    * min(self.input_budget, calibrated(raw) if force else self.input_budget),
+                    target_tokens=target,
+                    reasoning=reasoning,
                 )
-                floor = calibrated(estimate_tokens(compose("", cut), system, tools))
-                if floor > window:
+                floor = calibrated(estimate(compose("", cut)))
+                if floor > window and refuse:
                     # Even an empty summary cannot make this fit: don't pay for one.
                     raise ContextOverflowError(
                         f"The request needs about {floor} input tokens even after "
@@ -2918,7 +3031,18 @@ class Agent:
                     span, previous = messages[state.cut_index : cut], state.summary
                 else:
                     span, previous = messages[first + 1 : cut], None
+                # Unless forced, skip when the kept part alone is at the target:
+                # a summary cannot get under it and would be remade every run.
+                summarize = force or floor < target
+            if summarize:
                 attempted = True
+                summarizing_ns = time.time_ns()
+                self._emit_runtime(
+                    "context.summarizing",
+                    context=context,
+                    estimated_tokens_before=before,
+                    input_budget=self.input_budget,
+                )
                 failure: ProviderError | None = None
                 try:
                     summary = await self._summarize(
@@ -2933,24 +3057,26 @@ class Agent:
                     # fits the window. Not retried again this run: every later
                     # turn would pay for the same failing call.
                     run_state.summary_failed = True
-                    estimate = calibrated(raw)
-                    if estimate > window:
+                    state.summary_failed(len(starts))
+                    needed = calibrated(raw)
+                    if needed > window and refuse:
                         raise ContextOverflowError(
-                            f"The summary call failed and the request (about {estimate} "
+                            f"The summary call failed and the request (about {needed} "
                             f"input tokens) does not fit the {window} the context window "
                             f"leaves (input budget {self.input_budget}).",
-                            estimated_tokens=estimate,
+                            estimated_tokens=needed,
                             input_budget=self.input_budget,
                         ) from failure
                 else:
-                    state.summary = summary
+                    state.summary = truncate_summary(summary, summary_char_limit(self.input_budget))
+                    state.summary_succeeded()
                     state.cut_index = cut
                     state.fingerprint = fingerprint(history[:cut])
-                    sent = compose(summary, cut)
-                    raw = estimate_tokens(sent, system, tools)
+                    sent = compose(state.summary, cut)
+                    raw = estimate(sent)
 
         after = calibrated(raw)
-        if after > window:
+        if after > window and refuse:
             raise ContextOverflowError(
                 f"The request needs about {after} input tokens, more than the {window} "
                 f"the context window leaves (input budget {self.input_budget}).",
@@ -2976,6 +3102,7 @@ class Agent:
                 after=after,
                 budget=self.input_budget,
                 summary=state.summary,
+                summarizing_ns=summarizing_ns,
             )
             self._emit_runtime(
                 "context.compacted",
@@ -3008,10 +3135,13 @@ class Agent:
         caller bounds it by the run deadline; each attempt is also bounded by
         the provider turn timeout.
 
-        Its output ceiling is the larger of :data:`SUMMARY_MAX_TOKENS` and the
-        agent's per-turn ``max_tokens``: a reasoning model spends output tokens
-        thinking before it writes, and the per-turn ceiling is already sized
-        for that and already fits the window.
+        Its output ceiling is the larger of
+        :data:`~logpose.compaction.SUMMARY_MAX_TOKENS` and the agent's per-turn
+        ``max_tokens``: a reasoning model spends output tokens thinking before
+        it writes. The summary's length is bounded instead by the request
+        (a word limit from :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION`
+        of the input budget) and by truncation in the caller. Text from a
+        response cut off at ``max_tokens`` is still used (truncated likewise).
 
         Returns:
             The summary text, or ``None`` if the model answered with no text
@@ -3020,10 +3150,11 @@ class Agent:
         Raises:
             ProviderError: If every allowed attempt failed.
         """
+        transcript = render_transcript(
+            span, previous, max_words=summary_word_limit(self.input_budget)
+        )
         request = CompletionRequest(
-            messages=[
-                Message(role="user", content=[TextBlock(text=render_transcript(span, previous))])
-            ],
+            messages=[Message(role="user", content=[TextBlock(text=transcript)])],
             model=self._model(),
             max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
             system=SUMMARY_INSTRUCTION,
@@ -3772,10 +3903,33 @@ async def _exit_session(
     cm: AbstractAsyncContextManager[SessionHandle],
     exc: BaseException | None,
 ) -> None:
-    """Leave a store session block: save new messages and release the lease."""
+    """Leave a store session block: save new messages and release the lease.
+
+    Streams still open on the handle are closed first, so a run suspended after
+    a ``ToolCall`` answers its calls and writes its run record before the save.
+    Any tool call still unanswered at the end of the history (a stream that
+    could not be closed because it is running elsewhere) then gets an error
+    result, so the stored session stays replayable.
+    """
     from logpose.store import manager
 
     manager._ACTIVE_HANDLES.pop(handle, None)
+    for stream in list(manager._STREAMS.pop(handle, ())):
+        try:
+            await _aclose(stream)
+        except Exception as error:  # noqa: BLE001 - the save must still happen
+            _RUNTIME_LOGGER.warning("closing a session stream failed: %s", type(error).__name__)
+    messages = handle.conversation.messages
+    if messages and messages[-1].role == "assistant":
+        calls = [b for b in messages[-1].content if isinstance(b, ToolUseBlock)]
+        if calls:
+            # A copy: a run still going in another task keeps appending to the old
+            # list (and answers these calls itself); only the saved history changes.
+            repair = _error_results(calls, "Run ended before this tool finished.")
+            repaired = Conversation([*messages, repair])
+            # Keep the compaction state so its summary is still saved on exit.
+            repaired._compaction = handle.conversation._compaction
+            handle.conversation = repaired
     if exc is None:
         await cm.__aexit__(None, None, None)
     else:

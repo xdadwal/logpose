@@ -25,9 +25,9 @@ import os
 import threading
 import warnings
 import weakref
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:  # pragma: no cover
     from logpose.store.base import SessionHandle, SessionStore
@@ -79,6 +79,10 @@ _ACTIVE_HANDLES: weakref.WeakKeyDictionary[SessionHandle, SessionStore] = (
 )
 # Handles with a run in flight; one run at a time per handle.
 _RUNNING: weakref.WeakSet[SessionHandle] = weakref.WeakSet()
+# Streams started on a block's handle; the block closes them before it saves.
+_STREAMS: weakref.WeakKeyDictionary[SessionHandle, weakref.WeakSet[AsyncIterator[Any]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def db_path() -> Path:
@@ -189,8 +193,27 @@ def store_opening(*, owner: object) -> asyncio.Future[SessionStore]:
     return task
 
 
+_NO_SPAN_STORE_WARNED = False
+
+
 def span_writer(store: SessionStore) -> SpanWriter | None:
-    """Return the span writer owned by ``store``, or ``None`` once it is closed."""
+    """Return the span writer owned by ``store``, or ``None`` once it is closed.
+
+    Also ``None`` for a store that does not implement
+    :class:`~logpose.store.base.SpanStore`: tracing is then disabled, with one
+    WARNING per process.
+    """
+    from logpose.store.base import SpanStore
+
+    if not isinstance(store, SpanStore):
+        global _NO_SPAN_STORE_WARNED
+        if not _NO_SPAN_STORE_WARNED:
+            _NO_SPAN_STORE_WARNED = True
+            _LOGGER.warning(
+                "session store %s does not implement SpanStore; tracing is disabled",
+                type(store).__name__,
+            )
+        return None
     with _GUARD:
         entry = _OPEN.get(cast("SQLiteStore", store))
     return entry.writer if entry is not None else None
@@ -390,5 +413,6 @@ def reset_stores_for_tests() -> None:
         _OPENING.clear()
         _ACTIVE_HANDLES.clear()
         _RUNNING.clear()
+        _STREAMS.clear()
     for store in stores:
         _stop_now(store)  # spans still queued are discarded: tests start clean
