@@ -127,9 +127,10 @@ model is shaped.
      default budget) filled the budget by itself and forced a new summary every
      run. Text from a response cut off at `max_tokens` is used, truncated
      likewise. A response with no text counts as a failed summary.
-     **After a failure** (amended 2026-11-23): not retried within the run, and
-     not attempted again (unless forced by the reactive fallback) until the
-     history has gained a caller turn since the failure. This is kept on the
+     **After a failure** (amended 2026-11-23): not retried within the run.
+     After the k-th consecutive failure, unforced attempts wait for
+     `min(2^(k-1), 16)` new caller turns (1, 2, 4, 8, 16); a successful summary
+     resets the count; the reactive fallback always attempts. This is kept on the
      `Conversation`'s compaction state, not persisted with sessions.
   - **Skip when it cannot help** (amended 2026-11-23): unless forced by the
     reactive fallback, no summary is made when the kept part alone (system,

@@ -66,6 +66,9 @@ SUMMARY_INSTRUCTION = (
 )
 """System prompt for the summary call (the app's own system prompt is not sent)."""
 
+_MAX_FAILURE_WAIT = 16
+"""Most new caller turns to wait before retrying a repeatedly failing summary."""
+
 _SMOOTHING = 0.7
 """Weight the calibration ratio keeps on its old value after each turn."""
 
@@ -88,7 +91,9 @@ class _CompactionState:
         fingerprint: Identifies ``messages[:cut_index]`` the summary was made
             from; a mismatch means the caller edited history.
         failed_turns: Caller turns in the history when a summary call last
-            failed, or ``None``. Unforced attempts wait for a new caller turn.
+            failed, or ``None``.
+        failures: Consecutive failed summary calls. After the k-th, unforced
+            attempts wait for ``min(2 ** (k - 1), 16)`` new caller turns.
     """
 
     ratio: float = 1.0
@@ -96,6 +101,7 @@ class _CompactionState:
     cut_index: int = 0
     fingerprint: str = ""
     failed_turns: int | None = None
+    failures: int = 0
 
     def calibrate(self, reported: int, estimate: int) -> None:
         """Fold one turn's reported input tokens into the ratio.
@@ -110,6 +116,23 @@ class _CompactionState:
         if reported > 0 and estimate > 0:
             ratio = _SMOOTHING * self.ratio + (1 - _SMOOTHING) * (reported / estimate)
             self.ratio = min(RATIO_MAX, max(RATIO_MIN, ratio))
+
+    def may_summarize(self, caller_turns: int) -> bool:
+        """Whether an unforced summary attempt is allowed after earlier failures."""
+        if self.failed_turns is None or self.failures == 0:
+            return True
+        wait = min(2 ** (self.failures - 1), _MAX_FAILURE_WAIT)
+        return caller_turns >= self.failed_turns + wait
+
+    def summary_failed(self, caller_turns: int) -> None:
+        """Record a failed summary call made with ``caller_turns`` caller turns."""
+        self.failed_turns = caller_turns
+        self.failures += 1
+
+    def summary_succeeded(self) -> None:
+        """Reset the failure backoff."""
+        self.failed_turns = None
+        self.failures = 0
 
     def clear_summary(self) -> None:
         """Forget the cached summary and cut point."""

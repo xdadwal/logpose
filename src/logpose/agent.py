@@ -2031,8 +2031,8 @@ class Agent:
             (force or calibrated(raw) >= self.compaction_threshold * self.input_budget)
             and first >= 0
             and not run_state.summary_failed
-            # After a failed summary, wait for a new caller turn (unless forced).
-            and (force or state.failed_turns is None or len(starts) > state.failed_turns)
+            # After failed summaries, back off by caller turns (unless forced).
+            and (force or state.may_summarize(len(starts)))
         ):
             # The span must be non-empty and must end at or before the current
             # run's own first message, which is always sent verbatim.
@@ -2095,7 +2095,7 @@ class Agent:
                     # fits the window. Not retried again this run: every later
                     # turn would pay for the same failing call.
                     run_state.summary_failed = True
-                    state.failed_turns = len(starts)
+                    state.summary_failed(len(starts))
                     needed = calibrated(raw)
                     if needed > window and refuse:
                         raise ContextOverflowError(
@@ -2107,7 +2107,7 @@ class Agent:
                         ) from failure
                 else:
                     state.summary = truncate_summary(summary, summary_char_limit(self.input_budget))
-                    state.failed_turns = None
+                    state.summary_succeeded()
                     state.cut_index = cut
                     state.fingerprint = fingerprint(history[:cut])
                     sent = compose(state.summary, cut)

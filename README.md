@@ -706,8 +706,9 @@ still hits.
 If the summary call fails or returns no text, the request is sent uncompacted when
 it fits the window (`context_window - max_tokens`) or when `context_window` is not
 set; otherwise the run raises `ContextOverflowError`. A failed summary is not
-retried within the same run, nor in later runs until the conversation has a new
-user turn (the reactive retry below still forces one).
+retried within the same run; after repeated failures later runs back off
+exponentially, waiting 1, 2, 4, 8 and at most 16 new user turns between attempts
+(a success resets it; the reactive retry below still forces one).
 If the provider rejects a request with an HTTP 400 that mentions the context length
 (`context_length`, `maximum context length`, `context window`, `context size`,
 `context length` or `exceed_context`, covering OpenAI-style servers, vLLM,

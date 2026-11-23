@@ -66,8 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   character and leave out reasoning the provider does not re-send. The summary
   is bounded to 15% of the input budget (a stated word limit plus truncation)
   while its call keeps the agent's `max_tokens` (at least 2,048) as room for
-  reasoning; after a failed summary, no new attempt is made until a new caller
-  turn arrives; no summary is made when it cannot get the request
+  reasoning; failed summaries back off exponentially (1, 2, 4 … at most 16 new
+  caller turns between attempts); no summary is made when it cannot get the request
   under the target (large pinned first turn, system prompt or tool schemas), and
   the summarizer treats the transcript as data, not instructions. Optional
   `SummaryStore` protocol for direct summary access (`SessionStore` does not

@@ -1653,3 +1653,41 @@ async def test_forced_retry_attempts_despite_earlier_failure() -> None:
     result = await agent.run(conversation=conv)
     assert result.text == "ok"
     assert sum(is_summary_call(r) for r in provider.requests) == 2
+
+
+class _FailingSummarizer(FakeProvider):
+    """Every summary call answers with no text; every turn answers "ok"."""
+
+    def _turn_for(self, index: int) -> ScriptedTurn:
+        return ScriptedTurn.text("ok")
+
+    async def stream(self, req: CompletionRequest):  # type: ignore[override]
+        if is_summary_call(req):
+            self.requests.append(req)
+            yield ScriptedTurn.text("", stop_reason="max_tokens").completion()
+            return
+        async for event in super().stream(req):
+            yield event
+
+
+async def test_failing_summarizer_backs_off_exponentially() -> None:
+    provider = _FailingSummarizer()
+    agent = Agent(provider, model="test-model", context_budget=2_000)
+    conv = Conversation(chat_history(10))
+    attempts_at: list[int] = []
+    for turn in range(20):
+        before = sum(is_summary_call(r) for r in provider.requests)
+        await agent.run(f"q{turn}", conversation=conv)
+        if sum(is_summary_call(r) for r in provider.requests) > before:
+            attempts_at.append(turn)
+    # Waits of 1, 2, 4, 8 new caller turns after consecutive failures.
+    assert attempts_at[:5] == [0, 1, 3, 7, 15]
+    assert len(attempts_at) <= 6
+
+
+async def test_successful_summary_resets_backoff() -> None:
+    from logpose.compaction import _CompactionState
+
+    state = _CompactionState(failed_turns=5, failures=3)
+    state.summary_succeeded()
+    assert state.failures == 0 and state.failed_turns is None
