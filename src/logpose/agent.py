@@ -980,11 +980,6 @@ class Agent:
             )
         if handle in manager._RUNNING:
             raise LogposeError(f"Session {handle.id!r} already has a run in progress.")
-        if handle.lapsed:
-            raise SessionBusyError(
-                f"lease on session {handle.id!r} lapsed after its block sat idle; "
-                "open a new session block"
-            )
         return store
 
     async def _session_loop(
@@ -1022,6 +1017,21 @@ class Agent:
             store = self._active_store(handle)
         manager._RUNNING.add(handle)
         handle.idle_since = None
+        if handle.lapsed:
+            # The block sat idle and stopped renewing: take the lease back if it is
+            # still ours, else the session moved on and this run must not start.
+            revived = False
+            try:
+                revived = handle.revive is not None and await handle.revive()
+            finally:
+                if not revived:
+                    manager._RUNNING.discard(handle)
+                    handle.idle_since = monotonic()
+            if not revived:
+                raise SessionBusyError(
+                    f"lease on session {handle.id!r} lapsed while its block sat idle "
+                    "and was taken elsewhere; open a new session block"
+                )
         stats = _RunStats()
         started_ms = _now_ms()
         run_end: RunEnd | None = None
@@ -2182,7 +2192,10 @@ async def _exit_session(
     if messages and messages[-1].role == "assistant":
         calls = [b for b in messages[-1].content if isinstance(b, ToolUseBlock)]
         if calls:
-            messages.append(_error_results(calls, "Run ended before this tool finished."))
+            # A copy: a run still going in another task keeps appending to the old
+            # list (and answers these calls itself); only the saved history changes.
+            repair = _error_results(calls, "Run ended before this tool finished.")
+            handle.conversation = Conversation([*messages, repair])
     if exc is None:
         await cm.__aexit__(None, None, None)
     else:

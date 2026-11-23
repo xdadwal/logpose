@@ -286,14 +286,33 @@ class SQLiteStore:
     ) -> AsyncIterator[SessionHandle]:
         validate_session_id(session_id)
         handle, token = await self._acquire(session_id, wait, metadata)
-        renewal = asyncio.create_task(self._renewal_loop(handle, token))
+        renewal = [asyncio.create_task(self._renewal_loop(handle, token))]
+
+        async def revive() -> bool:
+            counts = await self._write(
+                [
+                    (
+                        "UPDATE logpose_sessions SET lease_expires_at = ? "
+                        "WHERE id = ? AND lease_token = ?",
+                        (_now_ms() + self._lease_ttl_ms, session_id, token),
+                    )
+                ]
+            )
+            if counts[0] == 0:
+                handle.lost = True
+                return False
+            handle.lapsed = False
+            renewal.append(asyncio.create_task(self._renewal_loop(handle, token)))
+            return True
+
+        handle.revive = revive
         try:
             yield handle
         except BaseException as exc:
-            await self._stop(renewal)
+            await self._stop(renewal[-1])
             await self._release(handle, token, exc)
             raise
-        await self._stop(renewal)
+        await self._stop(renewal[-1])
         await self._release(handle, token, None)
 
     async def _acquire(
@@ -405,8 +424,9 @@ class SQLiteStore:
         TTLs (``handle.idle_since``): a block whose response was dropped without
         ever running, and is kept alive by a reference cycle, then frees its lease
         when it expires instead of holding the session until garbage collection.
-        The handle is marked ``lapsed`` and refuses new runs; its exit still saves
-        if nobody has taken the lease meanwhile.
+        The handle is marked ``lapsed``; a new run on it calls ``handle.revive``,
+        which takes the lease back only if nobody else has taken it meanwhile. Its
+        exit likewise still saves if the lease was not taken.
         """
         interval = self._lease_ttl / 3
         idle_limit = 3 * self._lease_ttl

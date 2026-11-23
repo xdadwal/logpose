@@ -595,8 +595,9 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   or block is active, so a crashed process frees its sessions within a minute. A
   block that has had no run in progress for 3 minutes stops renewing: its lease
   expires on its own (so a dropped, never-run streaming response cannot hold a
-  session forever), new runs on that handle raise `SessionBusyError`, and its exit
-  still saves if nobody took the lease meanwhile.
+  session forever). A block held open across turns (a WebSocket chat) keeps
+  working: the next run on its handle takes the lease back if nobody else took it
+  meanwhile, and raises `SessionBusyError` if someone did.
 - **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
 - **Expiry:** a session expires after 30 days without use; an expired session starts
   empty on its next use. logpose never deletes rows on its own: call

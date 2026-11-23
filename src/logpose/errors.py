@@ -43,7 +43,8 @@ class SessionBusyError(LogposeError):
 
     On enter, the session is leased elsewhere (a run is in flight). On exit, the
     lease was lost (it expired and another holder took it) and the messages were
-    not saved. Also raised when a run starts on a handle whose lease lapsed.
+    not saved. Also raised when a run starts on a handle whose lease lapsed while
+    idle and was taken by another holder.
     """
 
 

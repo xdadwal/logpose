@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal, Protocol
@@ -63,7 +63,8 @@ class SessionHandle:
             or a run on it ended), or ``None`` while a run is in progress. The
             store stops renewing a lease idle for longer than three lease TTLs.
         lapsed: True once renewal stopped because the handle sat idle; the
-            lease then expires on its own and new runs on the handle are refused.
+            lease then expires on its own. A new run on the handle first tries
+            to take the lease back (see ``revive``).
     """
 
     def __init__(
@@ -85,6 +86,10 @@ class SessionHandle:
         self.next_seq = next_seq
         self.idle_since: float | None = time.monotonic()
         self.lapsed = False
+        # Set by the store: re-extend a lapsed lease if its stored token is still
+        # this holder's, and resume renewal. Returns False (and marks the handle
+        # lost) if another holder took the lease meanwhile.
+        self.revive: Callable[[], Awaitable[bool]] | None = None
 
     def new_messages(self) -> list[Message]:
         """Return the messages appended to ``conversation`` since it was loaded."""

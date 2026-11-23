@@ -956,17 +956,85 @@ async def test_dropped_never_run_response_frees_lease(
     await agent.aclose()
 
 
-async def test_idle_block_refuses_new_run_after_lease_lapses(
+async def test_lapsed_handle_reacquires_its_own_lease_for_a_new_run(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A block held open across turns (WebSocket chat) resumes after idling."""
+    _short_lease(monkeypatch, 0.2)
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0.6})), ScriptedTurn.text("done")]
+    )
+    agent = Agent(provider, model="m", tools=[nap])
+    async with agent.session("s1") as handle:
+        await asyncio.sleep(0.6 + 0.3)  # idle past the bound: renewal stopped
+        assert handle.lapsed
+        task = asyncio.create_task(agent.run("hi", session=handle))
+        await asyncio.sleep(0.45)  # past the TTL: only a resumed renewal keeps the lease
+        assert not handle.lapsed
+        with pytest.raises(SessionBusyError):
+            async with agent.session("s1"):
+                pass
+        result = await task
+    assert result.text == "done"
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(4,)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await agent.aclose()
+
+
+async def test_lapsed_handle_refuses_run_when_lease_was_taken(
     db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _short_lease(monkeypatch, 0.2)
-    agent = Agent(FakeProvider(ScriptedTurn.text("a")), model="m")
+    provider = FakeProvider([ScriptedTurn.text("other"), ScriptedTurn.text("never")])
+    agent = Agent(provider, model="m")
+    with pytest.raises(SessionBusyError):
+        async with agent.session("s1") as handle:
+            await asyncio.sleep(0.6 + 0.2 + 0.3)  # lapsed and expired
+            await agent.run("elsewhere", session_id="s1")  # another holder took it
+            with pytest.raises(SessionBusyError):
+                await agent.run("hi", session=handle)
+            assert handle.lost
+    assert provider.call_count == 1
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(2,)]
+    await agent.aclose()
+
+
+async def test_block_exit_during_run_in_another_task_keeps_live_history_valid(
+    db: Path,
+) -> None:
+    """The block exits while another task is inside __anext__ (a slow tool): the
+    stream cannot be closed, and the repair must not touch the live history."""
+    from logpose.events import ToolCall
+    from logpose.messages import ToolResultBlock
+
+    provider = FakeProvider(
+        [
+            ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0.3}, id="t1")),
+            ScriptedTurn.text("done"),
+        ]
+    )
+    agent = Agent(provider, model="m", tools=[nap])
+    called = asyncio.Event()
+
+    async def consume(handle: SessionHandle) -> list[Any]:
+        seen = []
+        async for event in agent.stream("go", session=handle):
+            seen.append(event)
+            if isinstance(event, ToolCall):
+                called.set()
+        return seen
+
     async with agent.session("s1") as handle:
-        await asyncio.sleep(0.6 + 0.3)
-        with pytest.raises(SessionBusyError):
-            agent.stream("hi", session=handle)
-    # Nobody else took the lease, so the exit still frees it cleanly.
-    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+        task = asyncio.create_task(consume(handle))
+        await called.wait()
+        await asyncio.sleep(0.05)  # the consumer is now awaiting __anext__ (tool running)
+    stored = _stored(db)
+    _assert_replayable(stored, ["t1"], _ENDED)
+    await task
+    second = provider.requests[1].messages
+    results = [b.tool_use_id for m in second for b in m.content if isinstance(b, ToolResultBlock)]
+    assert results == ["t1"]
+    _assert_all_tool_uses_answered(second)
     await agent.aclose()
 
 
