@@ -15,8 +15,8 @@ models fail.
   that field name and never under both.
 - `Agent(max_tokens=...)`, the 16384 default, and their precedence are unchanged;
   only the wire field name changes.
-- A value in `extra_body` or `Agent(extra=...)` for either field still overrides
-  as today. Merge order is unchanged.
+- A value in `extra_body` or `Agent(extra=...)` for either field replaces the
+  ceiling: logpose omits its own field and only the caller's field is sent.
 
 **Approaches considered:** (B) the same setting defaulting to `max_tokens`
 breaks OpenAI reasoning models by default. (C) auto-selecting by host

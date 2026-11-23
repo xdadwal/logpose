@@ -322,6 +322,9 @@ def _env(name: str) -> str | None:
     return value or None
 
 
+_CEILING_FIELDS = frozenset({"max_tokens", "max_completion_tokens"})
+
+
 class OpenAICompatProvider:
     """A :class:`~logpose.providers.base.Provider` for any Chat Completions API.
 
@@ -584,7 +587,6 @@ class OpenAICompatProvider:
             "messages": _messages_to_wire(
                 req.messages, req.system, preserve_reasoning=self.preserve_reasoning
             ),
-            self.max_tokens_field: req.max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -595,8 +597,13 @@ class OpenAICompatProvider:
                 "response_format is set both in the provider's extra_body and on the request. "
                 "Remove one; structured output owns response_format."
             )
-        body.update(self._extra_body)
-        body.update(req.extra)
+        # The caller's ceiling field, if any, replaces ours entirely: sending both
+        # lets servers pick one (vLLM prefers max_completion_tokens) and OpenAI
+        # reasoning models reject max_tokens outright.
+        overrides = {**self._extra_body, **req.extra}
+        if not _CEILING_FIELDS.intersection(overrides):
+            body[self.max_tokens_field] = req.max_tokens
+        body.update(overrides)
         return body
 
     # -- streaming ----------------------------------------------------------

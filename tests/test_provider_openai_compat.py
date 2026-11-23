@@ -934,8 +934,33 @@ def test_invalid_max_tokens_field_rejected() -> None:
         OpenAICompatProvider(base_url=BASE, max_tokens_field="max_output_tokens")  # type: ignore[arg-type]
 
 
-async def test_extra_body_legacy_field_passes_through() -> None:
+async def test_extra_body_legacy_field_replaces_logpose_ceiling() -> None:
     handler = Recorder(sse(finish_chunk("stop")))
     await drain(make_provider(handler, extra_body={"max_tokens": 50}), request(max_tokens=128))
     assert handler.last_body["max_tokens"] == 50
-    assert handler.last_body["max_completion_tokens"] == 128
+    assert "max_completion_tokens" not in handler.last_body
+
+
+async def test_request_extra_legacy_field_replaces_logpose_ceiling() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    await drain(make_provider(handler), request(max_tokens=128, extra={"max_tokens": 50}))
+    assert handler.last_body["max_tokens"] == 50
+    assert "max_completion_tokens" not in handler.last_body
+
+
+async def test_extra_body_new_field_replaces_logpose_ceiling() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    provider = make_provider(handler, extra_body={"max_completion_tokens": 50})
+    await drain(provider, request(max_tokens=128))
+    assert handler.last_body["max_completion_tokens"] == 50
+    assert "max_tokens" not in handler.last_body
+
+
+async def test_extra_body_new_field_replaces_legacy_selected_field() -> None:
+    handler = Recorder(sse(finish_chunk("stop")))
+    provider = make_provider(
+        handler, max_tokens_field="max_tokens", extra_body={"max_completion_tokens": 50}
+    )
+    await drain(provider, request(max_tokens=128))
+    assert handler.last_body["max_completion_tokens"] == 50
+    assert "max_tokens" not in handler.last_body
