@@ -1063,3 +1063,97 @@ def test_session_exit_timeout_exceeds_busy_timeout() -> None:
     from logpose.store.sqlite import SQLiteStore
 
     assert SESSION_EXIT_TIMEOUT > SQLiteStore(":memory:")._busy_timeout_ms / 1000
+
+
+async def _suspended_stream_block(agent: Agent) -> None:
+    """Open a block, leave a stream suspended after its first event, exit the block."""
+    async with agent.session("s1") as handle:
+        events = agent.stream("go", session=handle)
+        await events.__anext__()
+        # No aclose: the block's exit must close it before saving.
+
+
+async def test_block_exit_save_gets_its_own_budget_after_closing_streams(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing the open stream (its run record waits on a busy database) and
+    the save (release waits too) together exceed one exit budget: the save
+    must still get the whole budget for itself."""
+    import logpose.agent as agent_mod
+    from logpose.store.sqlite import SQLiteStore
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.3)
+    real_record, real_release = SQLiteStore.record_run, SQLiteStore._release
+
+    async def busy_record(self: SQLiteStore, record: Any) -> None:
+        await asyncio.sleep(0.2)
+        await real_record(self, record)
+
+    async def busy_release(self: SQLiteStore, *args: Any) -> None:
+        await asyncio.sleep(0.2)
+        await real_release(self, *args)
+
+    monkeypatch.setattr(SQLiteStore, "record_run", busy_record)
+    monkeypatch.setattr(SQLiteStore, "_release", busy_release)
+    agent = Agent(FakeProvider(ScriptedTurn.text("hello")), model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await agent.aclose()
+
+
+async def test_block_exit_abandons_a_stuck_stream_close_and_still_saves(
+    db: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stream whose close outlasts its bound is left to finish in the
+    background; the block saves and releases on time, and no task leaks."""
+    import gc
+
+    import logpose.agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "SESSION_EXIT_TIMEOUT", 0.3)
+    monkeypatch.setattr(agent_mod, "_STREAM_CLOSE_MARGIN", 0.05)
+
+    class StuckClose(FakeProvider):
+        async def stream(self, req: Any) -> Any:  # type: ignore[override]
+            try:
+                async for event in super().stream(req):
+                    yield event
+            finally:
+                loop = asyncio.get_running_loop()
+                end = loop.time() + 0.8
+                while (left := end - loop.time()) > 0:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.sleep(left)
+
+    agent = Agent(StuckClose(ScriptedTurn.text("hello")), model="m")
+    started = time.monotonic()
+    with caplog.at_level("WARNING"):
+        await _suspended_stream_block(agent)
+    assert time.monotonic() - started < 0.75
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    assert "closing session streams did not finish" in caplog.text
+    assert agent_mod._ABANDONED
+    await asyncio.wait(set(agent_mod._ABANDONED), timeout=2)
+    assert not agent_mod._ABANDONED
+    caplog.clear()
+    with caplog.at_level("ERROR", logger="asyncio"):
+        gc.collect()
+        await asyncio.sleep(0)
+    assert "pending" not in caplog.text
+    assert "never retrieved" not in caplog.text
+    await agent.aclose()
+
+
+async def test_block_exit_with_suspended_stream_normal_path(db: Path) -> None:
+    provider = FakeProvider([ScriptedTurn.text("hello"), ScriptedTurn.text("again")])
+    agent = Agent(provider, model="m")
+    await _suspended_stream_block(agent)
+    assert _rows(db, "SELECT role FROM logpose_messages ORDER BY seq") == [("user",)]
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    result = await agent.run("again", session_id="s1")
+    assert result.text == "again"
+    await agent.aclose()

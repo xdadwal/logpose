@@ -604,7 +604,10 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   `await agent.purge_expired_sessions()` to delete expired sessions, or
   `await agent.delete_session(sid)` to remove one.
 - **Run records:** each run writes a row to `logpose_runs`. Token counts cover
-  completed turns only.
+  completed turns only. A stream still open when its `agent.session(...)` block
+  exits is closed first and writes its record within its own time limit; the
+  block's save then gets a full time limit of its own (8 s), so a busy database
+  can lose that stream's run record (logged) but not the block's messages.
 
 Known limits:
 
