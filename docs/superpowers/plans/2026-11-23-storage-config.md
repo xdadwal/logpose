@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Path resolution: `db_path` argument (not blank) → `LOGPOSE_DB_PATH` (not blank) → `./logpose.db`; absolute with `~` expanded; resolved once at `Agent` construction. Type `str | os.PathLike[str] | None`.
+- Path resolution: `db_path` argument (not blank) → `LOGPOSE_DB_PATH` (not blank) → `./logpose.db`; absolute with `~` expanded. An explicit `db_path` is fixed at construction; without it the env/default is resolved at each use, as before. Type `str | os.PathLike[str] | None`.
 - `session_ttl: timedelta | float | None = None` (float = seconds); default 30 days; ≤ 0 or non-finite → `LogposeError`.
 - TTL rule: every write by an agent (session creation and each save) stamps `expires_at = now + that agent's session_ttl`; expiry checks and purge read the stored `expires_at`.
 - `load_session(session_id) -> list[Message]`: full stored history (no summary, not compacted); unknown or expired → `[]`; never deletes/resets/extends; no lease; validates the ID (`LogposeError`); opens the store lazily; uncommitted (in-progress) messages not visible.
