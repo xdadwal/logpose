@@ -504,6 +504,128 @@ A run without a conversation is independent. A conversation should remain on the
 backend that produced it because some providers include backend-specific reasoning
 state in the history.
 
+## Sessions
+
+Pass a `session_id` and logpose keeps the conversation in a local SQLite database:
+history is loaded before the run, new messages and a run record are saved after it,
+and a per-session lease stops two requests from running on one session at once.
+
+```python
+async with agent.session("chat-42") as handle:
+    async for event in agent.stream("hi", session=handle):
+        ...
+```
+
+Entering the block takes the lease and loads the history, so a busy session raises
+`SessionBusyError` before anything is streamed. That makes a clean HTTP answer
+possible:
+
+```python
+from fastapi import HTTPException
+from logpose import SessionBusyError
+
+@app.post("/chat/{sid}")
+async def chat(sid: str, body: ChatIn):
+    try:
+        async with agent.session(sid) as handle:
+            result = await agent.run(body.text, session=handle)
+    except SessionBusyError:
+        raise HTTPException(status_code=409, detail="session is busy") from None
+    return {"text": result.text}
+```
+
+To stream the reply, the session must stay open until the body has been sent. Do
+not `return StreamingResponse(...)` from inside `async with agent.session(...)`:
+the block exits (saving and releasing the session) before the first chunk is
+streamed, and the stream then fails. Enter the session before building the
+response, so a busy session is still a 409 before any headers go out, and leave it
+when the body finishes:
+
+```python
+from contextlib import AsyncExitStack, aclosing
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
+from logpose import SessionBusyError, TextDelta
+
+@app.post("/chat/{sid}/stream")
+async def chat_stream(sid: str, body: ChatIn):
+    stack = AsyncExitStack()
+    try:
+        handle = await stack.enter_async_context(agent.session(sid))
+    except SessionBusyError:
+        raise HTTPException(status_code=409, detail="session is busy") from None
+
+    async def chunks():
+        try:
+            # aclosing ends the run (answering any tool call it was waiting on)
+            # before the session is saved, also when the client leaves mid-stream.
+            async with aclosing(agent.stream(body.text, session=handle)) as events:
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        yield event.text
+        finally:
+            await stack.aclose()  # saves and releases, also when the client leaves
+
+    # The background task covers a body that is never iterated (the client left
+    # before streaming began); closing the stack a second time does nothing.
+    return StreamingResponse(chunks(), background=BackgroundTask(stack.aclose))
+```
+
+Leaving a session block also closes any stream still open on its handle before
+saving, and answers a trailing unanswered tool call with an error result, so a
+stored session always stays replayable.
+
+For a single call, the convenience form does the same in one step:
+
+```python
+result = await agent.run("hi", session_id="chat-42", session_metadata={"user": "ada"})
+```
+
+Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
+`stream_sync` and `SyncAgent` accept `session_id`, `session_metadata` and `session`.
+
+- **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
+  The file is created on first session use; runs without a session never touch disk.
+- **Session IDs:** anyone who knows a session ID can load that conversation, so use
+  unguessable IDs (for example `secrets.token_urlsafe(32)`) and check that the
+  caller owns the session before using it.
+- **Lease:** a lease lasts 60 seconds and is renewed every 20 seconds while its run
+  or block is active, so a crashed process frees its sessions within a minute. A
+  block that has had no run in progress for 3 minutes stops renewing: its lease
+  expires on its own (so a dropped, never-run streaming response cannot hold a
+  session forever). A block held open across turns (a WebSocket chat) keeps
+  working: the next run on its handle takes the lease back if nobody else took it
+  meanwhile, and raises `SessionBusyError` if someone did.
+- **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
+- **Expiry:** a session expires after 30 days without use; an expired session starts
+  empty on its next use. logpose never deletes rows on its own: call
+  `await agent.purge_expired_sessions()` to delete expired sessions, or
+  `await agent.delete_session(sid)` to remove one.
+- **Run records:** each run writes a row to `logpose_runs`. Token counts cover
+  completed turns only. A stream still open when its `agent.session(...)` block
+  exits is closed first and writes its record within its own time limit (about
+  10 s); the block then waits up to 6 s for any record still writing, and its
+  save gets a full 8 s of its own. So a busy database can lose that stream's run
+  record (logged) but not the block's messages; such an exit can take up to about
+  24 s. Wrapping the stream in `contextlib.aclosing(...)` closes it before the
+  block exits and avoids this.
+- **Exit and cancellation:** the exit's save runs past a cancellation, so a server
+  cancelling the handler on client disconnect does not shorten it. If streams may
+  be left open on a handle, set the ASGI server's graceful-shutdown timeout to at
+  least 25 s, or use `aclosing`.
+
+Known limits:
+
+- Sessions are single-host. SQLite in WAL mode supports several worker processes on
+  one machine; several hosts need a networked database (MySQL or Postgres support is
+  planned).
+- A run cancelled after its lease was lost surfaces the cancellation; the failed save
+  is logged.
+- Abandoned streams release the lease when they are closed. Wrap them to make that
+  prompt: `async with contextlib.aclosing(agent.stream(..., session_id=sid)) as events:`.
+
 ## Structured output
 
 Pass a pydantic model as `output_type` and the run returns a validated instance
@@ -583,7 +705,7 @@ with SyncAgent(Agent("openai-compat", model="gpt-5.1", tools=[get_weather])) as 
 ```
 
 For one-off calls, `run_sync()` and `stream_sync()` are also available. All of them accept
-`output_type` and `output_retries`. Do not use
+`output_type`, `output_retries` and the session arguments. Do not use
 the synchronous API from a thread already running an event loop; use `await` and
 `async for` there.
 

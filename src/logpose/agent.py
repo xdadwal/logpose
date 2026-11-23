@@ -73,18 +73,33 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import enum
 import inspect
+import json
 import logging
+import time
 import traceback
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+import weakref
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass, field, replace
 from time import monotonic
-from typing import Any, Literal, TypeVar, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from logpose.cancellation import (
     ToolDeadlineHandle,
@@ -99,6 +114,7 @@ from logpose.errors import (
     OutputValidationError,
     ProviderError,
     RunTimeoutError,
+    SessionBusyError,
     ToolExecutionError,
 )
 from logpose.events import (
@@ -140,6 +156,9 @@ from logpose.runtime import (
     current_runtime_context,
 )
 from logpose.tools import ToolDef
+
+if TYPE_CHECKING:  # pragma: no cover - store modules import this one
+    from logpose.store.base import Outcome, SessionHandle, SessionStore
 
 __all__ = [
     "Agent",
@@ -193,6 +212,34 @@ EMPTY_TOOL_RESULT = "(no output)"
 Providers reject empty content blocks, so a tool that returns ``""`` would
 otherwise fail the *next* request rather than its own.
 """
+
+SESSION_EXIT_TIMEOUT = 8.0
+"""Seconds a session run's exit (record the run, save, release) may take once shielded.
+
+Longer than the store's 5-second SQLite ``busy_timeout``, so one wait on a busy
+database cannot use up the whole exit. A session block closes the streams still
+open on its handle first, each bounded by its own exit; the save gets a fresh
+budget afterwards.
+"""
+
+_STREAM_CLOSE_MARGIN = 2.0
+"""Seconds past :data:`SESSION_EXIT_TIMEOUT` that closing a block's open streams
+may take before it is abandoned (a stream's run record already has its own
+bound; this backstops closing the loop itself)."""
+
+_LEFTOVER_WAIT = 6.0
+"""Seconds (the store's 5-second ``busy_timeout`` plus a margin) a block waits,
+before its save's budget starts, for exit work it abandoned while closing
+streams, so a run record still holding the store does not eat into the save."""
+
+_EXIT_LEFTOVERS: contextvars.ContextVar[list[asyncio.Future[Any]] | None] = contextvars.ContextVar(
+    "_EXIT_LEFTOVERS", default=None
+)
+"""Where exit work abandoned while a block closes a stream is collected."""
+
+_ABANDONED: set[asyncio.Future[Any]] = set()
+"""Exit tasks given up on, kept referenced until they finish so none is
+destroyed while pending."""
 
 _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
 
@@ -300,6 +347,9 @@ If it raises or returns a non-string, logpose falls back to its safe message.
 """
 
 
+_CONVERSATION_JSON_VERSION = 1
+
+
 class Conversation:
     """A mutable multi-turn message history.
 
@@ -350,6 +400,45 @@ class Conversation:
     def clear(self) -> None:
         """Drop every turn, keeping the same object usable."""
         self.messages.clear()
+
+    def to_json(self) -> str:
+        """Serialize the history to a versioned JSON document.
+
+        Returns:
+            ``{"version": 1, "messages": [...]}`` as a JSON string; lossless for
+            every content block type.
+        """
+        messages = [m.model_dump(mode="json") for m in self.messages]
+        return json.dumps({"version": _CONVERSATION_JSON_VERSION, "messages": messages})
+
+    @classmethod
+    def from_json(cls, text: str) -> Conversation:
+        """Rebuild a conversation from :meth:`to_json` output.
+
+        Args:
+            text: The JSON document.
+
+        Returns:
+            A new :class:`Conversation`.
+
+        Raises:
+            LogposeError: If the document is not valid JSON, its ``version`` is
+                not supported, or its messages are malformed.
+        """
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise LogposeError(f"conversation JSON is not valid JSON: {exc}") from None
+        version = data.get("version") if isinstance(data, dict) else None
+        if version != _CONVERSATION_JSON_VERSION:
+            raise LogposeError(f"unsupported conversation JSON version: {version!r}")
+        raw = data.get("messages")
+        if not isinstance(raw, list):
+            raise LogposeError("conversation JSON must have a 'messages' list")
+        try:
+            return cls(Message.model_validate(m) for m in raw)
+        except ValidationError as exc:
+            raise LogposeError(f"conversation JSON has a malformed message: {exc}") from None
 
     @property
     def text(self) -> str:
@@ -416,6 +505,7 @@ class Agent:
         context_policy: ContextPolicy | None = None,
         output_type: type[BaseModel] | None = None,
         output_retries: int = 1,
+        session_wait: float = 0.0,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -486,6 +576,8 @@ class Agent:
                 ``run``/``stream`` can override it per call.
             output_retries: Default number of correction turns sent when the
                 final answer fails validation (default 1). ``0`` fails at once.
+            session_wait: Seconds to keep retrying a busy session's lease before
+                raising :class:`~logpose.errors.SessionBusyError` (default 0).
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -559,6 +651,12 @@ class Agent:
             raise LogposeError(f"on_tool_call must be callable, got {type(on_tool_call).__name__}.")
         if not all(callable(observer) for observer in observers):
             raise LogposeError("observers must contain only callable callbacks.")
+        if (
+            isinstance(session_wait, bool)
+            or not isinstance(session_wait, (int, float))
+            or session_wait < 0
+        ):
+            raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
 
         if isinstance(provider, str):
             self.provider: Provider = resolve(provider, **provider_kwargs)
@@ -601,6 +699,8 @@ class Agent:
         self.last_context_diagnostics: dict[str, int | str | bool] = {}
         self.output_type = output_type
         self.output_retries = output_retries
+        self.session_wait = float(session_wait)
+        self._uses_store = False
 
         by_name: dict[str, ToolDef] = {}
         for tool_def in self.tools:
@@ -627,6 +727,9 @@ class Agent:
         conversation: Conversation | None = None,
         output_type: type[_M],
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> RunResult[_M]: ...
 
     @overload
@@ -637,6 +740,9 @@ class Agent:
         conversation: Conversation | None = None,
         output_type: None | _Unset = _UNSET,
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> RunResult[Any]: ...
 
     async def run(
@@ -646,6 +752,9 @@ class Agent:
         conversation: Conversation | None = None,
         output_type: type[BaseModel] | None | _Unset = _UNSET,
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> RunResult[Any]:
         """Run the loop to completion and return its result.
 
@@ -663,6 +772,13 @@ class Agent:
                 use the agent default; ``None`` disables it for this call.
             output_retries: Correction turns allowed for an invalid final
                 answer. Omit to use the agent default.
+            session_id: Run on this stored session: its lease is taken, its
+                history loaded, the new messages saved and a run record written,
+                exactly as if the call were wrapped in :meth:`session`.
+            session_metadata: Metadata merged into the session on lease; only
+                with ``session_id``.
+            session: A handle from an open :meth:`session` block to run on. The
+                run is recorded at once; messages are saved when the block exits.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
@@ -677,6 +793,8 @@ class Agent:
             MaxIterationsError: If the run exceeds ``max_iterations``. The
                 partial conversation is attached to the error.
             ProviderError: If the provider fails or violates its contract.
+            SessionBusyError: If the session is leased elsewhere, or its lease
+                was lost during the run (the run record is still written).
             Exception: Whatever ``on_tool_call`` raises, propagated unchanged
                 rather than converted into a tool result.
         """
@@ -686,6 +804,9 @@ class Agent:
             conversation=conversation,
             output_type=output_type,
             output_retries=output_retries,
+            session_id=session_id,
+            session_metadata=session_metadata,
+            session=session,
         )
         async for event in events:
             if isinstance(event, RunEnd):
@@ -701,6 +822,9 @@ class Agent:
         conversation: Conversation | None = None,
         output_type: type[BaseModel] | None | _Unset = _UNSET,
         output_retries: int | _Unset = _UNSET,
+        session_id: str | None = None,
+        session_metadata: Mapping[str, str] | None = None,
+        session: SessionHandle | None = None,
     ) -> AsyncIterator[Event]:
         """Run the loop, yielding events as they happen.
 
@@ -723,14 +847,20 @@ class Agent:
             output_type: As for :meth:`run`; ``RunEnd.result.output`` carries
                 the validated object.
             output_retries: As for :meth:`run`.
+            session_id: As for :meth:`run`. The lease is taken when iteration
+                starts, so a busy session raises from the first ``__anext__``;
+                use :meth:`session` to learn that before streaming.
+            session_metadata: As for :meth:`run`.
+            session: As for :meth:`run`.
 
         Returns:
             An async iterator of :data:`~logpose.events.Event` values.
 
         Raises:
             LogposeError: If ``prompt`` is not a supported type, if there is
-                nothing to send, or if the output options are invalid or
-                conflict with ``extra["response_format"]``. Iterating can raise
+                nothing to send, if the output options are invalid or
+                conflict with ``extra["response_format"]``, or if the session
+                arguments are invalid or combined. Iterating can raise
                 the same errors :meth:`run` documents, including whatever
                 ``on_tool_call`` raises.
         """
@@ -743,19 +873,266 @@ class Agent:
                 "Agent(extra=...) already sets 'response_format', which output_type also "
                 "sets; remove one of them."
             )
+        given = [
+            name
+            for name, value in (
+                ("session_id", session_id),
+                ("session", session),
+                ("conversation", conversation),
+            )
+            if value is not None
+        ]
+        if len(given) > 1:
+            raise LogposeError(f"Pass at most one of {', '.join(given)}.")
+        if session_metadata is not None and session_id is None:
+            raise LogposeError("session_metadata is only valid with session_id.")
         first = _as_message(prompt) if prompt is not None else None
+        if session_id is not None:
+            from logpose.store.base import validate_session_id
+
+            validate_session_id(session_id)
+            return self._session_loop(
+                first,
+                resolved_type,
+                resolved_retries,
+                session_id=session_id,
+                metadata=_check_metadata(session_metadata),
+            )
+        if session is not None:
+            self._active_store(session)
+            if first is None and not session.conversation.messages:
+                raise LogposeError("Nothing to send: pass a prompt, or a session with history.")
+            from logpose.store import manager
+
+            stream = self._session_loop(first, resolved_type, resolved_retries, handle=session)
+            # Registered so the block can close it before saving: a stream left
+            # suspended mid-run must answer its tool calls before the history is stored.
+            manager._STREAMS.setdefault(session, weakref.WeakSet()).add(stream)
+            return stream
         if first is None and not (conversation is not None and conversation.messages):
             raise LogposeError(
                 "Nothing to send: pass a prompt, or a conversation that already has messages."
             )
         return self._loop(first, conversation, resolved_type, resolved_retries)
 
+    def session(
+        self, session_id: str, *, metadata: Mapping[str, str] | None = None
+    ) -> AbstractAsyncContextManager[SessionHandle]:
+        """Lease a stored session for the duration of an ``async with`` block.
+
+        Entering takes the lease (waiting up to ``session_wait`` seconds) and
+        loads the history, so a busy session raises before anything is
+        streamed — a web app can still answer 409::
+
+            async with agent.session("chat-42") as handle:
+                async for event in agent.stream("hi", session=handle):
+                    ...
+
+        Each run on the handle writes its run record when it ends. Leaving the
+        block saves the messages appended to ``handle.conversation`` and
+        releases the lease, inside a shield bounded to
+        :data:`SESSION_EXIT_TIMEOUT` seconds so a cancellation cannot leave the
+        lease held until it expires. Streams still open on the handle are closed
+        before that budget starts, each within its own bounded exit.
+
+        Args:
+            session_id: The session to lease; ``[A-Za-z0-9._-]{1,128}``.
+            metadata: String metadata merged into the session's metadata.
+
+        Returns:
+            An async context manager yielding the
+            :class:`~logpose.store.base.SessionHandle`.
+
+        Raises:
+            LogposeError: If ``session_id`` or ``metadata`` is invalid.
+            SessionBusyError: On enter, if the session stays leased elsewhere;
+                on exit, if the lease was lost and the messages were not saved.
+        """
+        from logpose.store.base import validate_session_id
+
+        validate_session_id(session_id)
+        return self._session_block(session_id, _check_metadata(metadata))
+
+    @contextlib.asynccontextmanager
+    async def _session_block(
+        self, session_id: str, metadata: dict[str, str] | None
+    ) -> AsyncIterator[SessionHandle]:
+        from logpose.store import manager
+
+        store = await self._store()
+        cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+        handle = await cm.__aenter__()
+        manager._ACTIVE_HANDLES[handle] = store
+        try:
+            yield handle
+        except BaseException as exc:
+            await _finish_session(_exit_session(handle, cm, exc), exc, close=handle)
+            raise
+        await _finish_session(_exit_session(handle, cm, None), None, close=handle)
+
+    async def purge_expired_sessions(self) -> int:
+        """Delete every session idle past its time-to-live; return how many.
+
+        logpose never purges on its own; applications call this when they choose.
+        """
+        store = await self._store()
+        return await store.purge_expired()
+
+    async def delete_session(self, session_id: str) -> None:
+        """Delete a stored session with its messages and run records."""
+        from logpose.store.base import validate_session_id
+
+        validate_session_id(session_id)
+        store = await self._store()
+        await store.delete_session(session_id)
+
+    async def _store(self) -> SessionStore:
+        from logpose.store import manager
+
+        self._uses_store = True
+        return await manager.get_store(owner=self)
+
+    @staticmethod
+    def _active_store(handle: SessionHandle) -> SessionStore:
+        """Return the store that leased ``handle``, if its block is still open."""
+        from logpose.store import manager
+
+        store = manager._ACTIVE_HANDLES.get(handle)
+        if store is None:
+            raise LogposeError(
+                "session= takes a handle from an open 'async with agent.session(...)' block."
+            )
+        if handle in manager._RUNNING:
+            raise LogposeError(f"Session {handle.id!r} already has a run in progress.")
+        return store
+
+    async def _session_loop(
+        self,
+        first: Message | None,
+        output_type: type[BaseModel] | None,
+        output_retries: int,
+        *,
+        session_id: str | None = None,
+        metadata: dict[str, str] | None = None,
+        handle: SessionHandle | None = None,
+    ) -> AsyncIterator[Event]:
+        """Run :meth:`_loop` on a session and record the run on every outcome.
+
+        With ``session_id`` the lease is taken here, at the first ``__anext__``,
+        and the session is saved and released when the run ends. With ``handle``
+        only the run record is written; the session block saves and releases.
+        ``RunEnd`` is yielded only after the run is recorded (and, with
+        ``session_id``, saved), so a lost lease raises instead of ending normally.
+        """
+        from logpose.store import manager
+
+        cm: AbstractAsyncContextManager[SessionHandle] | None = None
+        if handle is None:
+            assert session_id is not None
+            store = await self._store()
+            cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+            handle = await cm.__aenter__()
+            manager._ACTIVE_HANDLES[handle] = store
+            if first is None and not handle.conversation.messages:
+                error = LogposeError("Nothing to send: pass a prompt, or a session with history.")
+                await _finish_session(_exit_session(handle, cm, error), error)
+                raise error
+        else:
+            store = self._active_store(handle)
+        manager._RUNNING.add(handle)
+        handle.idle_since = None
+        if handle.lapsed:
+            # The block sat idle and stopped renewing: take the lease back if it is
+            # still ours, else the session moved on and this run must not start.
+            revived = False
+            try:
+                revived = handle.revive is not None and await handle.revive()
+            finally:
+                if not revived:
+                    manager._RUNNING.discard(handle)
+                    handle.idle_since = monotonic()
+            if not revived:
+                raise SessionBusyError(
+                    f"lease on session {handle.id!r} lapsed while its block sat idle "
+                    "and was taken elsewhere; open a new session block"
+                )
+        stats = _RunStats()
+        started_ms = _now_ms()
+        run_end: RunEnd | None = None
+        try:
+            inner = self._loop(first, handle.conversation, output_type, output_retries, stats)
+            try:
+                async for event in inner:
+                    if isinstance(event, RunEnd):
+                        run_end = event
+                    else:
+                        yield event
+            finally:
+                # Closing the loop first cancels in-flight tools and closes the
+                # provider stream before the session is saved.
+                await _aclose(inner)
+        except BaseException as exc:
+            manager._RUNNING.discard(handle)
+            handle.idle_since = monotonic()
+            work = self._end_session_run(store, handle, cm, stats, started_ms, exc)
+            await _finish_session(work, exc)
+            raise
+        manager._RUNNING.discard(handle)
+        handle.idle_since = monotonic()
+        await _finish_session(
+            self._end_session_run(store, handle, cm, stats, started_ms, None), None
+        )
+        if run_end is None:  # pragma: no cover - the loop always ends with RunEnd
+            raise LogposeError("The agentic loop finished without producing a result.")
+        yield run_end
+
+    async def _end_session_run(
+        self,
+        store: SessionStore,
+        handle: SessionHandle,
+        cm: AbstractAsyncContextManager[SessionHandle] | None,
+        stats: _RunStats,
+        started_ms: int,
+        exc: BaseException | None,
+    ) -> None:
+        """Write the run record, then (``session_id`` form) save and release."""
+        from logpose.store.base import RunRecord
+
+        outcome, error_type = _outcome(exc)
+        record = RunRecord(
+            run_id=stats.run_id or self._runtime_id("run"),
+            session_id=handle.id,
+            model=self._model(),
+            provider=self.provider_name,
+            started_at_ms=started_ms,
+            ended_at_ms=_now_ms(),
+            outcome=outcome,
+            iterations=stats.iterations,
+            input_tokens=stats.usage.input_tokens,
+            output_tokens=stats.usage.output_tokens,
+            reasoning_tokens=stats.usage.reasoning_tokens,
+            cache_read_input_tokens=stats.usage.cache_read_input_tokens,
+            cache_creation_input_tokens=stats.usage.cache_creation_input_tokens,
+            error_type=error_type,
+        )
+        try:
+            await store.record_run(record)
+        finally:
+            if cm is not None:
+                await _exit_session(handle, cm, exc)
+
     async def aclose(self) -> None:
-        """Release provider resources owned by this agent.
+        """Release provider and session-store resources owned by this agent.
 
         Closes the provider only if the agent built it (``provider=`` was a
-        name). A provider handed in by the caller is left alone.
+        name). A provider handed in by the caller is left alone. Session stores
+        this agent used are closed once no other agent uses them.
         """
+        if self._uses_store:
+            from logpose.store import manager
+
+            self._uses_store = False
+            await manager.release_stores(self)
         if not self._owns_provider:
             return
         closer = getattr(self.provider, "aclose", None)
@@ -871,6 +1248,7 @@ class Agent:
         conversation: Conversation | None,
         output_type: type[BaseModel] | None = None,
         output_retries: int = 0,
+        stats: _RunStats | None = None,
     ) -> AsyncIterator[Event]:
         """Drive provider turns and tool executions until the run ends.
 
@@ -879,6 +1257,8 @@ class Agent:
             conversation: History to append to; a private list is used when omitted.
             output_type: Model the final answer must validate against, or ``None``.
             output_retries: Correction turns allowed for an invalid final answer.
+            stats: Run-scoped accumulator kept current with the run id, usage and
+                iterations, so a caller can read them whatever the outcome.
 
         Yields:
             :data:`~logpose.events.Event` values, ending with
@@ -902,6 +1282,20 @@ class Agent:
         self._emit_runtime("run.started", context=run_context)
         history: list[Message] = conversation.messages if conversation is not None else []
         iterations = 0
+        if stats is None:
+            stats = _RunStats()
+        stats.run_id = run_context.run_id
+        # Tool calls appended to history whose results are not yet appended.
+        # Whatever ends the run meanwhile (timeout, cancellation, an abandoned
+        # stream, a raising gate), each one gets an error result, or every later
+        # request on this conversation is rejected by the provider.
+        unanswered: list[ToolUseBlock] = []
+
+        def answer_unanswered(text: str) -> None:
+            if unanswered:
+                history.append(_error_results(unanswered, text))
+                unanswered.clear()
+
         try:
             if prompt is not None:
                 history.append(prompt)
@@ -925,6 +1319,7 @@ class Agent:
                         self.max_iterations,
                     )
                 iterations += 1
+                stats.iterations = iterations
                 turn_context = replace(
                     run_context,
                     turn_id=self._runtime_id("turn"),
@@ -960,10 +1355,19 @@ class Agent:
                 # later turn on this conversation with an error naming a message the
                 # consumer never wrote. `last` still carries the stop reason.
                 stored = bool(done.message.content)
+                # The model asking for tools without naming any is the end of
+                # the run: re-sending would loop forever.
+                calls = (
+                    [block for block in done.message.content if isinstance(block, ToolUseBlock)]
+                    if done.stop_reason == "tool_use"
+                    else []
+                )
                 if stored:
                     answer_index = len(history)
                     history.append(done.message)
+                    unanswered[:] = calls
                 total_usage = total_usage + done.usage
+                stats.usage = total_usage
                 last = done
                 yield TurnEnd(stop_reason=done.stop_reason, usage=done.usage)
 
@@ -974,36 +1378,16 @@ class Agent:
                     # iteration cap, so that case falls through and ends the run.
                     continue
 
-                # The model asking for tools without naming any is the end of
-                # the run: re-sending would loop forever.
-                calls = (
-                    [block for block in done.message.content if isinstance(block, ToolUseBlock)]
-                    if done.stop_reason == "tool_use"
-                    else []
-                )
                 if calls:
                     for call in calls:
                         yield ToolCall(id=call.id, name=call.name, input=call.input)
-                    try:
-                        async with _run_budget(run_deadline):
-                            results = await self._execute(calls, turn_context)
-                    except _RunExpired:
-                        # Every tool_use needs a tool_result, or the next request
-                        # on this conversation is rejected by the provider.
-                        history.append(
-                            Message(
-                                role="user",
-                                content=[
-                                    ToolResultBlock(
-                                        tool_use_id=call.id,
-                                        content="Run deadline exceeded before this tool finished.",
-                                        is_error=True,
-                                    )
-                                    for call in calls
-                                ],
-                            )
-                        )
-                        raise
+                    async with _run_budget(run_deadline):
+                        results = await self._execute(calls, turn_context)
+                    # ONE user message holding every result, in request order —
+                    # appended before the results are yielded, so a consumer that
+                    # walks away mid-results still leaves a replayable history.
+                    history.append(Message(role="user", content=list(results)))
+                    unanswered.clear()
                     for call, tool_result in zip(calls, results, strict=True):
                         yield ToolResult(
                             id=tool_result.tool_use_id,
@@ -1011,8 +1395,6 @@ class Agent:
                             content=tool_result.content,
                             is_error=tool_result.is_error,
                         )
-                    # ONE user message holding every result, in request order.
-                    history.append(Message(role="user", content=list(results)))
                     continue
 
                 if output_type is not None:
@@ -1075,6 +1457,7 @@ class Agent:
             )
             yield RunEnd(result=result)
         except _RunExpired:
+            answer_unanswered("Run deadline exceeded before this tool finished.")
             self._emit_runtime(
                 "run.timed_out",
                 context=run_context,
@@ -1091,6 +1474,8 @@ class Agent:
                 "run.cancelled", context=run_context, duration_seconds=monotonic() - started_at
             )
             raise
+        finally:
+            answer_unanswered("Run ended before this tool finished.")
 
     async def _provider_turn(
         self,
@@ -1768,6 +2153,239 @@ def _check_output_retries(output_retries: object) -> None:
         or output_retries < 0
     ):
         raise LogposeError(f"output_retries must be an int >= 0, got {output_retries!r}.")
+
+
+@dataclass
+class _RunStats:
+    """Run-scoped accumulator that :meth:`Agent._loop` keeps current."""
+
+    run_id: str = ""
+    iterations: int = 0
+    usage: Usage = field(default_factory=Usage)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _outcome(exc: BaseException | None) -> tuple[Outcome, str | None]:
+    """Map how a run ended to its ``RunRecord`` outcome and ``error_type``."""
+    if exc is None:
+        return "completed", None
+    if isinstance(exc, MaxIterationsError):
+        return "max_iterations", None
+    if isinstance(exc, RunTimeoutError):
+        return "run_timeout", None
+    if isinstance(exc, (asyncio.CancelledError, GeneratorExit)):
+        return "cancelled", None
+    return "error", type(exc).__name__
+
+
+def _check_metadata(metadata: Mapping[str, str] | None) -> dict[str, str] | None:
+    if metadata is None:
+        return None
+    if not isinstance(metadata, Mapping) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in metadata.items()
+    ):
+        raise LogposeError("session metadata must be a mapping of str to str.")
+    return dict(metadata)
+
+
+async def _exit_session(
+    handle: SessionHandle,
+    cm: AbstractAsyncContextManager[SessionHandle],
+    exc: BaseException | None,
+) -> None:
+    """Leave a store session block: save new messages and release the lease.
+
+    A session block closes its open streams first (:func:`_close_streams`).
+    Any tool call still unanswered at the end of the history (a stream that
+    could not be closed because it is running elsewhere, or whose close was
+    abandoned) then gets an error result in the saved copy, so the stored
+    session stays replayable.
+    """
+    from logpose.store import manager
+
+    manager._ACTIVE_HANDLES.pop(handle, None)
+    messages = handle.conversation.messages
+    if messages and messages[-1].role == "assistant":
+        calls = [b for b in messages[-1].content if isinstance(b, ToolUseBlock)]
+        if calls:
+            # A copy: a run still going in another task keeps appending to the old
+            # list (and answers these calls itself); only the saved history changes.
+            repair = _error_results(calls, "Run ended before this tool finished.")
+            handle.conversation = Conversation([*messages, repair])
+    if exc is None:
+        await cm.__aexit__(None, None, None)
+    else:
+        await cm.__aexit__(type(exc), exc, exc.__traceback__)
+
+
+async def _close_stream(stream: AsyncIterator[Any], leftovers: list[asyncio.Future[Any]]) -> None:
+    """Close one stream left open on a session block's handle.
+
+    A run suspended after a ``ToolCall`` answers its calls and writes its run
+    record (inside its own bounded exit) before the block saves. A stream
+    running in another task cannot be closed and is skipped. Exit work the
+    stream abandons is collected in ``leftovers``.
+    """
+    _EXIT_LEFTOVERS.set(leftovers)
+    try:
+        await _aclose(stream)
+    except Exception as error:  # noqa: BLE001 - the save must still happen
+        _RUNTIME_LOGGER.warning("closing a session stream failed: %s", type(error).__name__)
+
+
+async def _close_streams(handle: SessionHandle) -> bool:
+    """Close every stream still open on ``handle``; return whether the caller was cancelled.
+
+    Each stream closes in its own task, concurrently, so a stuck one cannot
+    keep the others open; a close still running after :data:`SESSION_EXIT_TIMEOUT`
+    plus a margin is abandoned. Before returning, waits up to
+    :data:`_LEFTOVER_WAIT` for abandoned work (a run record still holding the
+    store) to end, so the save's budget starts with the store free.
+    """
+    from logpose.store import manager
+
+    # No new run may start on the handle once its streams are being closed.
+    manager._ACTIVE_HANDLES.pop(handle, None)
+    streams = list(manager._STREAMS.pop(handle, ()))
+    if not streams:
+        return False
+    leftovers: list[asyncio.Future[Any]] = []
+    tasks = [asyncio.ensure_future(_close_stream(stream, leftovers)) for stream in streams]
+    bound = SESSION_EXIT_TIMEOUT + _STREAM_CLOSE_MARGIN
+    cancelled = await _wait_shielded(tasks, bound)
+    for task in tasks:
+        if not task.done():
+            _abandon(task)
+            leftovers.append(task)
+            _RUNTIME_LOGGER.warning(
+                "closing a session stream did not finish within %ss; saving without its run record",
+                bound,
+            )
+        elif task.cancelled():
+            _RUNTIME_LOGGER.warning("closing a session stream was cancelled")
+        elif task.exception() is not None:
+            _RUNTIME_LOGGER.warning(
+                "closing a session stream failed: %s", type(task.exception()).__name__
+            )
+    # Re-check until a fixed deadline: a stream still closing in the background
+    # can abandon its run record (adding to ``leftovers``) after this starts.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LEFTOVER_WAIT
+    while pending := [task for task in leftovers if not task.done()]:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            _RUNTIME_LOGGER.warning(
+                "abandoned session stream work still running after %ss; saving anyway",
+                _LEFTOVER_WAIT,
+            )
+            break
+        cancelled = await _wait_shielded(pending, remaining) or cancelled
+    return cancelled
+
+
+async def _wait_shielded(tasks: Collection[asyncio.Future[Any]], timeout: float) -> bool:
+    """Wait up to ``timeout`` seconds for all ``tasks``; return whether the caller was cancelled.
+
+    A cancellation of the caller does not stop the wait; it is reported instead.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    cancelled = False
+    while not all(task.done() for task in tasks):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait(tasks, timeout=remaining)
+        except asyncio.CancelledError:
+            cancelled = True
+    return cancelled
+
+
+def _abandon(task: asyncio.Future[Any]) -> None:
+    """Cancel an exit task that overran, keeping it referenced until it ends."""
+    task.cancel()
+    _ABANDONED.add(task)
+    leftovers = _EXIT_LEFTOVERS.get()
+    if leftovers is not None:
+        leftovers.append(task)
+
+    def done(t: asyncio.Future[Any]) -> None:
+        _ABANDONED.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            _RUNTIME_LOGGER.warning(
+                "abandoned session exit failed: %s", type(t.exception()).__name__
+            )
+
+    task.add_done_callback(done)
+
+
+async def _finish_session(
+    work: Coroutine[Any, Any, None],
+    exc: BaseException | None,
+    *,
+    close: SessionHandle | None = None,
+) -> None:
+    """Run a session exit inside a bounded shield.
+
+    The work runs as its own task and is waited on for up to
+    :data:`SESSION_EXIT_TIMEOUT` seconds even if the caller is cancelled again
+    meanwhile; a cancellation received while waiting is re-raised afterwards.
+    When the run itself was cancelled or abandoned (``exc`` is a
+    ``CancelledError`` or ``GeneratorExit``), failures of the exit are logged
+    rather than raised, so the cancellation propagates unchanged; otherwise
+    they propagate (for example :class:`~logpose.errors.SessionBusyError` for
+    a lost lease).
+
+    With ``close``, the streams still open on that handle are closed first, in
+    a shielded phase of their own (:func:`_close_streams`), so the save's
+    budget starts only once closing is over.
+    """
+    cancelled = await _close_streams(close) if close is not None else False
+    # The work task must not inherit a block's collector: only this exit's own
+    # abandonment (below, in the closing stream's context) belongs there.
+    token = _EXIT_LEFTOVERS.set(None)
+    try:
+        task = asyncio.ensure_future(work)
+    finally:
+        _EXIT_LEFTOVERS.reset(token)
+    cancelled = await _wait_shielded({task}, SESSION_EXIT_TIMEOUT) or cancelled
+    quiet = isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+    if not task.done():
+        _abandon(task)
+        _RUNTIME_LOGGER.warning(
+            "session exit did not finish within %ss; the lease will lapse on its own",
+            SESSION_EXIT_TIMEOUT,
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        if quiet:
+            return
+        raise LogposeError(
+            f"Saving the session did not finish within {SESSION_EXIT_TIMEOUT}s."
+        ) from exc
+    if cancelled:
+        if not task.cancelled() and task.exception() is not None:
+            _RUNTIME_LOGGER.warning("session exit failed: %s", type(task.exception()).__name__)
+        raise asyncio.CancelledError
+    if quiet:
+        if not task.cancelled() and task.exception() is not None:
+            _RUNTIME_LOGGER.warning("session exit failed: %s", type(task.exception()).__name__)
+        return
+    task.result()
+
+
+def _error_results(calls: list[ToolUseBlock], text: str) -> Message:
+    """Build the user turn answering every call in ``calls`` with an error result."""
+    return Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_use_id=call.id, content=text, is_error=True) for call in calls
+        ],
+    )
 
 
 def _as_message(prompt: str | Message) -> Message:

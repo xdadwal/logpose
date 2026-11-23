@@ -30,11 +30,22 @@ __all__ = [
     "StructuredOutputUnsupportedError",
     "OutputValidationError",
     "OutputRefusalError",
+    "SessionBusyError",
 ]
 
 
 class LogposeError(Exception):
     """Base class for every error raised by logpose."""
+
+
+class SessionBusyError(LogposeError):
+    """Raised when a session's lease cannot be taken or was lost.
+
+    On enter, the session is leased elsewhere (a run is in flight). On exit, the
+    lease was lost (it expired and another holder took it) and the messages were
+    not saved. Also raised when a run starts on a handle whose lease lapsed while
+    idle and was taken by another holder.
+    """
 
 
 class AuthError(LogposeError):

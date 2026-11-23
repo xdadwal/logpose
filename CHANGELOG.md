@@ -26,8 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
   search was already 8,000.
 
+### Changed (dependencies)
+
+- `aiosqlite>=0.20` is now a core dependency, imported lazily on first session use.
+
 ### Added
 
+- Sessions: `agent.run/stream(..., session_id=...)` and
+  `async with agent.session(sid)` persist history and run records in SQLite
+  (`LOGPOSE_DB_PATH`, default `logpose.db`) with a per-session lease. Adds
+  `SessionHandle`, `Agent(session_wait=...)`, `Agent.purge_expired_sessions()`,
+  `Agent.delete_session()` and `SessionBusyError`. The sync facade accepts the same
+  arguments and `SyncAgent.session(...)` as a `with` block. Leaving an
+  `agent.session(...)` block closes streams still open on it (each concurrently,
+  within its own bounded exit), waits up to 6 s for an abandoned run record to
+  free the database, then gives the save its own 8 s, so a busy database can
+  cost such a stream its run record (logged) but not the block's messages or
+  lease release.
 - Structured output: `agent.run(..., output_type=Model)` (also on `stream`, the sync
   facade, and as an `Agent` default) returns a validated `RunResult[T].output`,
   enforced only via strict `json_schema` `response_format`. `output_retries`

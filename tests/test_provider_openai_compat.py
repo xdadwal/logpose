@@ -368,6 +368,14 @@ async def test_usage_subtracts_cached_tokens_from_input() -> None:
     assert usage.output_tokens == 20
 
 
+async def test_reasoning_tokens_mapped_from_completion_details() -> None:
+    chunk = usage_chunk(10, 20)
+    chunk["usage"]["completion_tokens_details"] = {"reasoning_tokens": 7}
+    handler = Recorder(sse(finish_chunk("stop"), chunk))
+    done = (await drain(make_provider(handler), request()))[-1]
+    assert done.usage.reasoning_tokens == 7
+
+
 async def test_cached_tokens_cannot_exceed_prompt_tokens() -> None:
     handler = Recorder(sse(finish_chunk("stop"), usage_chunk(10, 1, cached=999)))
     usage = (await drain(make_provider(handler), request()))[-1].usage

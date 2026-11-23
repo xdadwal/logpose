@@ -228,3 +228,7 @@ class TestUsage:
         usage = Usage(input_tokens=1, output_tokens=2, cache_read_input_tokens=3)
 
         assert Usage.model_validate(usage.model_dump()) == usage
+
+
+def test_usage_adds_reasoning_tokens() -> None:
+    assert (Usage(reasoning_tokens=2) + Usage(reasoning_tokens=3)).reasoning_tokens == 5

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -43,6 +44,7 @@ from logpose.events import (
 from logpose.lifecycle import ToolObservation
 from logpose.messages import (
     Message,
+    RawBlock,
     RedactedThinkingBlock,
     TextBlock,
     ThinkingBlock,
@@ -2162,3 +2164,67 @@ async def test_run_timeout_is_not_reported_as_a_provider_failure() -> None:
     failed = [e for e in events if e.name == "provider.attempt.failed"]
     assert all(e.exception_type != "_RunExpired" for e in failed)
     assert events[-1].name == "run.timed_out"
+
+
+def test_conversation_json_round_trip_is_lossless() -> None:
+    conv = Conversation(
+        [
+            Message.user("hi"),
+            Message(
+                role="assistant",
+                content=[
+                    ThinkingBlock(thinking="hmm", signature="sig"),
+                    TextBlock(text="calling"),
+                    ToolUseBlock(id="t1", name="f", input={"a": 1}),
+                    RawBlock(data={"k": [1, 2]}),
+                ],
+            ),
+            Message(
+                role="user",
+                content=[ToolResultBlock(tool_use_id="t1", content="ok", is_error=True)],
+            ),
+        ]
+    )
+    assert Conversation.from_json(conv.to_json()).messages == conv.messages
+
+
+def test_conversation_from_json_rejects_unknown_version() -> None:
+    from logpose.errors import LogposeError
+
+    with pytest.raises(LogposeError, match="version"):
+        Conversation.from_json('{"version": 99, "messages": []}')
+
+
+def test_conversation_to_json_uses_json_mode() -> None:
+    import datetime
+
+    from logpose.messages import Message, ToolUseBlock
+
+    conv = Conversation(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(id="t1", name="x", input={"when": datetime.date(2026, 1, 2)})
+                ],
+            )
+        ]
+    )
+    data = json.loads(conv.to_json())
+    assert data["messages"][0]["content"][0]["input"] == {"when": "2026-01-02"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        '{"version": 1}',
+        '{"version": 1, "messages": [{"role": "bogus", "content": "x"}]}',
+        '{"version": 1, "messages": 5}',
+    ],
+)
+def test_conversation_from_json_rejects_malformed(text: str) -> None:
+    from logpose.errors import LogposeError
+
+    with pytest.raises(LogposeError):
+        Conversation.from_json(text)
