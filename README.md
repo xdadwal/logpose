@@ -542,7 +542,7 @@ response, so a busy session is still a 409 before any headers go out, and leave 
 when the body finishes:
 
 ```python
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, aclosing
 
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
@@ -559,9 +559,12 @@ async def chat_stream(sid: str, body: ChatIn):
 
     async def chunks():
         try:
-            async for event in agent.stream(body.text, session=handle):
-                if isinstance(event, TextDelta):
-                    yield event.text
+            # aclosing ends the run (answering any tool call it was waiting on)
+            # before the session is saved, also when the client leaves mid-stream.
+            async with aclosing(agent.stream(body.text, session=handle)) as events:
+                async for event in events:
+                    if isinstance(event, TextDelta):
+                        yield event.text
         finally:
             await stack.aclose()  # saves and releases, also when the client leaves
 
@@ -569,6 +572,10 @@ async def chat_stream(sid: str, body: ChatIn):
     # before streaming began); closing the stack a second time does nothing.
     return StreamingResponse(chunks(), background=BackgroundTask(stack.aclose))
 ```
+
+Leaving a session block also closes any stream still open on its handle before
+saving, and answers a trailing unanswered tool call with an error result, so a
+stored session always stays replayable.
 
 For a single call, the convenience form does the same in one step:
 
@@ -581,8 +588,15 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
 
 - **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
   The file is created on first session use; runs without a session never touch disk.
+- **Session IDs:** anyone who knows a session ID can load that conversation, so use
+  unguessable IDs (for example `secrets.token_urlsafe(32)`) and check that the
+  caller owns the session before using it.
 - **Lease:** a lease lasts 60 seconds and is renewed every 20 seconds while its run
-  or block is active, so a crashed process frees its sessions within a minute.
+  or block is active, so a crashed process frees its sessions within a minute. A
+  block that has had no run in progress for 3 minutes stops renewing: its lease
+  expires on its own (so a dropped, never-run streaming response cannot hold a
+  session forever), new runs on that handle raise `SessionBusyError`, and its exit
+  still saves if nobody took the lease meanwhile.
 - **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
 - **Expiry:** a session expires after 30 days without use; an expired session starts
   empty on its next use. logpose never deletes rows on its own: call

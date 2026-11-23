@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -2192,3 +2193,38 @@ def test_conversation_from_json_rejects_unknown_version() -> None:
 
     with pytest.raises(LogposeError, match="version"):
         Conversation.from_json('{"version": 99, "messages": []}')
+
+
+def test_conversation_to_json_uses_json_mode() -> None:
+    import datetime
+
+    from logpose.messages import Message, ToolUseBlock
+
+    conv = Conversation(
+        [
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(id="t1", name="x", input={"when": datetime.date(2026, 1, 2)})
+                ],
+            )
+        ]
+    )
+    data = json.loads(conv.to_json())
+    assert data["messages"][0]["content"][0]["input"] == {"when": "2026-01-02"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "not json",
+        '{"version": 1}',
+        '{"version": 1, "messages": [{"role": "bogus", "content": "x"}]}',
+        '{"version": 1, "messages": 5}',
+    ],
+)
+def test_conversation_from_json_rejects_malformed(text: str) -> None:
+    from logpose.errors import LogposeError
+
+    with pytest.raises(LogposeError):
+        Conversation.from_json(text)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sqlite3
 import subprocess
@@ -730,9 +731,10 @@ def _streaming_endpoint(agent: Agent) -> Any:
 
         async def body() -> Any:
             try:
-                async for event in agent.stream(text, session=handle):
-                    if isinstance(event, TextDelta):
-                        yield event.text
+                async with contextlib.aclosing(agent.stream(text, session=handle)) as events:
+                    async for event in events:
+                        if isinstance(event, TextDelta):
+                            yield event.text
             finally:
                 await stack.aclose()  # save and release once streaming ends
 
@@ -813,3 +815,183 @@ async def test_readme_streaming_pattern_releases_on_client_disconnect(db: Path) 
     await background()
     assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
     await agent.aclose()
+
+
+# --- review fixes: an open stream on a closing block, idle leases ----------------------
+
+
+def _assert_all_tool_uses_answered(messages: list[Any]) -> None:
+    """Every tool_use is answered by the message right after it."""
+    from logpose.messages import ToolResultBlock, ToolUseBlock
+
+    for i, m in enumerate(messages):
+        ids = [b.id for b in m.content if isinstance(b, ToolUseBlock)]
+        if not ids:
+            continue
+        assert i + 1 < len(messages), f"unanswered tool_use {ids} at the end"
+        following = messages[i + 1].content
+        answered = [b.tool_use_id for b in following if isinstance(b, ToolResultBlock)]
+        assert answered == ids
+
+
+def _stored(db: Path, sid: str = "s1") -> list[Any]:
+    import json
+
+    from logpose.messages import Message
+
+    return [
+        Message.model_validate({"role": role, "content": json.loads(content)})
+        for role, content in _rows(
+            db,
+            "SELECT role, content FROM logpose_messages WHERE session_id = ? ORDER BY seq",
+            sid,
+        )
+    ]
+
+
+async def test_block_exit_closes_stream_suspended_after_tool_call(db: Path) -> None:
+    from logpose.events import ToolCall
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t1")), ScriptedTurn.text("ok")]
+    )
+    agent = Agent(provider, model="m", tools=[nap])
+    async with agent.session("s1") as handle:
+        events = agent.stream("go", session=handle)
+        async for event in events:
+            if isinstance(event, ToolCall):
+                break
+        # The stream is left suspended right after the ToolCall; the block exits.
+    stored = _stored(db)
+    _assert_replayable(stored, ["t1"], _ENDED)
+    assert _rows(db, "SELECT outcome FROM logpose_runs") == [("cancelled",)]
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    # The session stays usable.
+    result = await agent.run("again", session_id="s1")
+    assert result.text == "ok"
+    _assert_all_tool_uses_answered(provider.requests[1].messages)
+    await agent.aclose()
+
+
+async def test_readme_pattern_with_tool_calls_and_held_stream_disconnect(db: Path) -> None:
+    """Reviewer repro: chunks yields ToolCall events too and holds the stream in a
+    variable (no aclosing); the client leaves after the ToolCall chunk."""
+    from contextlib import AsyncExitStack
+
+    from logpose.events import ToolCall
+
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 0}, id="t1")), ScriptedTurn.text("ok")]
+    )
+    agent = Agent(provider, model="m", tools=[nap])
+    stack = AsyncExitStack()
+    handle = await stack.enter_async_context(agent.session("s1"))
+
+    async def chunks() -> Any:
+        events = agent.stream("go", session=handle)
+        try:
+            async for event in events:
+                if isinstance(event, TextDelta):
+                    yield event.text
+                elif isinstance(event, ToolCall):
+                    yield f"[calling {event.name}]"
+        finally:
+            await stack.aclose()
+
+    body = chunks()
+    assert await body.__anext__() == "[calling nap]"
+    await body.aclose()  # client disconnected
+    await stack.aclose()  # background task
+    stored = _stored(db)
+    _assert_all_tool_uses_answered(stored)
+    _assert_replayable(stored, ["t1"], _ENDED)
+    result = await agent.run("again", session_id="s1")
+    assert result.text == "ok"
+    await agent.aclose()
+
+
+async def test_block_exit_repairs_trailing_unanswered_tool_use(db: Path) -> None:
+    from logpose.messages import Message, TextBlock, ToolUseBlock
+
+    agent = Agent(FakeProvider(ScriptedTurn.text("ok")), model="m")
+    async with agent.session("s1") as handle:
+        handle.conversation.append(Message(role="user", content=[TextBlock(text="go")]))
+        handle.conversation.append(
+            Message(role="assistant", content=[ToolUseBlock(id="t9", name="nap", input={})])
+        )
+    _assert_replayable(_stored(db), ["t9"], _ENDED)
+    await agent.aclose()
+
+
+def _short_lease(monkeypatch: pytest.MonkeyPatch, ttl: float) -> None:
+    import logpose.store.sqlite as sqlite_mod
+
+    real = sqlite_mod.SQLiteStore
+
+    class ShortLease(real):  # type: ignore[misc,valid-type]
+        def __init__(self, path: Any, **kw: Any) -> None:
+            super().__init__(path, lease_ttl=ttl, **kw)
+
+    monkeypatch.setattr(sqlite_mod, "SQLiteStore", ShortLease)
+
+
+async def test_dropped_never_run_response_frees_lease(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """README pattern whose response is dropped unrun; references stay alive (a cycle)."""
+    _short_lease(monkeypatch, 0.2)
+    agent = Agent(FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]), model="m")
+    chat_stream = _streaming_endpoint(agent)
+    status, body, background = await chat_stream("s1", "hi")
+    assert status == 200
+    kept = (body, background)  # never iterated, never closed
+    assert (await chat_stream("s1", "x"))[0] == 409
+    # Idle bound (3 x lease TTL) plus the TTL itself, plus slack.
+    await asyncio.sleep(0.6 + 0.2 + 0.4)
+    status, body2, background2 = await chat_stream("s1", "again")
+    assert status == 200
+    assert [c async for c in body2] == ["a"]
+    await background2()
+    del kept
+    await agent.aclose()
+
+
+async def test_idle_block_refuses_new_run_after_lease_lapses(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _short_lease(monkeypatch, 0.2)
+    agent = Agent(FakeProvider(ScriptedTurn.text("a")), model="m")
+    async with agent.session("s1") as handle:
+        await asyncio.sleep(0.6 + 0.3)
+        with pytest.raises(SessionBusyError):
+            agent.stream("hi", session=handle)
+    # Nobody else took the lease, so the exit still frees it cleanly.
+    assert _rows(db, "SELECT lease_token FROM logpose_sessions") == [(None,)]
+    await agent.aclose()
+
+
+async def test_long_run_keeps_lease_past_idle_bound(
+    db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _short_lease(monkeypatch, 0.2)
+    provider = FakeProvider(
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 1.2})), ScriptedTurn.text("done")]
+    )
+    agent = Agent(provider, model="m", tools=[nap])
+    async with agent.session("s1") as handle:
+        task = asyncio.create_task(agent.run("go", session=handle))
+        await asyncio.sleep(1.0)  # past the idle bound, run still active
+        with pytest.raises(SessionBusyError):
+            async with agent.session("s1"):
+                pass
+        result = await task
+    assert result.text == "done"
+    assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(4,)]
+    await agent.aclose()
+
+
+def test_session_exit_timeout_exceeds_busy_timeout() -> None:
+    from logpose.agent import SESSION_EXIT_TIMEOUT
+    from logpose.store.sqlite import SQLiteStore
+
+    assert SESSION_EXIT_TIMEOUT > SQLiteStore(":memory:")._busy_timeout_ms / 1000

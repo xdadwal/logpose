@@ -651,3 +651,64 @@ def test_processes_racing_on_a_fresh_file_all_open(tmp_path: Path) -> None:
         with sqlite3.connect(p) as conn:
             assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
             assert conn.execute("SELECT version FROM logpose_schema").fetchall() == [(1,)]
+
+
+async def test_purge_expired_spares_a_leased_session(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p) as s:
+        async with s.session("s1") as h:
+            h.conversation.append(_msg("hi"))
+        async with s.session("s1") as h:
+            # Past expires_at, but leased right now: purge must not touch it.
+            await s._write([("UPDATE logpose_sessions SET expires_at = 1 WHERE id = 's1'", ())])
+            assert await s.purge_expired() == 0
+            assert len(await s.load_messages("s1")) == 1
+            h.conversation.append(_msg("more"))
+        assert len(await s.load_messages("s1")) == 2
+
+
+async def test_failed_history_load_releases_the_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import logpose.store.sqlite as sqlite_mod
+
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p) as s:
+        async with s.session("s1") as h:
+            h.conversation.append(_msg("hi"))
+        real = sqlite_mod._fetch_messages
+
+        async def boom(db: Any, sid: str) -> Any:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(sqlite_mod, "_fetch_messages", boom)
+        with pytest.raises(sqlite3.OperationalError):
+            async with s.session("s1"):
+                pass
+        monkeypatch.setattr(sqlite_mod, "_fetch_messages", real)
+        async with s.session("s1") as h:  # not left leased
+            assert len(h.conversation.messages) == 1
+
+
+async def test_renewal_stops_after_idle_bound(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p, lease_ttl=0.2) as s:
+        with pytest.raises(SessionBusyError):
+            async with s.session("s1") as h:
+                await asyncio.sleep(0.6 + 0.2 + 0.3)
+                assert h.lapsed
+                async with s.session("s1") as other:  # the idle lease lapsed
+                    assert other.id == "s1"
+        # The stale holder's exit is refused: the lease moved on meanwhile.
+
+
+async def test_renewal_continues_while_a_run_is_active(tmp_path: Path) -> None:
+    p = tmp_path / "t.db"
+    async with SQLiteStore(p, lease_ttl=0.2) as s:
+        async with s.session("s1") as h:
+            h.idle_since = None  # a run is in progress
+            await asyncio.sleep(0.6 + 0.2 + 0.3)
+            assert not h.lapsed
+            with pytest.raises(SessionBusyError):
+                async with s.session("s1"):
+                    pass

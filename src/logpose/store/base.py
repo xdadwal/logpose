@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
@@ -58,6 +59,11 @@ class SessionHandle:
         loaded_count: How many messages were loaded on enter. Messages after this
             index in ``conversation.messages`` are new and are saved on exit.
         next_seq: The stored ``seq`` the first new message will get.
+        idle_since: ``time.monotonic()`` when the handle last went idle (opened,
+            or a run on it ended), or ``None`` while a run is in progress. The
+            store stops renewing a lease idle for longer than three lease TTLs.
+        lapsed: True once renewal stopped because the handle sat idle; the
+            lease then expires on its own and new runs on the handle are refused.
     """
 
     def __init__(
@@ -77,6 +83,8 @@ class SessionHandle:
         self.lost = lost
         self.loaded_count = loaded_count
         self.next_seq = next_seq
+        self.idle_since: float | None = time.monotonic()
+        self.lapsed = False
 
     def new_messages(self) -> list[Message]:
         """Return the messages appended to ``conversation`` since it was loaded."""

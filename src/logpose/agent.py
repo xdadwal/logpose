@@ -80,6 +80,7 @@ import json
 import logging
 import time
 import traceback
+import weakref
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -96,7 +97,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
 from uuid import uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from logpose.cancellation import (
     ToolDeadlineHandle,
@@ -111,6 +112,7 @@ from logpose.errors import (
     OutputValidationError,
     ProviderError,
     RunTimeoutError,
+    SessionBusyError,
     ToolExecutionError,
 )
 from logpose.events import (
@@ -209,8 +211,12 @@ Providers reject empty content blocks, so a tool that returns ``""`` would
 otherwise fail the *next* request rather than its own.
 """
 
-SESSION_EXIT_TIMEOUT = 5.0
-"""Seconds a session run's exit (record the run, save, release) may take once shielded."""
+SESSION_EXIT_TIMEOUT = 8.0
+"""Seconds a session run's exit (record the run, save, release) may take once shielded.
+
+Longer than the store's 5-second SQLite ``busy_timeout``, so one wait on a busy
+database cannot use up the whole exit.
+"""
 
 _RUNTIME_LOGGER = logging.getLogger("logpose.runtime")
 
@@ -379,7 +385,7 @@ class Conversation:
             ``{"version": 1, "messages": [...]}`` as a JSON string; lossless for
             every content block type.
         """
-        messages = [m.model_dump() for m in self.messages]
+        messages = [m.model_dump(mode="json") for m in self.messages]
         return json.dumps({"version": _CONVERSATION_JSON_VERSION, "messages": messages})
 
     @classmethod
@@ -393,13 +399,23 @@ class Conversation:
             A new :class:`Conversation`.
 
         Raises:
-            LogposeError: If the document's ``version`` is not supported.
+            LogposeError: If the document is not valid JSON, its ``version`` is
+                not supported, or its messages are malformed.
         """
-        data = json.loads(text)
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise LogposeError(f"conversation JSON is not valid JSON: {exc}") from None
         version = data.get("version") if isinstance(data, dict) else None
         if version != _CONVERSATION_JSON_VERSION:
             raise LogposeError(f"unsupported conversation JSON version: {version!r}")
-        return cls(Message.model_validate(m) for m in data["messages"])
+        raw = data.get("messages")
+        if not isinstance(raw, list):
+            raise LogposeError("conversation JSON must have a 'messages' list")
+        try:
+            return cls(Message.model_validate(m) for m in raw)
+        except ValidationError as exc:
+            raise LogposeError(f"conversation JSON has a malformed message: {exc}") from None
 
     @property
     def text(self) -> str:
@@ -863,7 +879,13 @@ class Agent:
             self._active_store(session)
             if first is None and not session.conversation.messages:
                 raise LogposeError("Nothing to send: pass a prompt, or a session with history.")
-            return self._session_loop(first, resolved_type, resolved_retries, handle=session)
+            from logpose.store import manager
+
+            stream = self._session_loop(first, resolved_type, resolved_retries, handle=session)
+            # Registered so the block can close it before saving: a stream left
+            # suspended mid-run must answer its tool calls before the history is stored.
+            manager._STREAMS.setdefault(session, weakref.WeakSet()).add(stream)
+            return stream
         if first is None and not (conversation is not None and conversation.messages):
             raise LogposeError(
                 "Nothing to send: pass a prompt, or a conversation that already has messages."
@@ -958,6 +980,11 @@ class Agent:
             )
         if handle in manager._RUNNING:
             raise LogposeError(f"Session {handle.id!r} already has a run in progress.")
+        if handle.lapsed:
+            raise SessionBusyError(
+                f"lease on session {handle.id!r} lapsed after its block sat idle; "
+                "open a new session block"
+            )
         return store
 
     async def _session_loop(
@@ -994,6 +1021,7 @@ class Agent:
         else:
             store = self._active_store(handle)
         manager._RUNNING.add(handle)
+        handle.idle_since = None
         stats = _RunStats()
         started_ms = _now_ms()
         run_end: RunEnd | None = None
@@ -1011,10 +1039,12 @@ class Agent:
                 await _aclose(inner)
         except BaseException as exc:
             manager._RUNNING.discard(handle)
+            handle.idle_since = monotonic()
             work = self._end_session_run(store, handle, cm, stats, started_ms, exc)
             await _finish_session(work, exc)
             raise
         manager._RUNNING.discard(handle)
+        handle.idle_since = monotonic()
         await _finish_session(
             self._end_session_run(store, handle, cm, stats, started_ms, None), None
         )
@@ -2132,10 +2162,27 @@ async def _exit_session(
     cm: AbstractAsyncContextManager[SessionHandle],
     exc: BaseException | None,
 ) -> None:
-    """Leave a store session block: save new messages and release the lease."""
+    """Leave a store session block: save new messages and release the lease.
+
+    Streams still open on the handle are closed first, so a run suspended after
+    a ``ToolCall`` answers its calls and writes its run record before the save.
+    Any tool call still unanswered at the end of the history (a stream that
+    could not be closed because it is running elsewhere) then gets an error
+    result, so the stored session stays replayable.
+    """
     from logpose.store import manager
 
     manager._ACTIVE_HANDLES.pop(handle, None)
+    for stream in list(manager._STREAMS.pop(handle, ())):
+        try:
+            await _aclose(stream)
+        except Exception as error:  # noqa: BLE001 - the save must still happen
+            _RUNTIME_LOGGER.warning("closing a session stream failed: %s", type(error).__name__)
+    messages = handle.conversation.messages
+    if messages and messages[-1].role == "assistant":
+        calls = [b for b in messages[-1].content if isinstance(b, ToolUseBlock)]
+        if calls:
+            messages.append(_error_results(calls, "Run ended before this tool finished."))
     if exc is None:
         await cm.__aexit__(None, None, None)
     else:
