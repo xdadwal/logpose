@@ -172,6 +172,8 @@ async def test_invoke_agent_attributes(db: Path) -> None:
     assert attrs[sc.GEN_AI_USAGE_OUTPUT_TOKENS] == 3
     assert attrs[sc.LOGPOSE_USAGE_INPUT_TOKENS] == 10
     assert attrs[sc.LOGPOSE_USAGE_CACHE_READ_INPUT_TOKENS] == 5
+    assert attrs["gen_ai.usage.cache_read.input_tokens"] == 5
+    assert attrs["gen_ai.usage.cache_creation.input_tokens"] == 0
     assert attrs[sc.LOGPOSE_USAGE_CACHE_CREATION_INPUT_TOKENS] == 0
     assert attrs[sc.LOGPOSE_USAGE_REASONING_TOKENS] == 2
     assert attrs[sc.GEN_AI_CONVERSATION_ID] == "s1"
@@ -180,7 +182,7 @@ async def test_invoke_agent_attributes(db: Path) -> None:
     assert attrs[sc.GEN_AI_REQUEST_MODEL] == "m"
     assert attrs[sc.LOGPOSE_METADATA_PREFIX + "exp"] == "baseline"
     assert attrs[sc.LOGPOSE_METADATA_PREFIX + "n"] == "3"
-    assert attrs[sc.LOGPOSE_METADATA_PREFIX + "ok"] == "True"
+    assert attrs[sc.LOGPOSE_METADATA_PREFIX + "ok"] == "true"  # JSON spelling
     cfg = sc.LOGPOSE_CONFIG_PREFIX
     assert attrs[cfg + "max_iterations"] == 10
     assert attrs[cfg + "max_tokens"] == agent._max_tokens()
@@ -1030,3 +1032,54 @@ def test_store_without_span_methods_disables_tracing_once(
     assert [r.getMessage() for r in caplog.records].count(
         "session store Bare does not implement SpanStore; tracing is disabled"
     ) == 1
+
+
+class ShortKeyProvider(FakeProvider):
+    def _secrets(self) -> tuple[str, ...]:
+        return ("EMPTY", "ollama", KEY)
+
+
+async def test_short_secrets_are_not_scrubbed() -> None:
+    agent = Agent(
+        ShortKeyProvider(ScriptedTurn.text("ok")),
+        model="m",
+        tracing=Tracing(capture_content=True),
+    )
+    await agent.run(f"EMPTY ollama {KEY}")
+    (chat,) = by_op(spans_of(agent), "chat")
+    sent = chat.attributes[sc.GEN_AI_INPUT_MESSAGES]
+    assert "EMPTY ollama" in sent  # too short to be a credential worth scrubbing
+    assert KEY not in sent and redact(KEY) in sent
+
+
+def test_run_id_claim_is_atomic_across_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+    import time as _time
+
+    import logpose.agent as agent_mod
+
+    class SlowSet(set):  # type: ignore[type-arg]
+        def __contains__(self, item: object) -> bool:
+            found = super().__contains__(item)
+            _time.sleep(0.05)  # let the other thread check before this one adds
+            return found
+
+    monkeypatch.setattr(agent_mod, "_ACTIVE_RUN_IDS", SlowSet())
+    agent = Agent(FakeProvider(ScriptedTurn.text("ok")), model="m", tracing=None)
+    outcomes: list[str] = []
+    start = threading.Barrier(2)
+
+    def claim() -> None:
+        start.wait()
+        try:
+            asyncio.run(agent._reserve_run_id("same-id", None, None))
+            outcomes.append("claimed")
+        except LogposeError:
+            outcomes.append("rejected")
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(outcomes) == ["claimed", "rejected"]

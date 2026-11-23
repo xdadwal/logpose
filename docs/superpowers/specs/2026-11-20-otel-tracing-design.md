@@ -113,7 +113,13 @@ config snapshot `logpose.config.*`, gate-block events, and error status with
 - `purge_expired` skips sessions under a live lease, and so keeps their spans.
 - **Token usage follows the convention:** `gen_ai.usage.input_tokens` includes
   cached tokens (logpose's uncached input plus `cache_read_input_tokens`), with
-  raw counts in `logpose.usage.*`.
+  raw counts in `logpose.usage.*`. Cache counts are also emitted as
+  `gen_ai.usage.cache_read.input_tokens` / `gen_ai.usage.cache_creation.input_tokens`
+  (defined in the pinned 1.45.0 registry). `gen_ai.provider.name` stays the logpose
+  provider name (`openai-compat`): no well-known value applies to an arbitrary
+  compatible server.
+- Run metadata is stored on spans as strings; `bool` values as `true`/`false`.
+- Configured secrets shorter than 12 characters are not scrubbed from content.
 
 ### Storage (schema version 3)
 

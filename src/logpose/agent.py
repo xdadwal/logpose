@@ -81,6 +81,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 import traceback
 import weakref
@@ -302,6 +303,9 @@ _TRACE_BACKGROUND: set[asyncio.Future[Any]] = set()
 
 _SLOW_TRACE_OPENS: weakref.WeakSet[asyncio.Future[Any]] = weakref.WeakSet()
 """Trace-store opens a run already gave up waiting for; not waited on again."""
+
+_RUN_IDS_LOCK = threading.Lock()
+"""Guards check-then-add on :data:`_ACTIVE_RUN_IDS` across threads."""
 
 _ACTIVE_RUN_IDS: set[str] = set()
 """Caller-supplied run IDs of runs in flight in this process, across all agents
@@ -1626,9 +1630,11 @@ class Agent:
         """
         if run_id is None:
             return False
-        if run_id in _ACTIVE_RUN_IDS:
-            raise LogposeError(f"run_id {run_id!r} is already in use by a running run.")
-        _ACTIVE_RUN_IDS.add(run_id)
+        # Locked: the sync facade runs agents on their own threads and loops.
+        with _RUN_IDS_LOCK:
+            if run_id in _ACTIVE_RUN_IDS:
+                raise LogposeError(f"run_id {run_id!r} is already in use by a running run.")
+            _ACTIVE_RUN_IDS.add(run_id)
         try:
             exists = await store.run_id_exists(run_id) if store is not None else False
             if not exists and sink is not None:
@@ -1643,7 +1649,8 @@ class Agent:
                     f"run_id {run_id!r} already exists; every run needs a fresh run_id."
                 )
         except BaseException:
-            _ACTIVE_RUN_IDS.discard(run_id)
+            with _RUN_IDS_LOCK:
+                _ACTIVE_RUN_IDS.discard(run_id)
             raise
         return True
 
@@ -3891,7 +3898,8 @@ class _RunIdClaim:
 
     def release(self, _task: object = None) -> None:
         if self.run_id is not None:
-            _ACTIVE_RUN_IDS.discard(self.run_id)
+            with _RUN_IDS_LOCK:
+                _ACTIVE_RUN_IDS.discard(self.run_id)
             self.run_id = None
 
 

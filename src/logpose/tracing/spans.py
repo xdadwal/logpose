@@ -43,6 +43,8 @@ _LOGGER = logging.getLogger("logpose.trace")
 
 TRACE_ENV = "LOGPOSE_TRACE"
 TRACE_CONTENT_ENV = "LOGPOSE_TRACE_CONTENT"
+MIN_SCRUB_CHARS = 12
+"""Configured secrets shorter than this are not scrubbed from captured content."""
 _TRUTHY = frozenset({"1", "true", "yes"})
 
 # OTLP enum values.
@@ -201,6 +203,8 @@ def _usage_attributes(usage: Usage) -> dict[str, Any]:
     return {
         sc.GEN_AI_USAGE_INPUT_TOKENS: usage.input_tokens + usage.cache_read_input_tokens,
         sc.GEN_AI_USAGE_OUTPUT_TOKENS: usage.output_tokens,
+        sc.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS: usage.cache_read_input_tokens,
+        sc.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS: usage.cache_creation_input_tokens,
         sc.LOGPOSE_USAGE_INPUT_TOKENS: usage.input_tokens,
         sc.LOGPOSE_USAGE_REASONING_TOKENS: usage.reasoning_tokens,
         sc.LOGPOSE_USAGE_CACHE_READ_INPUT_TOKENS: usage.cache_read_input_tokens,
@@ -298,7 +302,9 @@ class _SpanBuilder:
         self._config = dict(config)
         self._system = system
         self._tool_specs = tuple(tool_specs)
-        self._secrets = tuple(s for s in secrets if s)
+        # Short values ("EMPTY", "ollama", "none") are placeholders local servers
+        # accept, not credentials; replacing them would mangle ordinary content.
+        self._secrets = tuple(s for s in secrets if len(s) >= MIN_SCRUB_CHARS)
         self._trace_id = new_trace_id()
         self._root: _OpenSpan | None = None
         self._open: set[_OpenSpan] = set()
@@ -439,7 +445,9 @@ class _SpanBuilder:
         if self._session_id is not None:
             attrs[sc.GEN_AI_CONVERSATION_ID] = self._session_id
         for key, value in self._metadata.items():
-            attrs[sc.LOGPOSE_METADATA_PREFIX + key] = self._scrub(str(value))
+            # Strings on spans; bools in their JSON spelling, as in RunRecord.metadata.
+            text = ("true" if value else "false") if isinstance(value, bool) else str(value)
+            attrs[sc.LOGPOSE_METADATA_PREFIX + key] = self._scrub(text)
         for key, value in self._config.items():
             if value is not None:
                 attrs[sc.LOGPOSE_CONFIG_PREFIX + key] = value

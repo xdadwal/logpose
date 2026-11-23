@@ -983,7 +983,12 @@ What capture stores and scrubs:
 - The configured provider API key and `LOGPOSE_API_KEY` are replaced in captured
   content. Request headers are never recorded. An `api_key` you pass directly to
   `openai_decision_guard` is not known to the scrubber, although the guard never
-  puts it in content.
+  puts it in content. Values shorter than 12 characters (placeholders such as
+  `EMPTY` or `ollama` that local servers accept) are not scrubbed, so ordinary
+  words are not mangled.
+- `logpose.config.system_prompt_sha256` (a SHA-256 of the system prompt) is
+  stored even with capture off. It does not reveal the prompt, but a short or
+  guessable system prompt can be confirmed by hashing candidates.
 - Anything else the model or your tools see is stored as is. Treat the database
   as sensitive when capturing content.
 - Each content value is capped at `content_max_chars` (default 64,000). A longer
@@ -1059,7 +1064,8 @@ are timezone-aware datetimes compared with the root span's start at microsecond
 resolution; naive datetimes raise `LogposeError`. `session_id=` limits the export
 to one session. The resource `service.name` is the run's `Tracing.service_name`
 (stored on the root span as `logpose.service.name`; `"logpose"` if absent). Metadata
-values are exported as strings on spans. The file is replaced atomically (written
+values are exported as strings on spans (`bool` as `true`/`false`, as in the run
+record's JSON). The file is replaced atomically (written
 to a temporary file in the same directory, then renamed), so use a new path per
 incremental batch.
 
@@ -1124,6 +1130,12 @@ already-written child spans, leaving a partial trace.
 The GenAI semantic conventions are still in Development. logpose pins release
 1.45.0 and stamps it on exports (`logpose.semconv.version` and the schema URL),
 so attribute names may change in a future logpose release.
+`gen_ai.usage.input_tokens` includes cache reads; cache reads and writes are also
+reported as `gen_ai.usage.cache_read.input_tokens` and
+`gen_ai.usage.cache_creation.input_tokens` (and as `logpose.usage.*`).
+`gen_ai.provider.name` is logpose's provider name (`openai-compat`), not a
+well-known value such as `openai`: an OpenAI-compatible endpoint can be any
+server.
 
 ## Configuration reference
 
