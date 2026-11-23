@@ -289,6 +289,7 @@ class _SpanBuilder:
         system: str | None,
         tool_specs: Sequence[ToolSpec],
         secrets: Sequence[str] = (),
+        extra_keys: Sequence[str] = (),
     ) -> None:
         self._disabled = False
         self.run_id = run_id
@@ -302,6 +303,8 @@ class _SpanBuilder:
         self._config = dict(config)
         self._system = system
         self._tool_specs = tuple(tool_specs)
+        # Names only: per-run values (e.g. a visitor identifier) are never recorded.
+        self._extra_keys = sorted(str(key) for key in extra_keys)
         # Short values ("EMPTY", "ollama", "none") are placeholders local servers
         # accept, not credentials; replacing them would mangle ordinary content.
         self._secrets = tuple(s for s in secrets if len(s) >= MIN_SCRUB_CHARS)
@@ -451,6 +454,8 @@ class _SpanBuilder:
         for key, value in self._config.items():
             if value is not None:
                 attrs[sc.LOGPOSE_CONFIG_PREFIX + key] = value
+        if self._extra_keys:
+            attrs[sc.LOGPOSE_REQUEST_EXTRA_KEYS] = list(self._extra_keys)
         if self._system:
             attrs[sc.LOGPOSE_CONFIG_PREFIX + "system_prompt_sha256"] = hashlib.sha256(
                 self._system.encode()

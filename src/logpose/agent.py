@@ -373,6 +373,9 @@ _BUILTIN_CONTEXT = _BuiltinContext.BUILTIN
 _TURN_ONLY_EXTRA = frozenset({"response_format", "tool_choice", "parallel_tool_calls"})
 """``extra`` keys that describe the agent's own turn and are not sent with the summary call."""
 
+_RESERVED_EXTRA_KEYS = frozenset({"model", "messages", "tools", "stream", "stream_options"})
+"""Request fields logpose builds itself; a per-run ``extra`` may not set them."""
+
 _RUN_HISTORY: ContextVar[Sequence[Message]] = ContextVar("logpose_run_history", default=())
 """The executing run's full history, read by the ``recall_tool_output`` tool."""
 
@@ -989,6 +992,7 @@ class Agent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> RunResult[_M]: ...
 
     @overload
@@ -1004,6 +1008,7 @@ class Agent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> RunResult[Any]: ...
 
     async def run(
@@ -1018,6 +1023,7 @@ class Agent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> RunResult[Any]:
         """Run the loop to completion and return its result.
 
@@ -1050,14 +1056,25 @@ class Agent:
                 generated one, everywhere the run ID appears. With tracing or a
                 session, an ID already recorded raises ``LogposeError`` before
                 any guard or provider call.
+            extra: Provider request parameters for this run only, merged over
+                the agent's ``extra`` (``{**agent.extra, **extra}``) for every
+                model call of the run, including the summary call (minus
+                ``response_format``, ``tool_choice`` and
+                ``parallel_tool_calls``). Never sent to input guardrails, never
+                stored in a session; tracing records only the merged key names.
+                Keys must be ``str`` and may not be ``model``, ``messages``,
+                ``tools``, ``stream`` or ``stream_options``. A
+                ``max_tokens``/``max_completion_tokens`` here replaces the
+                provider's output-ceiling field for the run.
 
         Returns:
             The completed :class:`~logpose.events.RunResult`.
 
         Raises:
             LogposeError: If there is nothing to send, if
-                ``on_tool_call`` returns an unsupported type, or if the output
-                options are invalid or conflict with ``extra["response_format"]``.
+                ``on_tool_call`` returns an unsupported type, if ``extra`` is
+                invalid, or if the output options are invalid or conflict with
+                ``response_format`` in the agent's or the run's ``extra``.
             OutputValidationError: If the final answer never validates against
                 ``output_type``, or was cut off at ``max_tokens``.
             OutputRefusalError: If the model refused to give a structured answer.
@@ -1080,6 +1097,7 @@ class Agent:
             session=session,
             metadata=metadata,
             run_id=run_id,
+            extra=extra,
         )
         async for event in events:
             if isinstance(event, RunEnd):
@@ -1100,6 +1118,7 @@ class Agent:
         session: SessionHandle | None = None,
         metadata: RunMetadata | None = None,
         run_id: str | None = None,
+        extra: Mapping[str, Any] | None = None,
     ) -> AsyncIterator[Event]:
         """Run the loop, yielding events as they happen.
 
@@ -1129,14 +1148,16 @@ class Agent:
             session: As for :meth:`run`.
             metadata: As for :meth:`run`.
             run_id: As for :meth:`run`.
+            extra: As for :meth:`run`; checked when ``stream`` is called.
 
         Returns:
             An async iterator of :data:`~logpose.events.Event` values.
 
         Raises:
             LogposeError: If ``prompt`` is not a supported type, if there is
-                nothing to send, if the output options are invalid or
-                conflict with ``extra["response_format"]``, or if the session
+                nothing to send, if ``extra`` is invalid, if the output options
+                are invalid or conflict with ``response_format`` in the agent's
+                or the run's ``extra``, or if the session
                 arguments are invalid or combined, or if ``metadata`` or
                 ``run_id`` is invalid. Iterating can raise
                 the same errors :meth:`run` documents, including whatever
@@ -1146,9 +1167,11 @@ class Agent:
         resolved_retries = self.output_retries if output_retries is _UNSET else output_retries
         _check_output_type(resolved_type)
         _check_output_retries(resolved_retries)
-        if resolved_type is not None and "response_format" in self.extra:
+        run_extra = self._merge_run_extra(extra)
+        if resolved_type is not None and "response_format" in run_extra:
+            where = "Agent(extra=...)" if "response_format" in self.extra else "extra="
             raise LogposeError(
-                "Agent(extra=...) already sets 'response_format', which output_type also "
+                f"{where} already sets 'response_format', which output_type also "
                 "sets; remove one of them."
             )
         given = [
@@ -1179,6 +1202,7 @@ class Agent:
                 metadata=_check_metadata(session_metadata),
                 run_id=run_id,
                 run_metadata=run_metadata,
+                run_extra=run_extra,
             )
         if session is not None:
             self._active_store(session)
@@ -1193,6 +1217,7 @@ class Agent:
                 handle=session,
                 run_id=run_id,
                 run_metadata=run_metadata,
+                run_extra=run_extra,
             )
             # Registered so the block can close it before saving: a stream left
             # suspended mid-run must answer its tool calls before the history is stored.
@@ -1209,6 +1234,7 @@ class Agent:
             resolved_retries,
             run_id=run_id,
             run_metadata=run_metadata,
+            run_extra=run_extra,
         )
 
     def session(
@@ -1248,6 +1274,27 @@ class Agent:
 
         validate_session_id(session_id)
         return self._session_block(session_id, _check_metadata(metadata))
+
+    def _merge_run_extra(self, extra: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Check a per-run ``extra`` and return it merged over the agent's.
+
+        Raises:
+            LogposeError: If ``extra`` is not a mapping, has a non-``str`` key,
+                or sets a field logpose builds itself.
+        """
+        if extra is None:
+            return dict(self.extra)
+        if not isinstance(extra, Mapping):
+            raise LogposeError(f"extra must be a mapping, got {type(extra).__name__}.")
+        for key in extra:
+            if not isinstance(key, str):
+                raise LogposeError(f"extra keys must be str, got {type(key).__name__}.")
+            if key in _RESERVED_EXTRA_KEYS:
+                raise LogposeError(
+                    f"extra may not set {key!r}: logpose builds "
+                    f"{', '.join(sorted(_RESERVED_EXTRA_KEYS))} itself."
+                )
+        return {**self.extra, **extra}
 
     @contextlib.asynccontextmanager
     async def _session_block(
@@ -1331,6 +1378,7 @@ class Agent:
         handle: SessionHandle | None = None,
         run_id: str | None = None,
         run_metadata: dict[str, str | int | float | bool] | None = None,
+        run_extra: dict[str, Any] | None = None,
     ) -> AsyncIterator[Event]:
         """Run :meth:`_loop` on a session and record the run on every outcome.
 
@@ -1361,6 +1409,7 @@ class Agent:
             handle=handle,
             run_id=run_id,
             run_metadata=run_metadata,
+            run_extra=run_extra,
             claim=claim,
         )
         try:
@@ -1386,6 +1435,7 @@ class Agent:
         handle: SessionHandle | None,
         run_id: str | None,
         run_metadata: dict[str, str | int | float | bool] | None,
+        run_extra: dict[str, Any] | None = None,
         claim: _RunIdClaim | None = None,
     ) -> AsyncIterator[Event]:
         """The body of :meth:`_session_loop`, once the run ID is claimed."""
@@ -1434,6 +1484,7 @@ class Agent:
                 guard_metadata=handle.metadata,
                 run_id=run_id,
                 run_metadata=run_metadata,
+                run_extra=run_extra,
                 session_id=handle.id,
                 run_id_checked=True,
             )
@@ -1841,8 +1892,13 @@ class Agent:
         metadata: Mapping[str, str | int | float | bool] | None,
         model: str,
         sink: _SpanSink | None,
+        extra: Mapping[Any, Any] | None = None,
     ) -> _SpanBuilder:
-        """A span builder for one run, or the do-nothing one when tracing is off."""
+        """A span builder for one run, or the do-nothing one when tracing is off.
+
+        Only the key names of ``extra`` (the run's merged ``extra``) are traced,
+        never its values.
+        """
         if self.tracing is None or sink is None:
             return _NO_TRACE
         try:
@@ -1858,6 +1914,7 @@ class Agent:
                 system=self.system,
                 tool_specs=self._specs,
                 secrets=self._trace_secrets(),
+                extra_keys=sorted(str(key) for key in extra or ()),
             )
         except Exception as exc:  # noqa: BLE001 - tracing never fails a run
             _TRACE_LOGGER.warning("tracing disabled for run %s: %s", run_id, type(exc).__name__)
@@ -1876,6 +1933,7 @@ class Agent:
         guard_metadata: Mapping[str, str] | None = None,
         run_id: str | None = None,
         run_metadata: Mapping[str, str | int | float | bool] | None = None,
+        run_extra: dict[str, Any] | None = None,
         session_id: str | None = None,
         run_id_checked: bool = False,
     ) -> AsyncIterator[Event]:
@@ -1907,6 +1965,7 @@ class Agent:
             guard_metadata=guard_metadata,
             run_id=run_id,
             run_metadata=run_metadata,
+            run_extra=run_extra,
             session_id=session_id,
             sink=sink,
             flush_timeout=flush_timeout,
@@ -1932,6 +1991,7 @@ class Agent:
         guard_metadata: Mapping[str, str] | None,
         run_id: str | None,
         run_metadata: Mapping[str, str | int | float | bool] | None,
+        run_extra: dict[str, Any] | None = None,
         session_id: str | None,
         sink: _SpanSink | None = None,
         flush_timeout: float | None = None,
@@ -1948,7 +2008,14 @@ class Agent:
         run_stats = stats
         # Resolved first: a model error is the run's own error, not a tracing one.
         model = self._model()
-        trace = self._new_trace(resolved_id, session_id, run_metadata, model, sink)
+        trace = self._new_trace(
+            resolved_id,
+            session_id,
+            run_metadata,
+            model,
+            sink,
+            self.extra if run_extra is None else run_extra,
+        )
         if sink is not None:
             self._track_trace_run(sink, resolved_id)
         trace.start_run()
@@ -1961,6 +2028,7 @@ class Agent:
             guard_metadata=guard_metadata,
             run_id=resolved_id,
             run_metadata=run_metadata,
+            run_extra=run_extra,
             trace=trace,
         )
         error: BaseException | None = None
@@ -1999,6 +2067,7 @@ class Agent:
         guard_metadata: Mapping[str, str] | None = None,
         run_id: str | None = None,
         run_metadata: Mapping[str, str | int | float | bool] | None = None,
+        run_extra: dict[str, Any] | None = None,
         trace: _SpanBuilder = _NO_TRACE,
     ) -> AsyncIterator[Event]:
         """Drive provider turns and tool executions until the run ends.
@@ -2013,6 +2082,8 @@ class Agent:
             guard_metadata: Session metadata handed to input guardrails.
             run_id: The run ID; generated when omitted.
             run_metadata: App-supplied run metadata for the runtime context.
+            run_extra: The run's merged ``extra`` (agent's, then the call's);
+                the agent's ``extra`` when omitted.
             trace: The run's span builder (a no-op when tracing is off).
 
         Yields:
@@ -2030,6 +2101,7 @@ class Agent:
         """
         model = self._model()
         response_format = response_format_for(output_type) if output_type is not None else None
+        extra = dict(self.extra) if run_extra is None else run_extra
         run_context = RuntimeContext(
             run_id=run_id or self._runtime_id("run"),
             provider=self.provider_name,
@@ -2129,6 +2201,7 @@ class Agent:
                     request, estimate = await self._prepare_request(
                         history,
                         response_format,
+                        extra=extra,
                         current_start=current_start,
                         compaction=compaction,
                         run_compaction=run_compaction,
@@ -2847,6 +2920,7 @@ class Agent:
         history: Sequence[Message],
         response_format: dict[str, Any] | None = None,
         *,
+        extra: Mapping[str, Any] | None = None,
         current_start: int | None = None,
         compaction: _CompactionState | None = None,
         run_compaction: _RunCompaction | None = None,
@@ -2861,6 +2935,8 @@ class Agent:
         Args:
             history: The run's full history. Never modified.
             response_format: Structured-output format to attach, if any.
+            extra: The run's merged ``extra``; the agent's when omitted. The
+                summary call gets it minus the turn-only keys.
             current_start: Index of the first message this run appended. The
                 built-in path sends tool outputs before it as pointers; ``None``
                 treats the whole history as the current run.
@@ -2881,7 +2957,9 @@ class Agent:
             The request to send, and its raw (uncalibrated) token estimate on
             the built-in path (``0`` otherwise).
         """
-        request = self._request(history)
+        if extra is None:
+            extra = self.extra
+        request = self._request(history, extra)
         if response_format is not None:
             request.extra["response_format"] = copy.deepcopy(response_format)
         self.last_context_diagnostics = {}
@@ -2890,6 +2968,7 @@ class Agent:
             return await self._builtin_context(
                 request,
                 history,
+                extra=extra,
                 current_start=current_start,
                 state=compaction if compaction is not None else _CompactionState(),
                 run_state=run_compaction if run_compaction is not None else _RunCompaction(),
@@ -2947,6 +3026,7 @@ class Agent:
         request: CompletionRequest,
         history: Sequence[Message],
         *,
+        extra: Mapping[str, Any],
         current_start: int | None,
         state: _CompactionState,
         run_state: _RunCompaction,
@@ -3087,7 +3167,7 @@ class Agent:
                 failure: ProviderError | None = None
                 try:
                     summary = await self._summarize(
-                        span, previous, context, run_deadline, add_usage, trace
+                        span, previous, context, run_deadline, add_usage, trace, extra=extra
                     )
                 except ProviderError as exc:
                     summary, failure = None, exc
@@ -3166,6 +3246,8 @@ class Agent:
         run_deadline: float | None,
         add_usage: Callable[[Usage], None] | None,
         trace: _SpanBuilder = _NO_TRACE,
+        *,
+        extra: Mapping[str, Any] | None = None,
     ) -> str | None:
         """Make the summary call: same provider and model, no tools, retried.
 
@@ -3183,6 +3265,8 @@ class Agent:
         (a word limit from :data:`~logpose.compaction.SUMMARY_BUDGET_FRACTION`
         of the input budget) and by truncation in the caller. Text from a
         response cut off at ``max_tokens`` is still used (truncated likewise).
+        Its ``extra`` is the run's merged ``extra`` (the agent's when omitted)
+        minus the turn-only keys.
 
         Returns:
             The summary text, or ``None`` if the model answered with no text
@@ -3191,6 +3275,7 @@ class Agent:
         Raises:
             ProviderError: If every allowed attempt failed.
         """
+        summary_extra = self.extra if extra is None else extra
         transcript = render_transcript(
             span, previous, max_words=summary_word_limit(self.input_budget)
         )
@@ -3200,7 +3285,7 @@ class Agent:
             max_tokens=max(SUMMARY_MAX_TOKENS, self._max_tokens()),
             system=SUMMARY_INSTRUCTION,
             tools=[],
-            extra={k: v for k, v in self.extra.items() if k not in _TURN_ONLY_EXTRA},
+            extra={k: v for k, v in summary_extra.items() if k not in _TURN_ONLY_EXTRA},
         )
         attempt_context = context or RuntimeContext(
             run_id=self._runtime_id("run"), provider=self.provider_name, model=self._model()
@@ -3302,12 +3387,17 @@ class Agent:
             )
         return parse_output(output_type, done.message.text)
 
-    def _request(self, history: Sequence[Message]) -> CompletionRequest:
+    def _request(
+        self, history: Sequence[Message], extra: Mapping[str, Any] | None = None
+    ) -> CompletionRequest:
         """Build the request for the next turn.
 
         Args:
             history: The conversation so far. Copied, so later appends cannot
                 mutate a request the provider is still working with.
+            extra: The run's merged ``extra``; the agent's when omitted. Copied
+                per request, so a structured-output ``response_format`` added
+                to one request never reaches the next.
 
         Returns:
             The :class:`~logpose.providers.base.CompletionRequest` to send.
@@ -3319,7 +3409,7 @@ class Agent:
             max_tokens=self._max_tokens(),
             system=self.system,
             tools=list(self._specs),
-            extra=dict(self.extra),
+            extra=dict(self.extra if extra is None else extra),
         )
 
     def _model(self) -> str:

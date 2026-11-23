@@ -191,7 +191,9 @@ it. For such servers pass `OpenAICompatProvider(max_tokens_field="max_tokens")`,
 or `Agent("openai-compat", ..., max_tokens_field="max_tokens")`.
 
 If you set `max_tokens` or `max_completion_tokens` yourself in `extra_body` or
-`Agent(extra=...)`, your value replaces logpose's, and only your field is sent.
+`Agent(extra=...)` (or a per-run `extra=`, see
+[Configuration reference](#configuration-reference)), your value replaces logpose's, and
+only your field is sent.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
 so by default reasoning is not sent back on later turns. For servers that accept
@@ -986,6 +988,11 @@ metadata only: models, token counts, finish reasons, tool names, outcomes and
 your run metadata. With `Tracing(capture_content=True)` they also carry prompts,
 outputs, reasoning, tool arguments and results, and exception messages.
 
+A run that passes `extra=` (or whose agent sets `extra`) also records
+`logpose.request.extra_keys` on the `invoke_agent` span: the sorted key names of
+the run's merged `extra`. Values are never recorded, even with `capture_content`
+on.
+
 What capture stores and scrubs:
 
 - The configured provider API key and `LOGPOSE_API_KEY` are replaced in captured
@@ -1157,6 +1164,44 @@ Provider-specific request fields that logpose does not model can be passed with
 ```python
 agent = Agent("openai-compat", model="gpt-5.1", extra={"tool_choice": "required"})
 ```
+
+### Per-run `extra`
+
+`run`, `stream`, `run_sync`, `stream_sync`, `SyncAgent.run` and `SyncAgent.stream`
+accept `extra=` for request fields that belong to one run, so one shared agent can
+serve many callers:
+
+```python
+import hashlib
+
+agent = Agent("openai-compat", model="gpt-5.1")  # shared by every request
+
+async def answer(visitor_id: str, question: str):
+    return await agent.run(
+        question,
+        extra={
+            "safety_identifier": hashlib.sha256(visitor_id.encode()).hexdigest(),
+            "prompt_cache_key": "support-bot-v3",
+        },
+    )
+```
+
+- The run's `extra` is `{**agent.extra, **extra}`: per-run keys win. It is sent
+  with every model call of that run: each turn, output-correction turns and the
+  retry after a context-length error.
+- `extra` must be a mapping with `str` keys. `model`, `messages`, `tools`,
+  `stream` and `stream_options` are built by logpose and raise `LogposeError`
+  if set. Setting `response_format` here (or in `Agent(extra=...)`) together with
+  `output_type` also raises `LogposeError`.
+- A per-run `max_tokens` or `max_completion_tokens` replaces logpose's ceiling
+  field, as it does in `Agent(extra=...)`. Compaction budgets and the chat span's
+  `gen_ai.request.max_tokens` still use the agent's `max_tokens`.
+- The compaction summary call gets the merged `extra` without `response_format`,
+  `tool_choice` and `parallel_tool_calls`. A ceiling field in `extra` therefore
+  also caps the summary; set a small ceiling with `Agent(max_tokens=...)` instead
+  if long chats are compacted.
+- Input guardrails never receive it. It is not saved in sessions: pass it on each
+  run.
 
 ## Errors
 
