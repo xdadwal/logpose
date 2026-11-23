@@ -154,6 +154,7 @@ from logpose.guardrails import (
     GuardrailResult,
     GuardrailVerdict,
     InputGuardrail,
+    _has_unsupported_content,
     guard_text,
 )
 from logpose.lifecycle import ToolObservation, ToolObservationError, ToolObserver
@@ -1589,7 +1590,12 @@ class Agent:
 
         try:
             guard_input: GuardrailInput | None = None
-            if prompt is not None and self.input_guardrails and guard_text(prompt):
+            if (
+                prompt is not None
+                and self.input_guardrails
+                # Non-text content is screened too: the content check blocks it.
+                and (guard_text(prompt) or _has_unsupported_content(prompt))
+            ):
                 guard_input = GuardrailInput(
                     message=prompt,
                     recent=_recent_text(history),
@@ -1677,6 +1683,12 @@ class Agent:
                         if blocked is not None:
                             producer.cancel()
                             await asyncio.gather(producer, return_exceptions=True)
+                            # A turn that finished before the verdict spent
+                            # main-model tokens: count them.
+                            while not buffer.empty():
+                                held = buffer.get_nowait()
+                                if isinstance(held, _TurnDone) and held.done is not None:
+                                    add_usage(held.done.usage)
                             drop_unvetted()
                             self.last_context_diagnostics = diagnostics
                             for item in blocked_end(blocked, reply):
@@ -1893,11 +1905,17 @@ class Agent:
         async_guards = [g for g in self.input_guardrails if tiers != "sync" and _is_async_guard(g)]
 
         def decide(
-            guard: InputGuardrail, verdict: object, error: BaseException | None, began: float
+            name: str, verdict: object, error: BaseException | None, began: float
         ) -> tuple[GuardrailResult, str] | None:
-            name = _guard_name(guard)
             if error is None and not isinstance(verdict, GuardrailVerdict):
                 error = TypeError(f"guard returned {type(verdict).__name__}")
+            if (
+                error is None
+                and isinstance(verdict, GuardrailVerdict)
+                and not isinstance(verdict.allowed, bool)
+            ):
+                # A truthy non-bool such as "false" must never allow.
+                error = TypeError("guard verdict's allowed is not a bool")
             if error is not None:
                 verdict = GuardrailVerdict.block(
                     "error", GUARDRAIL_ERROR_REPLY, reason=f"guard raised {type(error).__name__}"
@@ -1935,6 +1953,21 @@ class Agent:
             )
             return result, verdict.reply or GUARDRAIL_ERROR_REPLY
 
+        if tiers != "async" and _has_unsupported_content(inp.message):
+            # Guards are text-only: content they cannot see is blocked before
+            # any guard runs, never sent unscreened. Decided (event) only when
+            # it blocks, so allowed runs report just the configured guards.
+            blocked = decide(
+                "content_check",
+                GuardrailVerdict.block(
+                    "error", GUARDRAIL_ERROR_REPLY, reason="unsupported content"
+                ),
+                None,
+                monotonic(),
+            )
+            assert blocked is not None
+            return blocked
+
         for guard in sync_guards:
             began = monotonic()
             verdict: object = None
@@ -1945,7 +1978,7 @@ class Agent:
                     verdict = await verdict
             except Exception as exc:  # noqa: BLE001 - a raising guard is a block
                 error = exc
-            blocked = decide(guard, verdict, error, began)
+            blocked = decide(_guard_name(guard), verdict, error, began)
             if blocked is not None:
                 return blocked
 
@@ -1969,7 +2002,7 @@ class Agent:
                         asyncio.CancelledError() if task.cancelled() else task.exception()
                     )
                     value = None if failure is not None else task.result()
-                    outcome = decide(guard, value, failure, began)
+                    outcome = decide(_guard_name(guard), value, failure, began)
                     if winner is None:
                         winner = outcome
                 if winner is not None:

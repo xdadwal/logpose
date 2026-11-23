@@ -816,6 +816,8 @@ They are configured on the agent, so `run`, `stream` and the sync facade need no
 extra arguments:
 
 ```python
+import os
+
 import httpx
 
 from logpose import Agent, openai_decision_guard, pattern_guard
@@ -834,6 +836,7 @@ agent = Agent(
                 "off_topic": "I can only help with Acme billing.",
                 "unsafe": "I can't help with that.",
             },
+            api_key=os.environ["GUARD_OPENAI_API_KEY"],  # required, never read from env
             client=shared_httpx_client,  # one httpx.AsyncClient for the app
         ),
     ],
@@ -843,9 +846,14 @@ agent = Agent(
 
 A guard is any sync or async callable taking a `GuardrailInput` (the new
 `message`, a few `recent` messages, session `metadata`, `run_id`) and returning
-a `GuardrailVerdict`. Guards are text-only; a run whose prompt has no text, or
-that has no new prompt, skips them. A guard that raises or returns the wrong type
-counts as a block with category `"error"`, as does a verdict with malformed `scores` or `usage`. A sync callable that returns a coroutine is treated as a sync-tier guard (awaited in sequence, so it does not race the turn); write async guards as `async def`.
+a `GuardrailVerdict`. Guards see the prompt's text exactly as it is sent to
+the provider (text blocks joined with no separator). Guards are text-only: a prompt
+with any non-text content (tool results, raw provider blocks) is blocked with
+category `"error"`, guard `"content_check"` and reason `"unsupported content"`
+before any guard runs,
+rather than sent unscreened. A run with an empty text prompt, or with no new
+prompt, skips the guards. A guard that raises or returns the wrong type
+counts as a block with category `"error"`, as does a verdict with malformed `scores` or `usage`, or whose `allowed` is not a `bool`. A sync callable that returns a coroutine is treated as a sync-tier guard (awaited in sequence, so it does not race the turn); write async guards as `async def`.
 
 **Order.** Sync guards run first, in list order, and the first block ends the run
 before any async guard starts (in parallel mode too: sync guards run before the
@@ -860,9 +868,10 @@ the first model turn, which hides their latency, with these trade-offs:
 
 - Text and thinking output is buffered until the guards allow. Tools never run
   before then.
-- On a block the turn is cancelled. A cancelled stream reports no usage, so its
-  main-model tokens are not counted, but a blocked request may still cost some
-  main-model tokens.
+- On a block the turn is cancelled. If the turn had already finished, its
+  reported usage counts in the run's usage and `RunRecord`. A turn cancelled
+  mid-stream reports no usage, so its main-model tokens are not counted, but a
+  blocked request may still cost some main-model tokens.
 - `context.compacted` and `context.summarizing` events from the discarded turn
   remain emitted, but a summary it made (or a failed summary attempt) is not
   kept: the conversation's compaction state is left as it was.
@@ -889,8 +898,11 @@ backtrack catastrophically on adversarial input, so set `max_chars`.
 OpenAI's Decisions API (`POST /v1/decisions`, model `gpt-6-luna`), billed for
 input tokens only. It is OpenAI-specific: for other providers, write a custom
 guard. It opens a new httpx client per call unless you pass a shared `client=`,
-which is recommended in web apps for connection reuse. A blank `api_key` falls
-back to `LOGPOSE_API_KEY`. `on_error` is `"block"` (the default, fail closed)
+which is recommended in web apps for connection reuse. `api_key` is required:
+a missing or blank key raises `LogposeError` at construction. It never falls
+back to `LOGPOSE_API_KEY` (which may be another server's key) or
+`OPENAI_API_KEY`. `timeout` (default 5 s) bounds the whole call. Pass `name=`
+to tell two decision guards apart in results and events. `on_error` is `"block"` (the default, fail closed)
 or `"allow"`. A fail-open allow is observable: the verdict has
 `category="fail_open"` and the failure `reason` (no body text), and the
 `guardrail.decided` event has `guard_allowed=True` with

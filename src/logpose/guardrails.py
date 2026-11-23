@@ -8,8 +8,8 @@ or response bodies.
 
 from __future__ import annotations
 
+import asyncio
 import math
-import os
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -119,8 +119,21 @@ class GuardrailResult:
 
 
 def guard_text(message: Message) -> str:
-    """Join a message's text blocks with newlines."""
-    return "\n".join(b.text for b in message.content if isinstance(b, TextBlock))
+    """A message's text exactly as the provider sends it.
+
+    Text blocks are joined with no separator (:attr:`Message.text`), as on the
+    wire, so a pattern split across blocks is still seen whole.
+    """
+    return message.text
+
+
+def _has_unsupported_content(message: Message) -> bool:
+    """Whether ``message`` has content a text-only guard cannot see.
+
+    Any block other than :class:`TextBlock` (tool results, raw provider blocks,
+    thinking) counts. The agent blocks such a prompt when guardrails are set.
+    """
+    return any(not isinstance(b, TextBlock) for b in message.content)
 
 
 def pattern_guard(
@@ -203,6 +216,7 @@ def openai_decision_guard(
     *,
     replies: Mapping[str, str],
     api_key: str | None = None,
+    name: str = "openai_decision_guard",
     base_url: str = "https://api.openai.com/v1",
     model: str = "gpt-6-luna",
     on_topic_min: float = 0.5,
@@ -219,15 +233,28 @@ def openai_decision_guard(
     blocks as unsafe; any other failure applies ``on_error``. The guard's
     Verdicts carry the call's usage in ``usage``.
 
+    ``api_key`` is required and is never read from the environment: the
+    ``LOGPOSE_API_KEY`` setting may belong to another server, and sending it to
+    ``base_url`` would leak it. ``name`` is the guard's name in results, events
+    and spans (set it to tell two decision guards apart). ``timeout`` bounds the
+    whole call, not just each HTTP phase.
+
     ``history`` is how many prior messages the judge sees; the runner supplies at
     most 4, so it must be within [0, 4]. With ``on_error="allow"`` a failure
     allows the run but the verdict has ``category="fail_open"`` and the failure
     ``reason``, and the ``guardrail.decided`` event reports that category.
 
     Raises:
-        LogposeError: At construction, if ``replies`` lacks a key, a threshold is
-            outside [0, 1], or ``history`` is outside [0, 4].
+        LogposeError: At construction, if ``api_key`` is missing or blank,
+            ``replies`` lacks a key, a threshold is outside [0, 1], or
+            ``history`` is outside [0, 4].
     """
+    key = (api_key or "").strip()
+    if not key:
+        raise LogposeError(
+            "openai_decision_guard needs api_key= (an OpenAI key); it does not read "
+            "LOGPOSE_API_KEY or any other environment variable"
+        )
     missing = {"off_topic", "unsafe"} - set(replies)
     if missing:
         raise LogposeError(f"replies is missing required keys: {sorted(missing)}")
@@ -254,9 +281,6 @@ def openai_decision_guard(
     async def _call(inp: GuardrailInput) -> dict[str, Any]:
         import httpx
 
-        key = (api_key or "").strip() or os.environ.get("LOGPOSE_API_KEY", "").strip()
-        if not key:
-            raise _GuardFailure("missing_api_key")
         prior = [m for m in (_text_message(x) for x in inp.recent) if m is not None]
         prior = prior[-history:] if history > 0 else []
         current = _text_message(inp.message)
@@ -268,13 +292,18 @@ def openai_decision_guard(
         owned = client is None
         http = client if client is not None else httpx.AsyncClient()
         try:
-            resp = await http.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {key}"},
-                timeout=timeout,
+            # httpx's timeout is per phase (connect, each read, ...); the outer
+            # bound keeps a trickling server from holding the guard longer.
+            resp = await asyncio.wait_for(
+                http.post(
+                    url,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {key}"},
+                    timeout=timeout,
+                ),
+                timeout,
             )
-        except httpx.TimeoutException:
+        except (httpx.TimeoutException, asyncio.TimeoutError):
             raise _GuardFailure("timeout") from None
         except httpx.HTTPError as exc:
             raise _GuardFailure(f"transport_error:{type(exc).__name__}") from None
@@ -356,5 +385,5 @@ def openai_decision_guard(
         return GuardrailVerdict.allow(usage=usage, **scores)
 
     guard = openai_decision_guard
-    guard.name = "openai_decision_guard"  # type: ignore[attr-defined]
+    guard.name = name  # type: ignore[attr-defined]
     return guard
