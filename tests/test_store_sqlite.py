@@ -47,6 +47,27 @@ def _msg(text: str) -> Message:
     return Message(role="user", content=[TextBlock(text=text)])
 
 
+_FAR_FUTURE_MS = 1 << 62
+
+
+async def _live(s: SQLiteStore, *session_ids: str) -> None:
+    """Create unleased session rows that never expire, for the direct append tests.
+
+    ``load_messages`` reads only a live session's messages, so a test that appends
+    without leasing needs the row a lease would have created.
+    """
+    await s._write(
+        [
+            (
+                "INSERT INTO logpose_sessions (id, created_at, updated_at, expires_at, "
+                "version, metadata) VALUES (?, 0, 0, ?, 0, '{}')",
+                (sid, _FAR_FUTURE_MS),
+            )
+            for sid in session_ids
+        ]
+    )
+
+
 async def _scalar(path: Path, sql: str, *params: object) -> object:
     async with aiosqlite.connect(path) as db, db.execute(sql, params) as cur:
         row = await cur.fetchone()
@@ -105,6 +126,7 @@ async def test_append_and_load_round_trip_all_blocks(tmp_path: Path) -> None:
         ),
     ]
     async with SQLiteStore(tmp_path / "t.db") as s:
+        await _live(s, "s1")
         assert await s.append_messages("s1", msgs, start_seq=0) == 3
         assert await s.load_messages("s1") == msgs
         assert await s.load_messages("other") == []
@@ -113,6 +135,7 @@ async def test_append_and_load_round_trip_all_blocks(tmp_path: Path) -> None:
 async def test_append_continues_seq(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     async with SQLiteStore(p) as s:
+        await _live(s, "s1")
         n = await s.append_messages("s1", [_msg("a"), _msg("b")], start_seq=0)
         assert n == 2
         m = await s.append_messages("s1", [_msg("c")], start_seq=n)
@@ -161,6 +184,7 @@ async def test_record_run_persists_all_fields(tmp_path: Path) -> None:
 async def test_delete_session_removes_messages_and_runs(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     async with SQLiteStore(p) as s:
+        await _live(s, "s1", "s2")
         await s.append_messages("s1", [_msg("a")], start_seq=0)
         await s.append_messages("s2", [_msg("b")], start_seq=0)
         await s.record_run(_run("s1", "r1"))
@@ -174,7 +198,7 @@ async def test_delete_session_removes_messages_and_runs(tmp_path: Path) -> None:
 async def test_purge_expired_counts_and_deletes(tmp_path: Path) -> None:
     p = tmp_path / "t.db"
     async with SQLiteStore(p) as s:
-        for sid, exp in (("old", 100), ("new", 10_000)):
+        for sid, exp in (("old", 100), ("new", _FAR_FUTURE_MS)):
             await s._write(
                 [
                     (
@@ -455,6 +479,7 @@ async def test_failing_commit_rolls_back_and_next_write_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with SQLiteStore(tmp_path / "t.db") as s:
+        await _live(s, "s1")
         db = s._db
         assert db is not None
         real = db.execute
@@ -532,6 +557,7 @@ async def test_concurrent_open_does_not_leak(
 
 async def test_cancel_during_begin_leaves_connection_usable(tmp_path: Path) -> None:
     async with SQLiteStore(tmp_path / "t.db") as s:
+        await _live(s, "s1")
         db = s._db
         assert db is not None
         task = asyncio.create_task(s.append_messages("s1", [_msg("cancelled")], start_seq=0))

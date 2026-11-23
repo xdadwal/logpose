@@ -314,3 +314,144 @@ def test_session_ttl_too_large() -> None:
     with pytest.raises(LogposeError):
         _agent(session_ttl=timedelta.max.total_seconds() * 2)
     assert _agent(session_ttl=timedelta.max).session_ttl == timedelta.max.total_seconds()
+
+
+# --- load_session --------------------------------------------------------------------------
+
+
+def _roles_texts(messages: list[Any]) -> list[tuple[str, str]]:
+    return [(m.role, m.text) for m in messages]
+
+
+async def test_load_session_returns_saved_history(tmp_path: Path) -> None:
+    path = tmp_path / "s.db"
+    agent = _agent("one", "two", db_path=path)
+    await agent.run("q1", session_id="s")
+    await agent.run("q2", session_id="s")
+    loaded = await agent.load_session("s")
+    assert _roles_texts(loaded) == [
+        ("user", "q1"),
+        ("assistant", "one"),
+        ("user", "q2"),
+        ("assistant", "two"),
+    ]
+    # A new list each call: mutating it changes nothing stored.
+    loaded.clear()
+    assert len(await agent.load_session("s")) == 4
+    await agent.aclose()
+
+
+async def test_load_session_returns_full_history_when_summarized(tmp_path: Path) -> None:
+    from logpose.messages import Message, TextBlock
+
+    path = tmp_path / "c.db"
+    provider = FakeProvider([ScriptedTurn.text("SUMMARY-ONE"), ScriptedTurn.text("answer")])
+    agent = Agent(provider, model="m", db_path=path, context_budget=2_000)
+    history: list[Message] = []
+    for i in range(10):
+        history.append(Message(role="user", content=[TextBlock(text=f"<q{i}> " + "x" * 400)]))
+        history.append(Message(role="assistant", content=[TextBlock(text=f"<a{i}> " + "y" * 400)]))
+    async with agent.session("s") as handle:
+        handle.conversation.extend(history)
+        await agent.run("latest", session=handle)
+    # Compaction ran and a summary was stored.
+    assert _rows(path, "SELECT COUNT(*) FROM logpose_summaries WHERE session_id='s'")[0][0] == 1
+    loaded = await agent.load_session("s")
+    assert len(loaded) == 22
+    assert loaded[:20] == history
+    assert _roles_texts(loaded[20:]) == [("user", "latest"), ("assistant", "answer")]
+    assert not any("SUMMARY-ONE" in m.text for m in loaded)
+    await agent.aclose()
+
+
+async def test_load_session_unknown_is_empty(tmp_path: Path) -> None:
+    agent = _agent(db_path=tmp_path / "s.db")
+    assert await agent.load_session("never-seen") == []
+    await agent.aclose()
+
+
+async def test_load_session_expired_is_empty_and_untouched(tmp_path: Path) -> None:
+    path = tmp_path / "s.db"
+    agent = _agent(db_path=path, session_ttl=0.05)
+    await agent.run("q", session_id="s")
+    before = _rows(path, "SELECT expires_at, updated_at, version FROM logpose_sessions")
+    await asyncio.sleep(0.1)
+    assert await agent.load_session("s") == []
+    assert _rows(path, "SELECT COUNT(*) FROM logpose_messages WHERE session_id='s'")[0][0] > 0
+    assert _rows(path, "SELECT expires_at, updated_at, version FROM logpose_sessions") == before
+    await agent.aclose()
+
+
+class _GatedProvider(FakeProvider):
+    """Blocks inside ``stream`` while ``gated`` until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__([ScriptedTurn.text("ok")], repeat_last=True)
+        self.gated = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def stream(self, req: Any) -> Any:  # type: ignore[override]
+        if self.gated:
+            self.entered.set()
+            await self.release.wait()
+        async for event in super().stream(req):
+            yield event
+
+
+async def test_load_session_does_not_take_lease(tmp_path: Path) -> None:
+    provider = _GatedProvider()
+    agent = Agent(provider, model="m", db_path=tmp_path / "s.db")
+    await agent.run("first", session_id="s")
+    provider.gated = True
+
+    async def hold() -> list[Any]:
+        async with agent.session("s") as handle:
+            return [event async for event in agent.stream("second", session=handle)]
+
+    task = asyncio.create_task(hold())
+    await asyncio.wait_for(provider.entered.wait(), 5)
+    # The lease is held and the turn is mid-flight: reads see the saved history only.
+    assert _roles_texts(await agent.load_session("s")) == [("user", "first"), ("assistant", "ok")]
+    provider.release.set()
+    events = await asyncio.wait_for(task, 5)
+    assert events
+    assert _roles_texts(await agent.load_session("s")) == [
+        ("user", "first"),
+        ("assistant", "ok"),
+        ("user", "second"),
+        ("assistant", "ok"),
+    ]
+    await agent.aclose()
+
+
+async def test_load_session_invalid_id(tmp_path: Path) -> None:
+    agent = _agent(db_path=tmp_path / "s.db")
+    with pytest.raises(LogposeError):
+        await agent.load_session("bad id!")
+    await agent.aclose()
+
+
+async def test_load_session_uses_agent_db_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, b = tmp_path / "env.db", tmp_path / "b.db"
+    monkeypatch.setenv("LOGPOSE_DB_PATH", str(env))
+    writer = _agent(db_path=b)
+    await writer.run("q", session_id="s")
+    await writer.aclose()
+    reader = _agent(db_path=b)
+    assert _roles_texts(await reader.load_session("s")) == [("user", "q"), ("assistant", "ok")]
+    # An agent on the environment's path sees nothing.
+    assert await _agent().load_session("s") == []
+    await reader.aclose()
+    assert _contents(b, "s") == ["q", "ok"]
+
+
+def test_sync_load_session(tmp_path: Path) -> None:
+    from logpose import SyncAgent
+
+    with SyncAgent(_agent(db_path=tmp_path / "s.db")) as sync_agent:
+        sync_agent.run("q", session_id="s")
+        loaded = sync_agent.load_session("s")
+    assert _roles_texts(loaded) == [("user", "q"), ("assistant", "ok")]

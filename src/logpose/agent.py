@@ -1343,6 +1343,32 @@ class Agent:
         store = await self._store()
         await store.delete_session(session_id)
 
+    async def load_session(self, session_id: str) -> list[Message]:
+        """Return a stored session's saved history, for display.
+
+        Reads this agent's database (:attr:`db_path`) without taking the
+        session's lease, so it never waits on, blocks or raises
+        :class:`~logpose.errors.SessionBusyError` against a run in progress; a
+        run still in flight is not included until it saves. The full stored
+        history is returned, including turns a compaction summary covers (the
+        summary itself is not a message). Each call returns a new list.
+
+        Args:
+            session_id: The session to read; ``[A-Za-z0-9._-]{1,128}``.
+
+        Returns:
+            The saved messages, oldest first; ``[]`` for a session that does not
+            exist or has expired (an expired session is left untouched).
+
+        Raises:
+            LogposeError: If ``session_id`` is invalid.
+        """
+        from logpose.store.base import validate_session_id
+
+        validate_session_id(session_id)
+        store = await self._store()
+        return list(await store.load_messages(session_id))
+
     @property
     def db_path(self) -> Path:
         """The absolute path of this agent's SQLite database.

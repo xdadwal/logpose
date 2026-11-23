@@ -686,9 +686,31 @@ class SQLiteStore:
     # --- messages, runs, purge ------------------------------------------------------------
 
     async def load_messages(self, session_id: str) -> list[Message]:
+        """Return the stored messages of a live session, oldest first.
+
+        Takes no lease and writes nothing: a session that is missing, or expired
+        but not yet purged, reads as ``[]`` and is left exactly as it is. Expiry
+        matches :meth:`purge_expired`: a session under a live lease is not
+        expired, since its save will stamp a new ``expires_at``. One statement
+        checks expiry and reads the messages, so the result is a consistent
+        snapshot even while another process saves.
+        """
         validate_session_id(session_id)
+        now = _now_ms()
         async with self._lock:
-            return await _fetch_messages(self._conn(), session_id)
+            async with self._conn().execute(
+                "SELECT m.role, m.content FROM logpose_messages AS m "
+                "JOIN logpose_sessions AS s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND (s.expires_at >= ? "
+                "OR (s.lease_token IS NOT NULL AND s.lease_expires_at >= ?)) "
+                "ORDER BY m.seq",
+                (session_id, now, now),
+            ) as cur:
+                rows = await cur.fetchall()
+        return [
+            Message.model_validate({"role": role, "content": json.loads(content)})
+            for role, content in rows
+        ]
 
     async def append_messages(
         self, session_id: str, messages: Sequence[Message], *, start_seq: int

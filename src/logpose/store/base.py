@@ -174,7 +174,15 @@ class SessionStore(Protocol):
         """
         ...
 
-    async def load_messages(self, session_id: str) -> list[Message]: ...
+    async def load_messages(self, session_id: str) -> list[Message]:
+        """Return a live session's stored messages, oldest first, as a new list.
+
+        A read only: no lease is taken and nothing is written. A missing session,
+        or one past its ``expires_at`` but not yet purged, returns ``[]`` and is
+        neither deleted, reset nor extended. Messages saved by a run still in
+        progress are not included until that run saves.
+        """
+        ...
 
     async def record_run(self, record: RunRecord) -> None: ...
 
