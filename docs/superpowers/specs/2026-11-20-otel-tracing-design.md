@@ -104,10 +104,22 @@ config snapshot `logpose.config.*`, gate-block events, and error status with
   and scores. With capture on, it also records the input text.
 - A **`compaction` span** (INTERNAL) when pointers or a summary were applied:
   pointer count, `summarized`, estimates before and after, and the budget. With
-  capture on, it also records the summary text.
+  capture on, it also records the summary text. When a summary call was made,
+  the span carries a `logpose.context.summarizing` event (the runtime
+  `context.summarizing` event: estimate before and budget) timed when the call
+  began; the summary call itself is a sibling `chat` span.
+- The input-guardrail `content_check` pseudo-guard (a non-text prompt, blocked
+  as category `error`) gets a `guardrail` span like any other guard.
+- `purge_expired` skips sessions under a live lease, and so keeps their spans.
 - **Token usage follows the convention:** `gen_ai.usage.input_tokens` includes
   cached tokens (logpose's uncached input plus `cache_read_input_tokens`), with
-  raw counts in `logpose.usage.*`.
+  raw counts in `logpose.usage.*`. Cache counts are also emitted as
+  `gen_ai.usage.cache_read.input_tokens` / `gen_ai.usage.cache_creation.input_tokens`
+  (defined in the pinned 1.45.0 registry). `gen_ai.provider.name` stays the logpose
+  provider name (`openai-compat`): no well-known value applies to an arbitrary
+  compatible server.
+- Run metadata is stored on spans as strings; `bool` values as `true`/`false`.
+- Configured secrets shorter than 12 characters are not scrubbed from content.
 
 ### Storage (schema version 3)
 
@@ -134,11 +146,19 @@ config snapshot `logpose.config.*`, gate-block events, and error status with
 - `delete_session` and `purge_expired` also remove a session's spans.
 - `purge_spans(older_than_ms)` is added for traces without a session.
 
-### Interface additions (`SessionStore`)
+### Interface additions (`SessionStore` and the optional `SpanStore`)
 
-- `async def write_spans(spans: Sequence[SpanRecord]) -> None`
-- `async def read_spans(*, since_ns=None, until_ns=None, session_id=None, trace_id=None) -> AsyncIterator[SpanRecord]`
-- `async def purge_spans(older_than_ms: int) -> int`
+- `SessionStore` gains `async def run_id_exists(run_id: str) -> bool` (run
+  records are session data, so every store answers it).
+- The span methods live on an optional, runtime-checkable `SpanStore` protocol
+  (like `SummaryStore`), so a custom `SessionStore` need not implement tracing.
+  A store without them runs sessions normally with tracing disabled (one
+  WARNING per process on `logpose.store`); `Agent.purge_traces` then returns 0
+  and `export_traces` raises `LogposeError`. `SQLiteStore` implements both.
+  - `async def write_spans(spans: Sequence[SpanRecord]) -> None`
+  - `def read_spans(*, since_ns=None, until_ns=None, session_id=None, trace_id=None) -> AsyncIterator[SpanRecord]`
+  - `def read_root_spans(*, after_seq=None, since_ns=None, until_ns=None, session_id=None) -> AsyncIterator[tuple[int, SpanRecord]]`
+  - `async def purge_spans(older_than_ms: int) -> int`
 
 ### API additions
 
@@ -180,9 +200,25 @@ config snapshot `logpose.config.*`, gate-block events, and error status with
      span has ended; a live run is never exported half-finished.
    - **Time window:** `since` and `until` are timezone-aware `datetime`s,
      matched against the **root span's start time**.
-   - **Return value:** `ExportResult(traces: int, through: datetime | None)`.
-     `through` is the latest root start exported, so callers can export
-     incrementally without duplicates.
+   - **Return value:** `ExportResult(traces: int, through: datetime | None,
+     cursor: int | None)`. `through` is the latest root start exported
+     (informational only).
+   - **Incremental export (amended 2026-11-20 after review):** a start-time or
+     end-time watermark is not exactly-once, because spans are written by a
+     background writer, possibly long after the run ends. So each span row
+     gets a write-order number `export_seq`, assigned inside the write
+     transaction. A re-write of the same span keeps its original number.
+     - Export reads roots in `export_seq` order.
+     - `cursor` is the largest `export_seq` exported, or the caller's `after`
+       when nothing was exported; it never goes backwards.
+     - Callers pass `after=result.cursor` on the next call to export each
+       completed trace exactly once.
+     - `since`/`until` remain plain filters on the root's start time.
+   - **Service name:** `Tracing.service_name` is stored on the root span and
+     becomes the resource `service.name` on export (resourceSpans are grouped
+     by it).
+   - **Purge:** `purge_spans` deletes whole traces whose root started before
+     the cutoff, plus any orphan spans older than the cutoff.
 5. **Metadata:**
    - stored on spans (`logpose.metadata.*`) and in `RuntimeContext`;
    - in `logpose_runs`, through a new `metadata TEXT` (JSON) column added by the

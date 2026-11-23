@@ -54,6 +54,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- OpenTelemetry GenAI tracing, off by default: `Agent(tracing=Tracing(...))`,
+  `LOGPOSE_TRACE`, `LOGPOSE_TRACE_CONTENT`. Spans are stored in the SQLite store
+  (schema v3, migrated automatically) by a background writer with bounded queues.
+- `export_traces()` and `ExportResult`: OTLP/JSON export (one trace per line,
+  Collector `otlpjsonfile` compatible) with `since`/`until`/`session_id` and an
+  exactly-once incremental `after=result.cursor` (unfiltered only: `after=` with a
+  filter raises, and a filtered export returns `cursor=None`);
+  `Agent.purge_traces(older_than)` to delete old spans.
+- Optional `SpanStore` protocol for the span methods: a `SessionStore` without
+  them runs with tracing disabled (one WARNING).
+- `run(..., run_id=..., metadata=...)` for caller-chosen run IDs and run labels,
+  recorded on spans, `RuntimeContext` and `RunRecord`.
 - Input guardrails: `Agent(input_guardrails=[...], guardrail_mode="blocking" | "parallel")`
   screen each run's new user message. Adds `GuardrailInput`, `GuardrailVerdict`,
   `GuardrailResult`, `InputGuardrail`, `pattern_guard`, `openai_decision_guard`
