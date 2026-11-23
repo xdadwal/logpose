@@ -101,6 +101,7 @@ from contextlib import AbstractAsyncContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
+from pathlib import Path
 from time import monotonic
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, Union, overload
@@ -228,6 +229,7 @@ __all__ = [
     "DEFAULT_PROVIDER_TURN_TIMEOUT",
     "DEFAULT_RUN_TIMEOUT",
     "DEFAULT_TOOL_TIMEOUT",
+    "DEFAULT_SESSION_TTL",
     "EMPTY_TOOL_RESULT",
     "RetryPolicy",
     "DEFAULT_RETRY_POLICY",
@@ -272,6 +274,9 @@ DEFAULT_MAX_CONCURRENT_TOOLS = 8
 
 DEFAULT_TOOL_TIMEOUT = 30.0
 """Default execution deadline, in seconds, for one tool after queueing."""
+
+DEFAULT_SESSION_TTL = 30 * 86400.0
+"""Seconds a stored session lives after its last write, unless ``session_ttl`` says otherwise."""
 
 EMPTY_TOOL_RESULT = "(no output)"
 """Stand-in for a tool result that is empty or only whitespace.
@@ -646,6 +651,8 @@ class Agent:
         input_guardrails: Sequence[InputGuardrail] = (),
         guardrail_mode: GuardrailMode = "blocking",
         tracing: Tracing | None | _Unset = _UNSET,
+        db_path: str | os.PathLike[str] | None = None,
+        session_ttl: timedelta | float | None = None,
         **provider_kwargs: Any,
     ) -> None:
         """Build an agent.
@@ -761,6 +768,21 @@ class Agent:
                 environment decides: ``LOGPOSE_TRACE`` (``1``/``true``/``yes``)
                 turns it on and ``LOGPOSE_TRACE_CONTENT`` adds content capture.
                 ``None`` turns tracing off whatever the environment says.
+            db_path: The SQLite file holding this agent's sessions, run records
+                and traces. When given (not blank), ``~`` is expanded and the
+                path made absolute once, here, and it stays fixed. Omitted or
+                blank, the path is resolved at each use, as before:
+                ``LOGPOSE_DB_PATH`` (when set and not blank), then
+                ``logpose.db`` in the working directory. :attr:`db_path` returns
+                the path in effect. Nothing is opened until the first session or
+                traced run.
+            session_ttl: How long a stored session lives after its last write
+                by this agent, as a :class:`~datetime.timedelta` or seconds
+                (default 30 days). Creating a session and every save stamp
+                ``expires_at = now + session_ttl``; expiry and
+                :meth:`purge_expired_sessions` read the stored time, so agents
+                with different TTLs can share one database: whichever wrote last
+                sets the expiry. Must be positive and finite.
             **provider_kwargs: Forwarded to the named provider's factory, e.g.
                 ``Agent("openai-compat", api_key=...)``. Only valid when ``provider``
                 is a name.
@@ -780,7 +802,10 @@ class Agent:
             ``output_retries`` is not an int >= 0, or if a context setting is
             invalid, or if, with the built-in context path, the input budget
             (``min(context_window - max_tokens, context_budget)``) is not
-            positive or an app tool is named ``recall_tool_output``.
+            positive or an app tool is named ``recall_tool_output``, or if
+            ``db_path`` is not a string or path, or ``session_ttl`` is not a
+            positive number of seconds or timedelta no larger than
+            ``timedelta.max``.
         """
         _check_output_type(output_type)
         _check_output_retries(output_retries)
@@ -859,6 +884,11 @@ class Agent:
             or session_wait < 0
         ):
             raise LogposeError(f"session_wait must be a number >= 0, got {session_wait!r}.")
+        resolved_ttl = _check_session_ttl(session_ttl)
+        if db_path is not None and not isinstance(db_path, (str, os.PathLike)):
+            raise LogposeError(
+                f"db_path must be a str, os.PathLike or None, got {type(db_path).__name__}."
+            )
         self._window_explicit = context_window is not None
         if context_window is None:
             context_window = DEFAULT_CONTEXT_WINDOW
@@ -928,6 +958,13 @@ class Agent:
         self.output_type = output_type
         self.output_retries = output_retries
         self.session_wait = float(session_wait)
+        # Fixed only when given; otherwise resolved at each store use, as before.
+        self._db_path_explicit: Path | None = (
+            _resolve_db_path(db_path)
+            if db_path is not None and os.fspath(db_path).strip()
+            else None
+        )
+        self.session_ttl: float = resolved_ttl
         self.input_guardrails: tuple[InputGuardrail, ...] = tuple(input_guardrails)
         self.guardrail_mode: GuardrailMode = guardrail_mode
         self._uses_store = False
@@ -937,6 +974,7 @@ class Agent:
         self._trace_slow_warned: set[str] = set()  # "open" / "check" timeouts, warned once
         # A store open this agent stopped waiting for: its failure still backs off.
         self._trace_opening: asyncio.Future[SessionStore] | None = None
+        self._trace_opening_path: Path | None = None  # the path that open is for
         # Run IDs this agent traced whose spans may still be queued; aclose
         # waits for these only, never for other agents' spans.
         self._trace_run_ids: set[str] = set()
@@ -1048,6 +1086,11 @@ class Agent:
                 with ``session_id``.
             session: A handle from an open :meth:`session` block to run on. The
                 run is recorded at once; messages are saved when the block exits.
+                Messages and the run record go to the database the handle was
+                leased from; with a handle from an agent with a different
+                ``db_path``, this run's traces still go to this agent's database,
+                while the ``run_id`` duplicate check consults the handle's
+                database, not this agent's traces.
             metadata: Labels for this run (``str`` keys; ``str``, ``int``,
                 ``float`` or ``bool`` values). Readable through
                 :func:`~logpose.runtime.current_runtime_context`, stored on the
@@ -1303,7 +1346,9 @@ class Agent:
         from logpose.store import manager
 
         store = await self._store()
-        cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+        cm = store.session(
+            session_id, wait=self.session_wait, metadata=metadata, ttl=self.session_ttl
+        )
         handle = await cm.__aenter__()
         manager._ACTIVE_HANDLES[handle] = store
         try:
@@ -1347,11 +1392,52 @@ class Agent:
         store = await self._store()
         await store.delete_session(session_id)
 
+    async def load_session(self, session_id: str) -> list[Message]:
+        """Return a stored session's saved history, for display.
+
+        Reads this agent's database (:attr:`db_path`) without taking the
+        session's lease, so it never waits on, blocks or raises
+        :class:`~logpose.errors.SessionBusyError` against a run in progress; a
+        run still in flight is not included until it saves. The full stored
+        history is returned, including turns a compaction summary covers (the
+        summary itself is not a message). Each call returns a new list.
+
+        Args:
+            session_id: The session to read; ``[A-Za-z0-9._-]{1,128}``.
+
+        Returns:
+            The saved messages, oldest first; ``[]`` for a session that does not
+            exist or has expired (an expired session is left untouched; a session
+            still under a live lease is not treated as expired).
+
+        Raises:
+            LogposeError: If ``session_id`` is invalid.
+        """
+        from logpose.store.base import validate_session_id
+
+        validate_session_id(session_id)
+        store = await self._store()
+        return list(await store.load_messages(session_id))
+
+    @property
+    def db_path(self) -> Path:
+        """The absolute path of this agent's SQLite database.
+
+        Fixed at construction when ``Agent(db_path=...)`` was given. Otherwise
+        resolved at each use, as before: ``LOGPOSE_DB_PATH`` when set and not
+        blank, then ``logpose.db`` in the current working directory.
+        """
+        if self._db_path_explicit is not None:
+            return self._db_path_explicit
+        from logpose.store import manager
+
+        return manager.db_path()
+
     async def _store(self) -> SessionStore:
         from logpose.store import manager
 
         self._uses_store = True
-        return await manager.get_store(owner=self)
+        return await manager.get_store(owner=self, path=self._db_path_explicit)
 
     @staticmethod
     def _active_store(handle: SessionHandle) -> SessionStore:
@@ -1444,7 +1530,9 @@ class Agent:
         cm: AbstractAsyncContextManager[SessionHandle] | None = None
         if handle is None:
             assert session_id is not None
-            cm = store.session(session_id, wait=self.session_wait, metadata=metadata)
+            cm = store.session(
+                session_id, wait=self.session_wait, metadata=metadata, ttl=self.session_ttl
+            )
             handle = await cm.__aenter__()
             manager._ACTIVE_HANDLES[handle] = store
             if first is None and not handle.conversation.messages:
@@ -1825,14 +1913,17 @@ class Agent:
         try:
             self._uses_store = True
             opening = self._trace_opening
+            path = self.db_path
             if (
                 opening is None
+                or self._trace_opening_path != path
                 or opening.get_loop() is not asyncio.get_running_loop()
                 or opening.cancelled()
                 or (opening.done() and opening.exception() is None)
             ):
-                opening = manager.store_opening(owner=self)
+                opening = manager.store_opening(owner=self, path=path)
             self._trace_opening = None
+            self._trace_opening_path = path
             if not opening.done():
                 budget = self._trace_wait_budget()
                 # One timed-out wait per pending open: later runs (of any agent)
@@ -1842,6 +1933,7 @@ class Agent:
                 if not opening.done():
                     _SLOW_TRACE_OPENS.add(opening)
                     self._trace_opening = opening
+                    self._trace_opening_path = path
                     self._warn_trace_slow(
                         "open",
                         "trace store not open after %.2gs (database busy); this run is "
@@ -3826,6 +3918,37 @@ def _check_positive_int(label: str, value: object) -> None:
     """Raise unless ``value`` is an ``int`` (not a ``bool``) of at least 1."""
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise LogposeError(f"{label} must be a positive int, got {value!r}.")
+
+
+def _check_session_ttl(session_ttl: timedelta | float | None) -> float:
+    """Return ``session_ttl`` in seconds (default 30 days), or raise ``LogposeError``."""
+    if session_ttl is None:
+        return DEFAULT_SESSION_TTL
+    if isinstance(session_ttl, timedelta):
+        seconds = session_ttl.total_seconds()
+    elif isinstance(session_ttl, (int, float)) and not isinstance(session_ttl, bool):
+        seconds = float(session_ttl)
+    else:
+        raise LogposeError(
+            f"session_ttl must be a timedelta, a number of seconds or None, got {session_ttl!r}."
+        )
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise LogposeError(f"session_ttl must be positive and finite, got {session_ttl!r}.")
+    if seconds > _MAX_SESSION_TTL:
+        raise LogposeError(
+            f"session_ttl must be at most timedelta.max ({_MAX_SESSION_TTL:g} s), "
+            f"got {session_ttl!r}."
+        )
+    return seconds
+
+
+_MAX_SESSION_TTL = timedelta.max.total_seconds()
+
+
+def _resolve_db_path(db_path: str | os.PathLike[str]) -> Path:
+    from logpose.store import manager
+
+    return manager.db_path(db_path)
 
 
 def _check_output_retries(output_retries: object) -> None:

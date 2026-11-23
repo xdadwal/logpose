@@ -591,8 +591,14 @@ result = await agent.run("hi", session_id="chat-42", session_metadata={"user": "
 Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
 `stream_sync` and `SyncAgent` accept `session_id`, `session_metadata` and `session`.
 
-- **Where it lives:** `LOGPOSE_DB_PATH` (default `logpose.db` in the current directory).
-  The file is created on first session use; runs without a session never touch disk.
+- **Where it lives:** `Agent(db_path=...)` when given, otherwise `LOGPOSE_DB_PATH`
+  (when set and not blank), otherwise `logpose.db` in the current directory. An
+  explicit `db_path` is fixed when the agent is constructed; without it the
+  environment variable is read at each use. `agent.db_path` returns the resolved
+  absolute path. The file is created on first session use; runs without a session
+  never touch disk. A `session=` handle always saves to the database it was leased
+  from; if its agent has a different `db_path`, that run's traces still go to the
+  running agent's database.
 - **Session IDs:** anyone who knows a session ID can load that conversation, so use
   unguessable IDs (for example `secrets.token_urlsafe(32)`) and check that the
   caller owns the session before using it.
@@ -604,8 +610,11 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   working: the next run on its handle takes the lease back if nobody else took it
   meanwhile, and raises `SessionBusyError` if someone did.
 - **Waiting:** `Agent(session_wait=...)` seconds to retry a busy lease (default 0).
-- **Expiry:** a session expires after 30 days without use; an expired session starts
-  empty on its next use. logpose never deletes rows on its own: call
+- **Expiry:** a session expires after `session_ttl` without use (default 30 days; a
+  `timedelta` or seconds; values above `timedelta.max` raise `LogposeError`). Every
+  write stamps `expires_at = now + that agent's session_ttl`, so changing the TTL
+  affects a session from its next write. An expired session starts empty on its
+  next use. logpose never deletes rows on its own: call
   `await agent.purge_expired_sessions()` to delete expired sessions, or
   `await agent.delete_session(sid)` to remove one.
 - **Run records:** each run writes a row to `logpose_runs`. Token counts cover
@@ -620,6 +629,74 @@ Blocking code uses `with sync_agent.session(sid) as handle:`, and `run_sync`,
   cancelling the handler on client disconnect does not shorten it. If streams may
   be left open on a handle, set the ASGI server's graceful-shutdown timeout to at
   least 25 s, or use `aclosing`.
+
+### Showing a stored conversation
+
+`await agent.load_session(sid)` (`SyncAgent.load_session(sid)` for blocking code)
+returns a session's saved messages, oldest first, so a page can render the history
+on load:
+
+- It is the full stored history, including turns a compaction summary covers.
+- An unknown or expired session returns `[]`. It never deletes, resets or extends
+  a session. A session still under a live lease is not treated as expired.
+- It takes no lease, so it works while a run is streaming in another tab and never
+  raises `SessionBusyError`. A turn still in progress is not visible until it
+  saves.
+- An invalid session ID raises `LogposeError`. Check that the caller owns the
+  session first (see Session IDs above).
+
+`.env` files read by pydantic-settings (or similar) do not populate `os.environ`,
+so logpose cannot see them. Pass `base_url=`, `api_key=`, `db_path=`, `session_ttl=` and
+`tracing=Tracing(...)` explicitly:
+
+```python
+from contextlib import asynccontextmanager
+from datetime import timedelta
+
+from fastapi import FastAPI, Request
+from pydantic import SecretStr
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from logpose import Agent, LogposeError, Tracing
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+    base_url: str
+    openai_api_key: SecretStr
+    db_path: str = "/var/lib/myapp/logpose.db"
+    session_ttl_days: int = 7
+
+settings = Settings()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.agent = Agent(
+        "openai-compat",
+        model="gpt-5.1",
+        base_url=settings.base_url,
+        api_key=settings.openai_api_key.get_secret_value(),
+        db_path=settings.db_path,
+        session_ttl=timedelta(days=settings.session_ttl_days),
+        tracing=Tracing(),
+    )
+    yield
+    await app.state.agent.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/chat/history")
+async def history(request: Request):
+    # The session ID comes from the visitor's own cookie, never from the URL, so
+    # a visitor can only read the conversation they own.
+    sid = request.cookies.get("chat_sid")
+    if not sid:
+        return []
+    try:
+        messages = await app.state.agent.load_session(sid)
+    except LogposeError:  # malformed cookie value
+        return []
+    # Send the browser only user and assistant text, not tool calls or results.
+    return [{"role": m.role, "text": m.text} for m in messages if m.text]
+```
 
 Known limits:
 
@@ -1072,6 +1149,10 @@ result = await export_traces("traces.jsonl")
 print(result.traces, result.through)
 ```
 
+`export_traces(..., db_path=agent.db_path)` reads a specific database; omitted, it
+resolves the path as `Agent(db_path=...)` does (`LOGPOSE_DB_PATH`, then
+`logpose.db`). Pass the agent's `db_path` when the agent was given one explicitly.
+
 `export_traces` writes one OTLP `ExportTraceServiceRequest` per line (OTLP/JSON,
 one trace per line) for traces whose root span has finished; runs still in
 progress are skipped until they end. `since` (exclusive) and `until` (inclusive)
@@ -1157,6 +1238,14 @@ server.
 | Provider | Model | Endpoint | Credential |
 | --- | --- | --- | --- |
 | `openai-compat` | `Agent(model=)` | `base_url=` / `LOGPOSE_BASE_URL` | optional `api_key=` / `LOGPOSE_API_KEY` |
+
+| Setting | Argument | Environment | Default |
+| --- | --- | --- | --- |
+| Database file | `Agent(db_path=)`, `export_traces(db_path=)` | `LOGPOSE_DB_PATH` | `logpose.db` in the working directory |
+| Session lifetime | `Agent(session_ttl=)` (`timedelta` or seconds) | none | 30 days |
+
+An explicit argument wins over the environment. Settings loaded from a `.env` file
+by another library are not in `os.environ`; pass them as arguments.
 
 Provider-specific request fields that logpose does not model can be passed with
 `extra=`:

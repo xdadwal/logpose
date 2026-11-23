@@ -539,7 +539,7 @@ async def test_store_open_failure_backs_off(
 ) -> None:
     attempts: list[int] = []
 
-    async def broken(*, owner: object | None = None) -> Any:
+    async def broken(*, owner: object | None = None, path: Path | None = None) -> Any:
         attempts.append(1)
         raise LogposeError("cannot open")
 
@@ -683,7 +683,7 @@ async def test_slow_open_that_then_fails_still_backs_off(
 ) -> None:
     attempts: list[int] = []
 
-    async def slow_then_broken(*, owner: object | None = None) -> Any:
+    async def slow_then_broken(*, owner: object | None = None, path: Path | None = None) -> Any:
         attempts.append(1)
         await asyncio.sleep(0.4)
         raise LogposeError("cannot open")
@@ -710,9 +710,9 @@ async def test_pending_slow_open_is_waited_on_only_once(
 ) -> None:
     original = manager.get_store
 
-    async def slow(*, owner: object | None = None) -> Any:
+    async def slow(*, owner: object | None = None, path: Path | None = None) -> Any:
         await asyncio.sleep(1.0)
-        return await original(owner=owner)
+        return await original(owner=owner, path=path)
 
     monkeypatch.setattr(manager, "get_store", slow)
     caplog.set_level(logging.WARNING)

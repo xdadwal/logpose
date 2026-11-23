@@ -1064,20 +1064,37 @@ async def test_block_exit_during_run_in_another_task_keeps_live_history_valid(
 async def test_long_run_keeps_lease_past_idle_bound(
     db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _short_lease(monkeypatch, 0.2)
+    _short_lease(monkeypatch, 0.5)
     provider = FakeProvider(
-        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 1.2})), ScriptedTurn.text("done")]
+        [ScriptedTurn.tool_use(tool_call("nap", {"seconds": 2.4})), ScriptedTurn.text("done")]
     )
     agent = Agent(provider, model="m", tools=[nap])
     async with agent.session("s1") as handle:
         task = asyncio.create_task(agent.run("go", session=handle))
-        await asyncio.sleep(1.0)  # past the idle bound, run still active
+        await asyncio.sleep(2.0)  # past the idle bound, run still active
         with pytest.raises(SessionBusyError):
             async with agent.session("s1"):
                 pass
         result = await task
     assert result.text == "done"
     assert _rows(db, "SELECT COUNT(*) FROM logpose_messages") == [(4,)]
+    await agent.aclose()
+
+
+async def test_load_session_readable_while_leased_past_expiry(db: Path) -> None:
+    agent = Agent(
+        FakeProvider([ScriptedTurn.text("a"), ScriptedTurn.text("b")]),
+        model="m",
+        session_ttl=0.2,
+    )
+    await agent.run("hi", session_id="s1")
+    async with agent.session("s1"):
+        await asyncio.sleep(0.4)  # past expires_at, lease still live
+        assert await agent.load_session("s1") != []
+    # the block's save stamped a fresh expires_at
+    assert await agent.load_session("s1") != []
+    await asyncio.sleep(0.4)
+    assert await agent.load_session("s1") == []
     await agent.aclose()
 
 

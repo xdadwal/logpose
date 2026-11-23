@@ -15,12 +15,19 @@ import random
 import secrets
 import sqlite3
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from logpose.agent import Conversation, _now_ms
+from logpose.agent import DEFAULT_SESSION_TTL, Conversation, _now_ms
 from logpose.errors import LogposeError, SessionBusyError
 from logpose.messages import Message
 from logpose.store.base import RunRecord, SessionHandle, validate_session_id
@@ -214,6 +221,10 @@ async def _fetch_messages(db: aiosqlite.Connection, session_id: str) -> list[Mes
         (session_id,),
     ) as cur:
         rows = await cur.fetchall()
+    return _decode_messages(rows)
+
+
+def _decode_messages(rows: Iterable[Any]) -> list[Message]:
     return [
         Message.model_validate({"role": role, "content": json.loads(content)})
         for role, content in rows
@@ -240,14 +251,27 @@ async def _fetch_summary(db: aiosqlite.Connection, session_id: str) -> tuple[int
     return (int(row[0]), str(row[1])) if row is not None else None
 
 
+def _ttl_ms(ttl: float) -> int:
+    """Return a session TTL in whole milliseconds (at least 1), or raise."""
+    if isinstance(ttl, bool) or not isinstance(ttl, (int, float)) or not math.isfinite(ttl):
+        raise LogposeError(f"session ttl must be a finite number of seconds, got {ttl!r}.")
+    if ttl <= 0:
+        raise LogposeError(f"session ttl must be positive, got {ttl!r}.")
+    return max(1, int(ttl * 1000))
+
+
 class SQLiteStore:
-    """Session store backed by one aiosqlite connection, serialized by a lock."""
+    """Session store backed by one aiosqlite connection, serialized by a lock.
+
+    ``idle_ttl`` is the session time-to-live used when :meth:`session` is not
+    given its own ``ttl``.
+    """
 
     def __init__(
         self,
         path: str | os.PathLike[str],
         *,
-        idle_ttl: float = 30 * 86400.0,
+        idle_ttl: float = DEFAULT_SESSION_TTL,
         lease_ttl: float = 60.0,
         busy_timeout_ms: int = 5000,
     ) -> None:
@@ -411,6 +435,7 @@ class SQLiteStore:
         *,
         wait: float = 0.0,
         metadata: Mapping[str, str] | None = None,
+        ttl: float | None = None,
     ) -> AbstractAsyncContextManager[SessionHandle]:
         """Lease ``session_id`` for the duration of an ``async with`` block.
 
@@ -421,15 +446,21 @@ class SQLiteStore:
         by exception, messages appended to ``handle.conversation`` are saved and the
         lease released, unless the lease was lost, in which case nothing is saved
         and :class:`SessionBusyError` is raised.
+
+        ``ttl`` is this caller's session time-to-live in seconds (default: the
+        store's ``idle_ttl``). Creating the session and the save on exit each
+        stamp ``expires_at = now + ttl``; the stored ``expires_at`` alone decides
+        expiry, so callers with different TTLs on one database simply restamp it.
         """
-        return self._session(session_id, wait, dict(metadata) if metadata else {})
+        ttl_ms = self._idle_ttl_ms if ttl is None else _ttl_ms(ttl)
+        return self._session(session_id, wait, dict(metadata) if metadata else {}, ttl_ms)
 
     @asynccontextmanager
     async def _session(
-        self, session_id: str, wait: float, metadata: dict[str, str]
+        self, session_id: str, wait: float, metadata: dict[str, str], ttl_ms: int
     ) -> AsyncIterator[SessionHandle]:
         validate_session_id(session_id)
-        handle, token = await self._acquire(session_id, wait, metadata)
+        handle, token = await self._acquire(session_id, wait, metadata, ttl_ms)
         renewal = [asyncio.create_task(self._renewal_loop(handle, token))]
         closing = False
 
@@ -465,17 +496,19 @@ class SQLiteStore:
             yield handle
         except BaseException as exc:
             await stop_renewal()
-            await self._release(handle, token, exc)
+            await self._release(handle, token, exc, ttl_ms)
             raise
         await stop_renewal()
-        await self._release(handle, token, None)
+        await self._release(handle, token, None, ttl_ms)
 
     async def _acquire(
-        self, session_id: str, wait: float, metadata: dict[str, str]
+        self, session_id: str, wait: float, metadata: dict[str, str], ttl_ms: int
     ) -> tuple[SessionHandle, str]:
         deadline = time.monotonic() + max(wait, 0.0)
         while True:
-            got = await self._transaction(lambda db: self._try_acquire(db, session_id, metadata))
+            got = await self._transaction(
+                lambda db: self._try_acquire(db, session_id, metadata, ttl_ms)
+            )
             if got is not None:
                 handle, token = got
                 if not handle.created:
@@ -491,7 +524,7 @@ class SQLiteStore:
             await asyncio.sleep(min(_POLL_INTERVAL, remaining))
 
     async def _try_acquire(
-        self, db: aiosqlite.Connection, session_id: str, metadata: dict[str, str]
+        self, db: aiosqlite.Connection, session_id: str, metadata: dict[str, str], ttl_ms: int
     ) -> tuple[SessionHandle, str] | None:
         now = _now_ms()
         async with db.execute(
@@ -527,7 +560,7 @@ class SQLiteStore:
                     session_id,
                     now,
                     now,
-                    now + self._idle_ttl_ms,
+                    now + ttl_ms,
                     json.dumps(merged),
                     token,
                     lease_expires,
@@ -621,7 +654,9 @@ class SQLiteStore:
         # a cancellation of the caller.
         await asyncio.wait([task])
 
-    async def _release(self, handle: SessionHandle, token: str, exc: BaseException | None) -> None:
+    async def _release(
+        self, handle: SessionHandle, token: str, exc: BaseException | None, ttl_ms: int
+    ) -> None:
         new = handle.new_messages()
         summary = handle.summary_to_save()
 
@@ -649,7 +684,7 @@ class SQLiteStore:
             await db.execute(
                 "UPDATE logpose_sessions SET version = version + 1, updated_at = ?, "
                 "expires_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ?",
-                (now, now + self._idle_ttl_ms, handle.id),
+                (now, now + ttl_ms, handle.id),
             )
             return True
 
@@ -662,9 +697,28 @@ class SQLiteStore:
     # --- messages, runs, purge ------------------------------------------------------------
 
     async def load_messages(self, session_id: str) -> list[Message]:
+        """Return the stored messages of a live session, oldest first.
+
+        Takes no lease and writes nothing: a session that is missing, or expired
+        but not yet purged, reads as ``[]`` and is left exactly as it is. Expiry
+        matches :meth:`purge_expired`: a session under a live lease is not
+        expired, since its save will stamp a new ``expires_at``. One statement
+        checks expiry and reads the messages, so the result is a consistent
+        snapshot even while another process saves.
+        """
         validate_session_id(session_id)
+        now = _now_ms()
         async with self._lock:
-            return await _fetch_messages(self._conn(), session_id)
+            async with self._conn().execute(
+                "SELECT m.role, m.content FROM logpose_messages AS m "
+                "JOIN logpose_sessions AS s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND (s.expires_at >= ? "
+                "OR (s.lease_token IS NOT NULL AND s.lease_expires_at >= ?)) "
+                "ORDER BY m.seq",
+                (session_id, now, now),
+            ) as cur:
+                rows = await cur.fetchall()
+        return _decode_messages(rows)
 
     async def append_messages(
         self, session_id: str, messages: Sequence[Message], *, start_seq: int

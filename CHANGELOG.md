@@ -14,6 +14,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of that run (for example a per-visitor `safety_identifier` on a shared agent).
   Reserved request fields raise `LogposeError`. The `invoke_agent` span records
   the key names (never values) as `logpose.request.extra_keys`.
+- `Agent(db_path=, session_ttl=)` set where sessions live and how long they last
+  (default 30 days; each write stamps `expires_at = now + session_ttl`). An
+  explicit `db_path` is fixed at construction; otherwise `LOGPOSE_DB_PATH` or
+  `logpose.db` is resolved at each use, as before. `Agent.db_path` returns the
+  resolved path. `export_traces(db_path=)` reads a chosen database.
+- `Agent.load_session(session_id)` and `SyncAgent.load_session`: the full stored
+  history for display, without a lease; `[]` for an unknown or expired session;
+  never deletes or extends.
 
 ### Changed (defaults)
 

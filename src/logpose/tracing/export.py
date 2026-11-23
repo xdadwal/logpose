@@ -151,6 +151,7 @@ async def export_traces(
     until: datetime | None = None,
     session_id: str | None = None,
     after: int | None = None,
+    db_path: str | os.PathLike[str] | None = None,
 ) -> ExportResult:
     """Write finished traces from the span store to ``path`` as OTLP/JSON lines.
 
@@ -171,6 +172,10 @@ async def export_traces(
         session_id: Only export traces of this session.
         after: Only export roots written after this ``ExportResult.cursor``.
             ``service.name`` is taken from the root span (``Tracing.service_name``).
+        db_path: The database to read, resolved as ``Agent(db_path=...)`` is:
+            omitted or blank, ``LOGPOSE_DB_PATH`` (when set and not blank), then
+            ``logpose.db`` in the working directory. Pass the agent's
+            :attr:`~logpose.agent.Agent.db_path` to export its traces.
 
     Raises:
         LogposeError: A naive ``since`` or ``until``, or ``after`` combined with
@@ -192,7 +197,7 @@ async def export_traces(
     target.parent.mkdir(parents=True, exist_ok=True)
     from logpose.store.base import SpanStore
 
-    store = await manager.get_store()
+    store = await manager.get_store(path=manager.db_path(db_path))
     if not isinstance(store, SpanStore):
         raise LogposeError(f"session store {type(store).__name__} does not store spans")
     count = 0

@@ -706,6 +706,28 @@ class SyncAgent:
         runner = _runner_for(self.agent)
         return _SyncSession(runner, self.agent.session(session_id, metadata=metadata))
 
+    def load_session(self, session_id: str) -> list[Message]:
+        """Return a stored session's saved history without taking its lease.
+
+        The blocking twin of :meth:`~logpose.agent.Agent.load_session`, driven
+        on the agent's private loop.
+
+        Args:
+            session_id: The session to read; ``[A-Za-z0-9._-]{1,128}``.
+
+        Returns:
+            The saved messages, oldest first; ``[]`` if the session does not
+            exist or has expired (a session still under a live lease is not
+            treated as expired).
+
+        Raises:
+            LogposeError: If called from a thread with a running event loop, or
+                if ``session_id`` is invalid.
+        """
+        _reject_running_loop("SyncAgent.load_session()")
+        runner = _runner_for(self.agent)
+        return runner.run(self.agent.load_session(session_id))
+
     def close(self) -> None:
         """Write queued trace spans, close the provider, stop the private loop.
 
