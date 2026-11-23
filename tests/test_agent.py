@@ -53,6 +53,7 @@ from logpose.messages import (
 )
 from logpose.providers.base import (
     CompletionDone,
+    CompletionRequest,
     Provider,
     ProviderTextDelta,
 )
@@ -1604,6 +1605,22 @@ def test_named_provider_is_resolved_with_provider_kwargs() -> None:
     assert agent.provider_name == "openai-compat"
     assert agent.provider.base_url == "http://local.test/v1"  # type: ignore[attr-defined]
     assert agent.model == "local-model"
+
+
+def test_agent_forwards_max_tokens_field_to_provider() -> None:
+    agent = Agent(
+        "openai-compat",
+        model="local-model",
+        base_url="http://local.test/v1",
+        max_tokens_field="max_tokens",
+    )
+
+    assert agent.provider.max_tokens_field == "max_tokens"  # type: ignore[attr-defined]
+    body = agent.provider._build_body(  # type: ignore[attr-defined]
+        CompletionRequest(messages=[Message.user("hi")], model="m", max_tokens=64), "m"
+    )
+    assert body["max_tokens"] == 64
+    assert "max_completion_tokens" not in body
 
 
 def test_provider_kwargs_alongside_a_built_provider_raise() -> None:

@@ -170,18 +170,26 @@ See [`examples/local_docker.py`](examples/local_docker.py) for a complete exampl
 ### Output limit
 
 Each turn's output ceiling defaults to 16384 tokens: room for reasoning plus a
-long answer. A reply that long can take longer than the 120-second turn
-deadline on slower models; if your replies run that long, raise
-`provider_turn_timeout` and `run_timeout` as well.
+long answer. Small local models often need it lower; set it with
+`Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`. A reply that
+long can take longer than the 120-second turn deadline on slower models; if
+your replies run that long, raise `provider_turn_timeout` and `run_timeout` as
+well.
+
+Some servers hard-reject a large ceiling with a 400. Examples: DeepSeek (limit
+8192 on `max_tokens`), some Groq models (8192 on `max_completion_tokens`), and
+vLLM when the prompt plus the ceiling exceeds `max_model_len` (so a 16k-context
+deployment fails every turn). For these, lower `max_tokens=` (8192 or less).
 
 The ceiling is sent as `max_completion_tokens`, the field OpenAI (and vLLM and
 llama.cpp) now expect; OpenAI's reasoning models reject the older `max_tokens`.
-For a server that only accepts the legacy field, such as some older Ollama or LM
-Studio builds, pass `OpenAICompatProvider(max_tokens_field="max_tokens")`, or
-`Agent("openai-compat", ..., max_tokens_field="max_tokens")`. A server that
-silently ignores the field applies no output cap; the turn and run deadlines
-still bound it. Small local models often need it lower; set it with
-`Agent(max_tokens=...)` or `OpenAICompatProvider(max_tokens=...)`.
+A server that only understands `max_tokens` may ignore the new field, so the
+output is uncapped (only the turn and run deadlines bound it), or it may reject
+it. For such servers pass `OpenAICompatProvider(max_tokens_field="max_tokens")`,
+or `Agent("openai-compat", ..., max_tokens_field="max_tokens")`.
+
+If you set `max_tokens` or `max_completion_tokens` yourself in `extra_body` or
+`Agent(extra=...)`, your value replaces logpose's, and only your field is sent.
 
 Chat Completions has no standard field for a reasoning model's chain of thought,
 so by default reasoning is not sent back on later turns. For servers that accept
@@ -258,8 +266,9 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
 Tool output is budgeted to about 2k tokens per call: shell, `read_file` pages,
-`list_dir`, grep, page fetches, and web search return at most 8,000 characters. `read_file` has no line cap and `list_dir` no entry cap; both page
-by characters with a continuation the model can follow.
+`list_dir`, grep, page fetches, and web search return about 8,000 characters.
+`read_file` has no line cap and `list_dir` no entry cap; both page by characters, each page about 8,000
+characters plus a continuation line the model can follow.
 
 ```python
 import httpx
