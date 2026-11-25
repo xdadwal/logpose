@@ -126,7 +126,7 @@ from logpose.tools import ToolDef, discover_tools, tool
 from logpose.tracing.export import ExportResult, export_traces
 from logpose.tracing.spans import Tracing
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

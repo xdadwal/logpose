@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-26
+
 ### Added
 
 - `current_time` built-in tool: the current date and time in an IANA time zone
@@ -537,5 +539,6 @@ whichever backend is behind them.
 - `import logpose` imports no provider SDK, reads no credential, and makes no
   network call; backends are resolved by name and import lazily.
 
-[Unreleased]: https://github.com/xdadwal/logpose/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/xdadwal/logpose/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/xdadwal/logpose/releases/tag/v0.2.0
 [0.1.0]: https://github.com/xdadwal/logpose/releases/tag/v0.1.0
