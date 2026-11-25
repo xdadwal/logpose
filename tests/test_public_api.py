@@ -64,6 +64,7 @@ EXPECTED_API = {
     "tool",
     "ToolDef",
     "discover_tools",
+    "current_time",
     # sync facade
     "SyncAgent",
     "run_sync",
@@ -153,6 +154,7 @@ OWNERS = {
     "tool": "logpose.tools",
     "ToolDef": "logpose.tools",
     "discover_tools": "logpose.tools",
+    "current_time": "logpose.clock",
     "SyncAgent": "logpose.sync",
     "run_sync": "logpose.sync",
     "stream_sync": "logpose.sync",

@@ -22,7 +22,6 @@ __all__ = [
     "RECALL_PAGE_CHARS",
     "estimate_tokens",
     "apply_pointers",
-    "make_recall_tool",
     "turn_starts",
     "SUMMARY_PREFIX",
     "SUMMARY_MAX_TOKENS",
@@ -282,7 +281,7 @@ def _find_output(messages: Sequence[Message], call_id: str) -> str | None:
     return None
 
 
-def make_recall_tool(history: Callable[[], Sequence[Message]]) -> ToolDef:
+def _recall_tool(history: Callable[[], Sequence[Message]]) -> ToolDef:
     """Build the ``recall_tool_output`` tool over a run's full history.
 
     Args:

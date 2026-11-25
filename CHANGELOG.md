@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `current_time` built-in tool: the current date and time in an IANA time zone
+  (default UTC), e.g. `Thursday, 26 November 2026, 14:05 IST (Asia/Kolkata)`.
+  An unknown zone returns a message with an example instead of raising.
 - Per-run `extra=` on `run`, `stream`, `run_sync`, `stream_sync` and
   `SyncAgent.run`/`stream`, merged over `Agent(extra=...)` for every model call
   of that run (for example a per-visitor `safety_identifier` on a shared agent).
@@ -38,9 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** servers that hard-reject a large output ceiling (for example
   DeepSeek, some Groq models, vLLM with a small `max_model_len`) now fail with a
   400 under the 16384 default; lower `max_tokens=` (8192 or less).
-- Tool output caps reduced from 16,000 to 8,000 characters (about 2k tokens):
-  shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
-  search was already 8,000.
 
 - **Breaking: context compaction is now on by default.** `context_policy` now
   defaults to the built-in policy instead of `None`; pass `context_policy=None`
@@ -141,9 +141,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   events. Cancelled tools run their terminators and get error results (and
   `tool_observer` outcomes), so the conversation stays valid. A provider error
   that cannot be retried within the remaining time surfaces as itself.
-- `bounded_run` registers a process-group kill with `current_tool_deadline()`,
-  so a tool or run deadline stops shell commands. The shell's own default
-  timeout is 25 s, below the agent's 30 s `tool_timeout`.
 
 ### Changed
 
@@ -156,14 +153,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool_timeout=30`, and `RetryPolicy(max_attempts=2, max_delay=4.0,
   max_retry_after=10.0)`. The `"default"` sentinel for `provider_turn_timeout`
   is rejected.
-- **Breaking:** toolkit limits sized to ~4k tokens per call: shell 30 s / 1 MB
-  capture / 16,000 chars to the model; `read_file` pages, `list_dir`, grep, and
-  `fetch_readable_text` 16,000 chars (fetch also 10 s and 1 MB); web search
-  8,000 chars and 10 s. `read_file` has no line cap and `list_dir` no entry cap
-  (`max_lines`/`max_entries` default to `None`); both page by characters.
 
 ### Removed
 
+- **Breaking:** `logpose.shell`, `logpose.workspace` (the shell, `read_file`,
+  `list_dir` and grep tool builders) and all of `logpose.web` (page fetch and
+  DuckDuckGo search helpers), along with the optional `web` extra. Define your
+  own tools with `@tool`. `make_recall_tool` is no longer public;
+  `recall_tool_output` is unchanged.
 - **Breaking:** the `docker` provider and its `docker-models` alias. Point
   `openai-compat` at Docker Model Runner instead:
   `Agent("openai-compat", model="auto", base_url="http://localhost:12434/engines/v1")`.
@@ -177,7 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** logpose now ships only OpenAI-compatible Chat Completions
   backends (`openai-compat`; `docker` was removed later, see above). Removed the `anthropic`, `claude-code`,
   `openai` (Responses API), `codex`, and `zai` providers, the Z.ai MCP web-search
-  backend (`logpose.web.search_zai`), the `logpose.auth` package, the
+  backend, the `logpose.auth` package, the
   `logpose[anthropic]` extra, and `examples/codex.py`. OpenAI models remain
   reachable through `openai-compat`. The previous multi-provider codebase is
   preserved on the `archive/multi-provider` branch.
