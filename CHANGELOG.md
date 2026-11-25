@@ -42,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DeepSeek, some Groq models, vLLM with a small `max_model_len`) now fail with a
   400 under the 16384 default; lower `max_tokens=` (8192 or less).
 - Tool output caps reduced from 16,000 to 8,000 characters (about 2k tokens):
-  shell, `read_file` pages, `list_dir`, grep, and `fetch_readable_text`. Web
-  search was already 8,000.
+  `fetch_readable_text` (the shell, `read_file`, `list_dir` and grep tools this
+  also covered were removed before release).
 
 - **Breaking: context compaction is now on by default.** `context_policy` now
   defaults to the built-in policy instead of `None`; pass `context_policy=None`
@@ -144,9 +144,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   events. Cancelled tools run their terminators and get error results (and
   `tool_observer` outcomes), so the conversation stays valid. A provider error
   that cannot be retried within the remaining time surfaces as itself.
-- `bounded_run` registers a process-group kill with `current_tool_deadline()`,
-  so a tool or run deadline stops shell commands. The shell's own default
-  timeout is 25 s, below the agent's 30 s `tool_timeout`.
 
 ### Changed
 
@@ -159,14 +156,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tool_timeout=30`, and `RetryPolicy(max_attempts=2, max_delay=4.0,
   max_retry_after=10.0)`. The `"default"` sentinel for `provider_turn_timeout`
   is rejected.
-- **Breaking:** toolkit limits sized to ~4k tokens per call: shell 30 s / 1 MB
-  capture / 16,000 chars to the model; `read_file` pages, `list_dir`, grep, and
-  `fetch_readable_text` 16,000 chars (fetch also 10 s and 1 MB); web search
-  8,000 chars and 10 s. `read_file` has no line cap and `list_dir` no entry cap
-  (`max_lines`/`max_entries` default to `None`); both page by characters.
+- **Breaking:** `fetch_readable_text` limits sized to ~4k tokens per call:
+  16,000 chars, 10 s and 1 MB; web search 10 s.
 
 ### Removed
 
+- **Breaking:** `logpose.shell` and `logpose.workspace` (the shell, `read_file`,
+  `list_dir` and grep tool builders) and `logpose.web.make_search_tool`. Define
+  your own tools with `@tool`; `fetch_readable_text` and the search helpers
+  remain. `make_recall_tool` is no longer public; `recall_tool_output` is
+  unchanged.
 - **Breaking:** the `docker` provider and its `docker-models` alias. Point
   `openai-compat` at Docker Model Runner instead:
   `Agent("openai-compat", model="auto", base_url="http://localhost:12434/engines/v1")`.
@@ -451,13 +450,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation fails into a tool error the model can retry rather than killing the
   run. A server that reports `finish_reason: "stop"` while still emitting tool
   calls is treated as `tool_use`, since trusting it would drop the calls.
-
-### Removed (Breaking)
-
-- `logpose.shell` and `logpose.workspace` (the shell, `read_file`, `list_dir`
-  and grep tool builders) and `logpose.web.make_search_tool`. Define your own
-  tools with `@tool`; `fetch_page` and the search helpers remain.
-- `make_recall_tool` is no longer public; `recall_tool_output` is unchanged.
 
 ## [0.1.0] - 2026-08-05
 

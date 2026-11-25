@@ -20,16 +20,16 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_formats_time_in_zone() -> None:
-    assert current_time.handler(timezone="Asia/Kolkata") == EXPECTED
+    assert current_time(timezone="Asia/Kolkata") == EXPECTED
 
 
 def test_default_is_utc() -> None:
-    assert current_time.handler().endswith("UTC (UTC)")
+    assert current_time().endswith("UTC (UTC)")
 
 
 @pytest.mark.parametrize("bad", ["Mars/Base", "", "../etc/passwd"])
 def test_invalid_zone_returns_message(bad: str) -> None:
-    out = current_time.handler(timezone=bad)
+    out = current_time(timezone=bad)
     assert repr(bad) in out
     assert "'Asia/Kolkata'" in out
 
@@ -61,3 +61,28 @@ def test_exported() -> None:
     import logpose
 
     assert "current_time" in logpose.__all__
+
+
+@pytest.fixture
+def no_tzdata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(name: str) -> None:
+        raise KeyError(name)
+
+    monkeypatch.setattr(clock, "ZoneInfo", boom)
+    monkeypatch.setattr(clock, "_tzdata_available", lambda: False)
+
+
+def test_default_utc_without_tzdata(no_tzdata: None) -> None:
+    assert current_time().endswith("UTC (UTC)")
+    assert current_time(timezone="etc/utc").endswith("(etc/utc)")
+
+
+def test_named_zone_without_tzdata_falls_back_to_utc(no_tzdata: None) -> None:
+    out = current_time(timezone="Asia/Kolkata")
+    assert "08:35 UTC" in out
+    assert "not installed" in out
+
+
+def test_long_bad_zone_is_truncated() -> None:
+    out = current_time(timezone="x" * 5000)
+    assert len(out) < 300

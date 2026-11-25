@@ -269,39 +269,10 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `Agent(tool_timeout=)` | 30 s | one tool call, after it gets a slot |
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
-Tool output is budgeted to about 2k tokens per call. Page fetches and web
-search return about 8,000 characters, and older tool output that no longer fits
+Tool output is budgeted to about 2k tokens per call: `fetch_readable_text`
+caps at about 8,000 characters, and older tool output that no longer fits
 the context is replaced by a pointer the model can expand with
 `recall_tool_output`, one page of about 8,000 characters at a time.
-
-### Built-in tools
-
-`current_time` is the one built-in tool: it returns the current date and time in
-an IANA zone (default UTC), for example
-`Thursday, 26 November 2026, 14:05 IST (Asia/Kolkata)`. Pass it as a tool, and
-tell the model your zone in the system prompt so it asks for the right one:
-
-```python
-from logpose import Agent, current_time
-
-agent = Agent(
-    "openai-compat",
-    model="gpt-5.1",
-    tools=[current_time],
-    system="The user is in India; use the Asia/Kolkata time zone.",
-)
-```
-
-For a fixed zone, wrap it with your own `@tool`:
-
-```python
-from logpose import tool, current_time
-
-@tool
-def now() -> str:
-    """Get the current date and time in India."""
-    return current_time.handler(timezone="Asia/Kolkata")
-```
 
 ```python
 import httpx
@@ -331,11 +302,44 @@ Deadlines interrupt only work logpose awaits on your behalf: the provider, your
 tools, and the callbacks it runs for them (`on_tool_call`, `tool_observer`,
 `context_policy`). Your code between streamed events is never interrupted; the
 deadline is checked when logpose next waits. If the run deadline passes while
-tools run, they are cancelled (registered terminators run), `tool_observer` records an error outcome for each, and each unfinished
-call gets an error tool result so the conversation stays valid for the next run.
+tools run, they are cancelled (registered terminators run), `tool_observer` records an
+error outcome for each, and each unfinished call gets an error tool result so the conversation stays valid for the next run.
 A `TimeoutError` raised by your own gate, observer, or policy propagates as
 itself. A turn timeout before any delta can use the retry
 policy; a timeout after output is partial and is not replayed.
+
+### Built-in tools
+
+`current_time` is the one built-in tool: it returns the current date and time in
+an IANA zone (default UTC), for example
+`Thursday, 26 November 2026, 14:05 IST (Asia/Kolkata)`. Pass it as a tool, and
+tell the model your zone in the system prompt so it asks for the right one:
+
+```python
+from logpose import Agent, current_time
+
+agent = Agent(
+    "openai-compat",
+    model="gpt-5.1",
+    tools=[current_time],
+    system="The user is in India; use the Asia/Kolkata time zone.",
+)
+```
+
+For a fixed zone, wrap it with your own `@tool`:
+
+```python
+from logpose import tool, current_time
+
+@tool
+def now() -> str:
+    """Get the current date and time in India."""
+    return current_time(timezone="Asia/Kolkata")
+```
+
+Named zones need a time zone database. Slim images without one (Alpine,
+distroless, Windows) can `pip install tzdata`; without it `current_time` still
+answers in UTC.
 
 ## Defining tools
 

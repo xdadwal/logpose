@@ -34,7 +34,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Web tooling for logpose.tools_web: page fetch (readability extraction) and
+# Web tooling for logpose.web: page fetch (readability extraction) and
 # DuckDuckGo search. requests is used for streaming downloads with redirects;
 # BeautifulSoup strips scripts/styles for readable text.
 web = [
