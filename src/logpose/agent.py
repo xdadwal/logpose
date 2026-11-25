@@ -119,11 +119,11 @@ from logpose.compaction import (
     SUMMARY_INSTRUCTION,
     SUMMARY_MAX_TOKENS,
     _CompactionState,
+    _recall_tool,
     apply_pointers,
     choose_cut,
     estimate_tokens,
     fingerprint,
-    make_recall_tool,
     message_chars,
     overhead_chars,
     render_transcript,
@@ -1001,7 +1001,7 @@ class Agent:
                     f"Tool name {RECALL_TOOL_NAME!r} is reserved by the built-in context "
                     "policy; rename the tool or pass context_policy=None."
                 )
-            by_name[RECALL_TOOL_NAME] = make_recall_tool(_RUN_HISTORY.get)
+            by_name[RECALL_TOOL_NAME] = _recall_tool(_RUN_HISTORY.get)
         self._tools_by_name = by_name
         self._specs: tuple[ToolSpec, ...] = tuple(tool_def.spec() for tool_def in by_name.values())
         resolved_window = context_window - self._max_tokens()

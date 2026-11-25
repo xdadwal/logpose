@@ -17,7 +17,7 @@ from logpose import (
     Usage,
     tool,
 )
-from logpose.compaction import apply_pointers, estimate_tokens, make_recall_tool, turn_starts
+from logpose.compaction import _recall_tool, apply_pointers, estimate_tokens, turn_starts
 from logpose.context import PreparedContext
 from logpose.errors import LogposeError, ProviderError
 from logpose.messages import ToolResultBlock, ToolUseBlock
@@ -186,7 +186,7 @@ async def test_recall_tool_reads_full_output_and_pages() -> None:
             content=[ToolResultBlock(tool_use_id="r1", content="a" * 8000 + "b" * 2000)],
         ),
     ]
-    recall = make_recall_tool(lambda: history)
+    recall = _recall_tool(lambda: history)
     assert recall.name == RECALL
     assert set(recall.input_schema["properties"]) == {"call_id", "offset"}
     assert recall.input_schema["required"] == ["call_id"]

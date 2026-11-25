@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `current_time` built-in tool: the current date and time in an IANA time zone
+  (default UTC), e.g. `Thursday, 26 November 2026, 14:05 IST (Asia/Kolkata)`.
+  An unknown zone returns a message with an example instead of raising.
 - Per-run `extra=` on `run`, `stream`, `run_sync`, `stream_sync` and
   `SyncAgent.run`/`stream`, merged over `Agent(extra=...)` for every model call
   of that run (for example a per-visitor `safety_identifier` on a shared agent).
@@ -448,6 +451,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validation fails into a tool error the model can retry rather than killing the
   run. A server that reports `finish_reason: "stop"` while still emitting tool
   calls is treated as `tool_use`, since trusting it would drop the calls.
+
+### Removed (Breaking)
+
+- `logpose.shell` and `logpose.workspace` (the shell, `read_file`, `list_dir`
+  and grep tool builders) and `logpose.web.make_search_tool`. Define your own
+  tools with `@tool`; `fetch_page` and the search helpers remain.
+- `make_recall_tool` is no longer public; `recall_tool_output` is unchanged.
 
 ## [0.1.0] - 2026-08-05
 

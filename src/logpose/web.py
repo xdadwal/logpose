@@ -14,8 +14,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from logpose.tools import ToolDef, tool
-
 try:
     import requests
     from bs4 import BeautifulSoup
@@ -262,68 +260,3 @@ def clean_ddg_url(href: str) -> str:
         return href
     except ValueError:
         return ""
-
-
-def make_search_tool(
-    *,
-    backend: Callable[[str, int], list[str]],
-    name: str = "web_search",
-    description: str | None = None,
-    output_char_cap: int | Callable[[], int | None] | None = 8_000,
-    on_output: Callable[[str], None] | None = None,
-) -> ToolDef:
-    """Build a web-search ToolDef bound to a backend entry provider.
-
-    Args:
-        backend: ``(query, max_results) -> entries``; raise
-            :class:`SearchFailure` with a model-safe message for provider
-            problems, return ``[]`` for a genuine empty result set. Any other
-            exception surfaces as its type name only — response payloads may
-            contain credentials and are never shown.
-        name: Tool name (default ``web_search``).
-        description: Override the model-facing summary.
-        output_char_cap: Longest result body returned to the model; a callable
-            is resolved per call, so embedding apps can track live config.
-        on_output: Observes the full formatted result body (e.g. artifact
-            capture) before any truncation.
-    """
-    summary = description or (
-        "Search the web and return the top results as `title — url` with a "
-        "snippet. Reports provider blocking/errors distinctly from an empty "
-        "search."
-    )
-
-    @tool
-    def web_search(query: str, max_results: int = 5) -> str:
-        """Search the web; returns `title — url` entries with snippets."""
-        max_results = max(1, min(max_results, 25))
-        query = query.strip()
-        if not query:
-            return "Web search needs a non-empty query."
-        try:
-            results = backend(query, max_results)
-        except SearchFailure as exc:
-            return str(exc)
-        except Exception as exc:  # noqa: BLE001 - payload text may hold credentials
-            return f"Web search for {query!r} failed: {type(exc).__name__}."
-        if not results:
-            return f"No web results for {query!r}. Try different or broader search terms."
-        body = "\n\n".join(results)
-        full = f"Web results for {query!r}:\n\n{body}"
-        if on_output is not None:
-            on_output(full)
-        cap = output_char_cap() if callable(output_char_cap) else output_char_cap
-        if cap is not None and len(body) > cap:
-            body = body[:cap] + "\n...[truncated]"
-            full = f"Web results for {query!r}:\n\n{body}"
-        return full
-
-    return ToolDef(
-        name=name,
-        description=summary,
-        input_schema=web_search.input_schema,
-        handler=web_search.handler,
-        is_async=web_search.is_async,
-        args_model=web_search.args_model,
-        positional_only=web_search.positional_only,
-    )

@@ -51,6 +51,7 @@ from logpose.agent import (
     ToolGateResult,
 )
 from logpose.cancellation import ToolDeadlineHandle, current_tool_deadline
+from logpose.clock import current_time
 from logpose.context import ContextInput, ContextPolicy, ContextPreparationError, PreparedContext
 from logpose.errors import (
     AuthError,
@@ -166,6 +167,7 @@ __all__ = [
     "tool",
     "ToolDef",
     "discover_tools",
+    "current_time",
     # sync facade
     "SyncAgent",
     "run_sync",
