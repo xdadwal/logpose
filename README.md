@@ -47,22 +47,26 @@ may change before 1.0.
 ## Install
 
 Python 3.10 or newer is required. The project is not published on PyPI yet, so
-install it directly from GitHub:
+install a tagged release from GitHub:
 
 ```bash
-uv add git+https://github.com/xdadwal/logpose.git
+uv add "logpose @ git+https://github.com/xdadwal/logpose.git@v0.2.0"
 ```
 
 or:
 
 ```bash
-python -m pip install "git+https://github.com/xdadwal/logpose.git"
+python -m pip install "logpose @ git+https://github.com/xdadwal/logpose.git@v0.2.0"
 ```
+
+Each [GitHub release](https://github.com/xdadwal/logpose/releases) also has a
+wheel attached, which pip can install from its URL. Drop the `@v0.2.0` to track
+`master` instead.
 
 > The `logpose` name on PyPI currently belongs to an unrelated project. Until a
 > distribution name is announced here, use the Git URL above.
 
-Runtime dependencies are `pydantic` and `httpx`. Every built-in provider speaks
+Runtime dependencies are `pydantic`, `httpx` and `aiosqlite`. Every built-in provider speaks
 the OpenAI Chat Completions API, so no vendor SDK is needed.
 
 ## Quickstart
