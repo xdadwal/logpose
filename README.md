@@ -269,10 +269,10 @@ could otherwise run unbounded has a safe default. Each accepts `None` for
 | `Agent(tool_timeout=)` | 30 s | one tool call, after it gets a slot |
 | `RetryPolicy()` | 2 attempts, backoff up to 4 s, `Retry-After` up to 10 s | provider retries |
 
-Tool output is budgeted to about 2k tokens per call: `fetch_readable_text`
-caps at about 8,000 characters, and older tool output that no longer fits
-the context is replaced by a pointer the model can expand with
-`recall_tool_output`, one page of about 8,000 characters at a time.
+Older tool output that no longer fits the context is replaced by a pointer the
+model can expand with `recall_tool_output`, one page of about 8,000 characters
+at a time. Budget your own tools' output; about 2k tokens per call is a good
+target.
 
 ```python
 import httpx

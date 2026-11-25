@@ -33,15 +33,6 @@ dependencies = [
     "aiosqlite>=0.22",
 ]
 
-[project.optional-dependencies]
-# Web tooling for logpose.web: page fetch (readability extraction) and
-# DuckDuckGo search. requests is used for streaming downloads with redirects;
-# BeautifulSoup strips scripts/styles for readable text.
-web = [
-    "requests>=2.31",
-    "beautifulsoup4>=4.12",
-]
-
 [project.urls]
 Homepage = "https://github.com/xdadwal/logpose"
 
